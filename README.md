@@ -16,11 +16,7 @@ Google's Play Integrity API is designed to assess the integrity of the device an
 ---
 
 ## Project Structure
-app/
-├── java/
-│ └── MainActivity.java # Main entry point, handles UI and triggers native detection.
-├── cpp/
-│ ├── native-lib.cpp # Native lib that contain logic to detect PIF, Frida, debuggers, Zygisk, and tampering.
+he project has a Java component (MainActivity.java) that handles the UI and triggers native detection, and a C++ component (native-lib.cpp) that detects PIF, Frida, debuggers, Zygisk, and tampering.
 
 ---
 
@@ -51,6 +47,8 @@ After Reading around the internet and reverse engineering a little the code of t
 3. **Uses reflection** in `EntryPoint.java` to spoof:
    - `Build.MODEL`, `Build.ID`, `Build.VERSION.SDK_INT`
    - AndroidKeyStore's internal `KeyStoreSpi` via a custom `Provider`
+
+---
 
 ## Detection Logic for the different components in my native application code
 
@@ -168,6 +166,8 @@ The native function `f5d6d8a0228d2e7b607f28fefe95c77` implements the core runtim
   - Java class and method names are stored as **base64-encoded and further obfuscated strings**.
   - These are decoded and deobfuscated at runtime to reveal real names.
   - This will prevent static string scanning and analysis for JNI symbols when using static analysis tools.
+
+---
 
 ## Testing Process
 
