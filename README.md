@@ -15,6 +15,12 @@ Google's Play Integrity API is designed to assess the integrity of the device an
 
 ---
 
+## Release App
+
+You can find the release application in the /release folder in the project folder. 
+
+---
+
 ## Project Structure
 The project has a Java component (MainActivity.java) that handles the UI and triggers native detection, and a C++ component (native-lib.cpp) that detects PIF, Frida, debuggers, Zygisk, and tampering.
 
