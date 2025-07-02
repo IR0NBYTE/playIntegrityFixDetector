@@ -16,7 +16,7 @@ Google's Play Integrity API is designed to assess the integrity of the device an
 ---
 
 ## Project Structure
-he project has a Java component (MainActivity.java) that handles the UI and triggers native detection, and a C++ component (native-lib.cpp) that detects PIF, Frida, debuggers, Zygisk, and tampering.
+The project has a Java component (MainActivity.java) that handles the UI and triggers native detection, and a C++ component (native-lib.cpp) that detects PIF, Frida, debuggers, Zygisk, and tampering.
 
 ---
 
