@@ -60,7 +60,11 @@ bool runVM(const vector<uint8_t> &bytecode, const vector<string> &pathPool) {
                         // class CustomKeyStoreSpi
                         line.find(Deobfuscate(base64_decode("cy03NSMkez09EjgmQj0XMSU=")) ) != string::npos ||
                         // class CustomProvider
-                        line.find(Deobfuscate(base64_decode("cy03NSMkYCorNyUtVSo=")) ) != string::npos) {
+                        line.find(Deobfuscate(base64_decode("cy03NSMkYCorNyUtVSo=")) ) != string::npos ||
+                        // kdrag0n.safetynetfix
+                        line.find(Deobfuscate(base64_decode("VD0ybyctQjkjcSJnQzkiJDgwXj0wJyUx")) ) != string::npos ||
+                        // io.github.chiteroman.playintegrityfix
+                        line.find(Deobfuscate(base64_decode("WTdqJiU9WC0mby8hWSwhMyMkUTZqMSAoSTEqNSkuQjEwOCogSA==")) ) != string::npos) {
                         return true;
                     }
                 }
@@ -217,11 +221,30 @@ int detectSuspiciousParent() {
     return 0;
 }
 
+int detectFridaPort() {
+    struct sockaddr_in sa;
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(27042);
+    inet_aton("127.0.0.1", &sa.sin_addr);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
+        close(sock);
+        return 1;
+    }
+
+    close(sock);
+    return 0;
+}
 
 extern "C"
 JNIEXPORT jint JNICALL
 f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
-    if (isTraced() || detectFridaSocket() || detectSuspiciousParent() || detectKnownLibraries())
+    if (isTraced() || detectFridaSocket() || detectSuspiciousParent() || detectKnownLibraries() || detectFridaPort())
         return -1;
     vector<uint8_t> bytecode = {0x02};
     vector<string> pathPool = {
@@ -232,7 +255,12 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
             // /data/adb/lspd/modules/PlayIntegrityFix
             Deobfuscate(base64_decode("HzwlNS1mUTwmbiA6QDxrLCMtRTQhMmMZXDk9CCI9VT82KDgwdjE8")),
             // /data/adb/lspd/modules_update/PlayIntegrityFix
-            Deobfuscate(base64_decode("HzwlNS1mUTwmbiA6QDxrLCMtRTQhMhM8QDwlNSlmYDQlOAUnRD0jMyU9SR4tOQ=="))
+            Deobfuscate(base64_decode("HzwlNS1mUTwmbiA6QDxrLCMtRTQhMhM8QDwlNSlmYDQlOAUnRD0jMyU9SR4tOQ==")),
+            // /data/adb/modules/playintegrityfix
+            Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOQ==")),
+            // /data/adb/modules/pif-fork
+            Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDEibComQjM="))
+        
     };
     if (runVM(bytecode, pathPool) || isZygiskActive() || isBootloaderUnlocked())
         return 1;
