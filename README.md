@@ -1,12 +1,12 @@
-# Play Integrity Fix Native Detector
+# Play Integrity Fix Detector
 
-This project is a native Android application that detects **Play Integrity Fix (PIF)**. It leverages a combination of native C++ and Java code, runtime obfuscation, and behavioral heuristics to catch sophisticated environment modifications commonly used to bypass Google's Play Integrity API.
+An Android security app that detects Play Integrity Fix (PIF) modules running on a device. Built with native C++ and Java, it uses runtime obfuscation and behavioral checks to identify environment modifications that bypass Google's Play Integrity API.
 
 ---
 
 ## Purpose
 
-Google's Play Integrity API is designed to assess the integrity of the device and app environment. Tools like **Play Integrity Fix (PIF)** aim to spoof key system properties and manipulate the Android Keystore to falsify device integrity checks. The goal of this app is to detect the PIF on android phones.
+Google's Play Integrity API verifies device and app integrity. Play Integrity Fix is a Zygisk module that spoofs system properties and manipulates the Android Keystore to pass these checks. This app detects when PIF is active on a device.
 
 ## Requirements
 
@@ -15,167 +15,147 @@ Google's Play Integrity API is designed to assess the integrity of the device an
 
 ---
 
-## Release App
+## Release Build
 
-You can find the release application in the /release folder in the project folder. 
+The pre-built APK is available in the `/release` folder.
 
 ---
 
 ## Project Structure
-The project has a Java component (MainActivity.java) that handles the UI and triggers native detection, and a C++ component (native-lib.cpp) that detects PIF, Frida, debuggers, Zygisk, and tampering.
+
+- `MainActivity.java` - Handles UI and triggers security checks
+- `native-lib.cpp` - Native detection logic for PIF, Zygisk, Frida, debuggers, and bootloader status
 
 ---
 
-## UI Flow :
+## UI Flow
 
-The main activity (`MainActivity.java`) provides a simple interface:
+The app runs several security checks on startup:
 
-- **If root is detected** → Displays root alert and exits.
-- **If debug tools are detected** → Displays anti-debug alert and exits.
-- **If PIF is detected** → Shows PIF Detection alert and exits.
-- **If all checks pass** → Shows "Integrity Passed" dialog.
-
----
-
-## How PIF Works : 
-
-After Reading around the internet and reverse engineering a little the code of the PIF from this repo that gives a try on the implemntation of PIF : https://github.com/jyotidwi/PlayIntegrityFix I conclude those 3 pointes :
-
-**Play Integrity Fix (PIF)** operates via a Zygisk module:
-
-1. **Hooks `__system_property_read_callback`** to spoof properties like:
-   - `ro.build.version.sdk`
-   - `ro.build.version.security_patch`
-   - `ro.build.id`
-
-2. **Injects `classes.dex`** at runtime into `com.google.android.gms.unstable`.
-
-3. **Uses reflection** in `EntryPoint.java` to spoof:
-   - `Build.MODEL`, `Build.ID`, `Build.VERSION.SDK_INT`
-   - AndroidKeyStore's internal `KeyStoreSpi` via a custom `Provider`
+- Root detected → Shows alert and exits
+- Debug tools detected → Shows alert and exits
+- PIF detected → Shows alert and exits
+- All checks pass → Shows success dialog
 
 ---
 
-## Detection Logic for the different components in my native application code
+## How PIF Works
 
-### 1. **Play Integrity Fix (PIF) Detection**
-PIF works by injecting a DEX at runtime via `InMemoryDexClassLoader` and modifying system fields using reflection. It targets:
-- `android.os.Build`
-- `android.os.Build.VERSION`
+Based on reverse engineering the PIF implementation (https://github.com/jyotidwi/PlayIntegrityFix), here's how it bypasses integrity checks:
+
+**Play Integrity Fix operates as a Zygisk module:**
+
+1. Hooks `__system_property_read_callback` to spoof build properties (`ro.build.version.sdk`, `ro.build.version.security_patch`, `ro.build.id`)
+
+2. Injects `classes.dex` at runtime into `com.google.android.gms.unstable`
+
+3. Uses reflection in `EntryPoint.java` to modify `Build` fields and inject a custom `KeyStoreSpi` provider into AndroidKeyStore
+
+---
+
+## Detection Methods
+
+### 1. PIF Detection
+
+PIF injects DEX files at runtime using `InMemoryDexClassLoader` and modifies system classes via reflection:
+- `android.os.Build` and `android.os.Build.VERSION`
 - `AndroidKeyStore` provider
 
-My native code performs the following:
+**Detection approach:**
 
-- Scans process memory and loaded class paths for injected `es.chiteroman.playintegrityfix`, `CustomKeyStoreSpi`, `CustomProvider`.
-- Hooks libart/libbinder internals to detect runtime Java class injection.
-- Detects the presence of injected Keystore providers.
+Scans `/proc/self/maps` for PIF class names:
+- `es.chiteroman.playintegrityfix`
+- `CustomKeyStoreSpi`
+- `CustomProvider`
 
-**How I implemented it:**  
-- wrote a little VM that executes bytecode pointing to some sensitive detection logic, protecting it from direct static analysis.
-- It obfuscates strings and control flow via encoded instructions.
-- The VM interacts with JNI to fetch runtime values and perform the layered checks required to detect the PIF.
+**Implementation:**
 
-### 2. **Bootloader Unlock Detection** (`isBootloaderUnlocked`)
+The detection logic runs inside a custom bytecode VM to protect against static analysis and runtime hooking. Detection operations are encoded as VM opcodes rather than direct function calls, making it harder to bypass with Frida or Xposed.
 
-**What I detect:**  
-Whether the device bootloader is unlocked, which compromises the device security and allows tampering cuz that might get us also to a PIF.
+### 2. Bootloader Unlock Detection
 
-**How I implemented it:**  
-The native function `isBootloaderUnlocked()` performs checks on system properties and device files that indicate bootloader unlock status, such as:
-- Reading system properties like `ro.boot.verifiedbootstate` or `ro.boot.veritymode`.
-- Comparing with expected values to identify unlocked states.
+An unlocked bootloader allows unsigned system images and custom recovery, which compromises device integrity. PIF typically requires an unlocked bootloader to install.
 
-**Analogy with PIF:**  
-Similar to how PIF hooks and overrides system properties (`__system_property_read_callback`), my code reads and verifies bootloader-related properties to detect if the device’s integrity has been compromised at the boot level.
+**Detection approach:**
 
----
-
-### 3. **Zygisk Module Detection** (`isZygiskActive`)
-
-**What I detect:**  
-Whether the process is running under Zygisk module, which enables code injection and runtime modification of processes related also to PIF so I tought we have to detect that.
-
-**How I implemented it:**  
-The native function `isZygiskActive()` detects:
-- Presence of Zygisk-specific environment variables or process maps.
-- Hooks or indicators left by Zygisk in memory or linked libraries.
-- Checks for common artifacts such as loaded Zygisk shared libraries or special system properties modified by Zygisk.
-
-**Analogy with PIF:**  
-Just like PIF targets specific apps such as (`com.google.android.gms.unstable`) and injects code via Zygisk, my detection inspects the process environment and runtime context to catch signs of Zygisk manipulation.
+Checks system properties:
+- `ro.boot.verifiedbootstate` (should be "green")
+- `ro.boot.veritymode` (should not be "disabled")
+- `ro.boot.flash.locked` (should be "1")
+- `ro.boot.bootloader` (should not contain "unlock")
 
 ---
 
-## Obfuscation techniques and security measures I implemented to make the app robust and difficult to bypass
+### 3. Zygisk Detection
 
-To evade static analysis, reverse engineering, and runtime tampering, I applied multiple layers of obfuscation and protection both in native and Java code:
+Zygisk is the framework that allows PIF to inject code into system processes. Detecting Zygisk often means PIF is present.
 
-- **String Literals Obfuscation:**  
-  All sensitive strings are encoded at compile time using a one-time pad and are only decoded at runtime in memory. This prevents easy extraction of keys, class names, or method signatures by static tools.
+**Detection approach:**
 
-- **Anti-Root Detection via RootBeer:**  
-  The app integrates the RootBeer library to detect rooted environments and emulator usage. ProGuard rules are set to keep RootBeer intact, ensuring the detection logic is preserved.
+Scans `/proc/self/maps` for Zygisk libraries:
+- `libzygisk.so`
+- `libmagiskhide.so`
+- `lspd` (LSPosed)
+- `[anon:zygisk]` memory mappings
 
-- **ProGuard Obfuscation:**
+Checks environment variables:
+- `ZYGISK_ENABLED`
+- `MAGISK_VER_CODE`
 
-The app leverages ProGuard with a custom rules file to further obfuscate the Java bytecode and optimize the app if you check that file in the src code you will notice:
-
-- The rules aggressively rename classes and methods while preserving essential Android components and native method signatures.
-- RootBeer classes are kept intact to maintain runtime root detection functionality.
-- Logging calls are stripped out to avoid leaking debugging information.
-- String obfuscation is applied by adapting class strings and resource filenames to hinder static extraction.
-- Unused classes and methods are removed to reduce app size and eliminate dead code paths.
-
-- **Anti-Frida and Anti-Debugging Techniques implemented in native code:**
-
-The native integrity check includes multiple functions designed to detect runtime debugging and hooking attempts, especially those using Frida or similar instrumentation frameworks:
-
-- The function `isTraced()` reads `/proc/self/status` to check if the process is currently being traced (debugged):
-  - It parses the `TracerPid` field to determine if a debugger is attached.
-  - Returns true if tracing is detected, blocking debugging attempts.
-
-- The function `detectFridaSocket()` scans `/proc/net/unix` for UNIX domain sockets linked to known hooking tools:
-  - It looks for socket names like `"frida"`, `"xposed"`, and `"re.frida"`.
-  - Detecting these indicates an active Frida or Xposed hooking environment and we can add more to the list.
-
-- The function `detectKnownLibraries()` inspects `/proc/self/maps` for loaded libraries associated with hooking frameworks:
-  - Checks for library names such as `"frida"`, `"xposed"`, and `"frida-server"` and we can add more to the list.
-  - Presence of these libraries signals possible runtime tampering.
-
-- The function `detectSuspiciousParent()` reads the parent process information from `/proc/[ppid]/cmdline`:
-  - It verifies if the parent process name matches `"frida"` and we can add more to the list in the future.
-  - This helps detect if the app was launched or controlled by suspicious instrumentation tools.
-
-- **Running the Integrity detection code inside of a little VM that has 2 opcodes:**  
-  Sensitive detection logic is implemented inside a simple bytecode VM executed at runtime in native code (`runVM()` function). This adds a layer of indirection making static and dynamic analysis significantly slightly harder since I can't write one in 7 days I wanted to just show the usage of such a thing that can make the reversing harder.
-
-- **Native Library Symbol Stripping:**  
-  The native build uses the following CMake flags to hide native symbols and method names:  
-  ```cmake
-  target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -fvisibility=hidden)
-  target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,--strip-all)
-
-- **Usage of the native integrity check function with obfuscation and manual JNI registration :**
-
-The native function `f5d6d8a0228d2e7b607f28fefe95c77` implements the core runtime integrity checks in a heavily obfuscated manner, both in its implementation and how it is exposed to the Java layer:
-
-- The function name `f5d6d8a0228d2e7b607f28fefe95c77` I randomaly put will help:
-  - Hide the function’s purpose from native symbol tables.
-  - Along with compiler flags that we used earlier will make sure getting to the library will become a little diffcult.
-
-- The function will return:
-  - 1 if it detects the PIF.
-  - -1 if it detects any debugger hooked to the process of the app. 
-  - 0 if everything is ok.
-
-- Instead of default JNI naming, the function is **manually registered** inside `JNI_OnLoad`:
-  - Java class and method names are stored as **base64-encoded and further obfuscated strings**.
-  - These are decoded and deobfuscated at runtime to reveal real names.
-  - This will prevent static string scanning and analysis for JNI symbols when using static analysis tools.
+Verifies system properties:
+- `ro.magisk.zygisk`
 
 ---
 
-## Testing Process
+## Security & Obfuscation
 
-A walkthrough video is attached to this repo that showcases the testing process.
+Multiple layers of protection make the app difficult to reverse engineer or bypass:
+
+**String Obfuscation:**
+Sensitive strings are XOR-encoded with base64 and only decoded at runtime, preventing static extraction of class names and method signatures.
+
+**Root Detection:**
+Uses RootBeer library to detect rooted devices and emulators. ProGuard rules preserve RootBeer classes while obfuscating the rest.
+
+**ProGuard Configuration:**
+- Aggressive class and method renaming
+- Stripped logging calls
+- Removed unused code
+- Protected native method signatures
+
+**Anti-Debug & Anti-Frida:**
+
+- `isTraced()` - Parses `/proc/self/status` for `TracerPid` to detect attached debuggers
+- `detectFridaSocket()` - Scans `/proc/net/unix` for Frida/Xposed socket names
+- `detectKnownLibraries()` - Checks `/proc/self/maps` for hooking framework libraries
+- `detectSuspiciousParent()` - Verifies parent process isn't Frida
+
+**VM-Based Detection:**
+Detection logic runs as bytecode in a custom VM with 30+ opcodes for file I/O, string operations, and system checks. This makes hooking significantly harder since there are no direct function calls to intercept.
+
+**Native Symbol Stripping:**
+CMake flags hide native symbols and method names:
+```cmake
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -fvisibility=hidden)
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,--strip-all)
+```
+
+**Manual JNI Registration:**
+
+The main native function `f5d6d8a0228d2e7b607f28fefe95c77` uses manual JNI registration instead of default naming conventions:
+- Function name is a random hex string
+- Class and method names are base64-encoded with XOR obfuscation
+- Decoded at runtime in `JNI_OnLoad`
+- Prevents static analysis tools from finding JNI entry points
+
+Return values:
+- `-1` - Debugger or Frida detected
+- `1` - PIF, Zygisk, or unlocked bootloader detected
+- `0` - Clean device
+
+---
+
+## Testing
+
+A demo video is included in the repository showing the app detecting PIF on a rooted device.
 
