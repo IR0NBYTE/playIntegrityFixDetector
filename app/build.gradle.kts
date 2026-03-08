@@ -24,7 +24,7 @@ android {
     signingConfigs {
         create("release") {
             val keystore = System.getenv("RELEASE_KEYSTORE_PATH")
-            if (keystore != null) {
+            if (!keystore.isNullOrEmpty()) {
                 storeFile = file(keystore)
                 storePassword = System.getenv("KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("KEY_ALIAS")
@@ -39,7 +39,10 @@ android {
             isShrinkResources = true
             isDebuggable = false
 
-            signingConfig = signingConfigs.getByName("release")
+            val keystore = System.getenv("RELEASE_KEYSTORE_PATH")
+            if (!keystore.isNullOrEmpty()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
 
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

@@ -34,9 +34,6 @@ jobs:
       - name: Build Debug
         run: ./gradlew assembleDebug
 
-      - name: Build Release
-        run: ./gradlew assembleRelease
-
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
