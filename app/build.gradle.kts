@@ -21,11 +21,25 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystore = System.getenv("RELEASE_KEYSTORE_PATH")
+            if (keystore != null) {
+                storeFile = file(keystore)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             isDebuggable = false
+
+            signingConfig = signingConfigs.getByName("release")
 
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -53,7 +67,7 @@ android {
 }
 
 dependencies {
-    implementation("com.scottyab:rootbeer-lib:0.1.1")
+    implementation(libs.rootbeer)
     implementation(libs.appcompat)
     implementation(libs.material)
     implementation(libs.constraintlayout)

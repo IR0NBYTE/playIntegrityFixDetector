@@ -48,7 +48,7 @@
     native <methods>;
 }
 
-# Remove all logging
+# Remove all logging in release builds
 -assumenosideeffects class android.util.Log {
     public static boolean isLoggable(java.lang.String, int);
     public static int v(...);
@@ -66,8 +66,6 @@
 -dontwarn **
 -ignorewarnings
 
-# Obfuscate class names
--renamesourcefileattribute SourceFile
--keepattributes SourceFile,LineNumberTable
-
-
+# Strip source file names in release (don't leak internal structure)
+-renamesourcefileattribute ""
+-keepattributes LineNumberTable

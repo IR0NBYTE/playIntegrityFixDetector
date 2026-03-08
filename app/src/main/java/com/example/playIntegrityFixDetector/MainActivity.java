@@ -5,16 +5,18 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.annotation.NonNull;
 
 import android.os.Bundle;
-import android.util.Log;
-import android.view.View;
+import android.os.Handler;
+import android.os.Looper;
 import android.widget.Button;
 
 import com.example.playIntegrityFixDetector.databinding.ActivityMainBinding;
 import com.scottyab.rootbeer.RootBeer;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 public class MainActivity extends AppCompatActivity {
 
-    private static final String TAG = "IntegrityCheck";
     private static final int RESULT_DEBUG_DETECTED = -1;
     private static final int RESULT_TAMPERING_DETECTED = 1;
     private static final int RESULT_CLEAN = 0;
@@ -25,13 +27,14 @@ public class MainActivity extends AppCompatActivity {
         try {
             System.loadLibrary("playIntegrityFixDetector");
             nativeLibLoaded = true;
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load native library", e);
+        } catch (UnsatisfiedLinkError ignored) {
         }
     }
 
     private ActivityMainBinding binding;
     private RootBeer rootChecker;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -64,37 +67,50 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupDetectionButton() {
-        Button detectBtn = findViewById(R.id.button2);
+        Button detectBtn = binding.button2;
         if (detectBtn == null) return;
 
-        detectBtn.setOnClickListener(v -> runIntegrityCheck());
+        detectBtn.setOnClickListener(v -> {
+            detectBtn.setEnabled(false);
+            detectBtn.setText("Checking...");
+            runIntegrityCheck(detectBtn);
+        });
     }
 
-    private void runIntegrityCheck() {
-        int result = isIntegrityTampered();
+    private void runIntegrityCheck(Button detectBtn) {
+        executor.execute(() -> {
+            int result = isIntegrityTampered();
 
-        switch (result) {
-            case RESULT_DEBUG_DETECTED:
-                showSecurityAlert(
-                    "Debug Tools Detected",
-                    "Runtime instrumentation detected. This may indicate tampering attempts."
-                );
-                break;
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
 
-            case RESULT_TAMPERING_DETECTED:
-                showSecurityAlert(
-                    "Integrity Violation",
-                    "System modifications detected that bypass integrity checks."
-                );
-                break;
+                detectBtn.setEnabled(true);
+                detectBtn.setText("Detect PlayIntegrityFix");
 
-            case RESULT_CLEAN:
-                showSuccessDialog();
-                break;
+                switch (result) {
+                    case RESULT_DEBUG_DETECTED:
+                        showSecurityAlert(
+                            "Debug Tools Detected",
+                            "Runtime instrumentation detected. This may indicate tampering attempts."
+                        );
+                        break;
 
-            default:
-                showErrorAndExit("Unexpected integrity check result");
-        }
+                    case RESULT_TAMPERING_DETECTED:
+                        showSecurityAlert(
+                            "Integrity Violation",
+                            "System modifications detected that bypass integrity checks."
+                        );
+                        break;
+
+                    case RESULT_CLEAN:
+                        showSuccessDialog();
+                        break;
+
+                    default:
+                        showErrorAndExit("Unexpected integrity check result");
+                }
+            });
+        });
     }
 
     private void showSecurityAlert(@NonNull String title, @NonNull String message) {
@@ -132,6 +148,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        executor.shutdownNow();
         binding = null;
         rootChecker = null;
     }
