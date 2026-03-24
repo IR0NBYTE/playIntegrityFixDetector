@@ -35,6 +35,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            externalNativeBuild {
+                cmake {
+                    cppFlags += "-DIS_DEBUG_BUILD"
+                }
+            }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true

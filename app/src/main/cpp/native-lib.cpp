@@ -1147,8 +1147,10 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
     if (detectSuspiciousParent() == 1)
         result |= DETECTION_FRIDA;
 
+#ifndef IS_DEBUG_BUILD
     if (isAppDebuggable(env, obj))
         result |= DETECTION_DEBUGGER;
+#endif
 
     // randomize execution order
     std::vector<DetectionCheck> checks = {
