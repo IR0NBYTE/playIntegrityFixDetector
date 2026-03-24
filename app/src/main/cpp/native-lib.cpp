@@ -27,57 +27,68 @@ public:
     ScopedFile& operator=(const ScopedFile&) = delete;
 };
 
-static constexpr uint8_t VM_OBFUSCATION_KEY = 0x5A;
+/*
+ * Opcode encoding: each byte is XOR'd with a rolling key derived from
+ * the previous decoded opcode. First byte uses the seed. This means
+ * you can't just XOR the whole stream with a constant -- you need to
+ * decode sequentially or know the full execution trace.
+ */
+static constexpr uint8_t VM_KEY_SEED = 0x5A;
 
 enum VMOpcode : uint8_t {
-    OP_PUSH_IMM8        = 0x01,
-    OP_PUSH_IMM32       = 0x02,
-    OP_PUSH_STR         = 0x03,
-    OP_POP              = 0x04,
-    OP_DUP              = 0x05,
-    OP_SWAP             = 0x06,
+    OP_PUSH_IMM8     = 0x01,
+    OP_PUSH_IMM32    = 0x02,
+    OP_PUSH_STR      = 0x03,
+    OP_POP           = 0x04,
+    OP_DUP           = 0x05,
+    OP_SWAP          = 0x06,
 
-    OP_LOAD_REG         = 0x10,
-    OP_STORE_REG        = 0x11,
-    OP_CLEAR_REG        = 0x12,
+    OP_LOAD_REG      = 0x10,
+    OP_STORE_REG     = 0x11,
+    OP_CLEAR_REG     = 0x12,
 
-    OP_ADD              = 0x20,
-    OP_SUB              = 0x21,
-    OP_XOR              = 0x22,
-    OP_AND              = 0x23,
-    OP_OR               = 0x24,
-    OP_NOT              = 0x25,
+    OP_ADD           = 0x20,
+    OP_SUB           = 0x21,
+    OP_XOR           = 0x22,
+    OP_AND           = 0x23,
+    OP_OR            = 0x24,
+    OP_NOT           = 0x25,
 
-    OP_CMP_EQ           = 0x30,
-    OP_CMP_NEQ          = 0x31,
-    OP_CMP_GT           = 0x32,
-    OP_CMP_LT           = 0x33,
+    OP_CMP_EQ        = 0x30,
+    OP_CMP_NEQ       = 0x31,
+    OP_CMP_GT        = 0x32,
+    OP_CMP_LT        = 0x33,
 
-    OP_JUMP             = 0x40,
-    OP_JUMP_IF_TRUE     = 0x41,
-    OP_JUMP_IF_FALSE    = 0x42,
-    OP_CALL             = 0x43,
-    OP_RET              = 0x44,
+    OP_JUMP          = 0x40,
+    OP_JUMP_IF_TRUE  = 0x41,
+    OP_JUMP_IF_FALSE = 0x42,
+    OP_CALL          = 0x43,
+    OP_RET           = 0x44,
 
-    OP_FILE_OPEN        = 0x50,
-    OP_FILE_CLOSE       = 0x51,
-    OP_FILE_READ_LINE   = 0x52,
-    OP_FILE_EXISTS      = 0x53,
-    OP_FILE_EOF         = 0x54,
+    OP_FILE_OPEN     = 0x50,
+    OP_FILE_CLOSE    = 0x51,
+    OP_FILE_READ_LINE = 0x52,
+    OP_FILE_EXISTS   = 0x53,
+    OP_FILE_EOF      = 0x54,
 
-    OP_STR_CONTAINS     = 0x60,
-    OP_STR_COMPARE      = 0x61,
-    OP_STR_LENGTH       = 0x62,
-    OP_STR_CONCAT       = 0x63,
-    OP_STR_DECODE       = 0x64,
+    OP_STR_CONTAINS  = 0x60,
+    OP_STR_COMPARE   = 0x61,
+    OP_STR_LENGTH    = 0x62,
+    OP_STR_CONCAT    = 0x63,
+    OP_STR_DECODE    = 0x64,
 
-    OP_SYS_PROP_GET     = 0x70,
-    OP_SYS_GETENV       = 0x71,
-    OP_SYS_ACCESS       = 0x72,
+    OP_SYS_PROP_GET  = 0x70,
+    OP_SYS_GETENV    = 0x71,
+    OP_SYS_ACCESS    = 0x72,
 
-    OP_NOP              = 0x80,
-    OP_HALT             = 0x81,
-    OP_DEBUG_CHECK      = 0x82,
+    OP_NOP           = 0x80,
+    OP_HALT          = 0x81,
+    OP_DEBUG_CHECK   = 0x82,
+
+    /* dead code traps -- these do nothing but exist to confuse disassemblers */
+    OP_TRAP_A        = 0x90,
+    OP_TRAP_B        = 0x91,
+    OP_TRAP_C        = 0x92,
 };
 
 struct VMState {
@@ -104,26 +115,49 @@ private:
     VMState state;
     std::vector<uint8_t> bytecode;
     std::vector<std::string> stringPool;
+    uint32_t expectedHash;
+    uint8_t rollingKey;
 
+    /*
+     * Rolling XOR: key mutates after each decoded opcode based on what
+     * we just decoded. Static analysis needs the full execution order
+     * to recover the stream. Suck it, IDA.
+     */
     uint8_t decodeOpcode(uint8_t encoded) {
-        return encoded ^ VM_OBFUSCATION_KEY;
+        uint8_t decoded = encoded ^ rollingKey;
+        rollingKey = (rollingKey * 31 + decoded) & 0xFF;
+        return decoded;
+    }
+
+    /* djb2 -- simple, fast, good enough for integrity checks */
+    static uint32_t hashBytecode(const std::vector<uint8_t>& code) {
+        uint32_t h = 5381;
+        for (auto b : code)
+            h = ((h << 5) + h) ^ b;
+        return h;
     }
 
 public:
-    SecureVM(const std::vector<uint8_t>& code, const std::vector<std::string>& strings)
-        : bytecode(code), stringPool(strings) {}
+    SecureVM(const std::vector<uint8_t>& code, const std::vector<std::string>& strings,
+             uint32_t hash = 0)
+        : bytecode(code), stringPool(strings), expectedHash(hash),
+          rollingKey(VM_KEY_SEED) {}
 
     bool execute() {
+        /* verify bytecode wasn't patched */
+        if (expectedHash != 0 && hashBytecode(bytecode) != expectedHash)
+            return true; /* tampered -> report detection */
+
         state.ip = 0;
         state.halted = false;
+        rollingKey = VM_KEY_SEED;
 
         while (state.ip < bytecode.size() && !state.halted) {
             uint8_t rawOpcode = bytecode[state.ip++];
             uint8_t opcode = decodeOpcode(rawOpcode);
 
-            if (!executeOpcode(static_cast<VMOpcode>(opcode))) {
+            if (!executeOpcode(static_cast<VMOpcode>(opcode)))
                 return false;
-            }
         }
 
         return !state.stack.empty() && state.stack.back() != 0;
@@ -339,9 +373,23 @@ private:
                 break;
             }
 
-            case OP_NOP: {
+            case OP_NOP: break;
+
+            /*
+             * Dead code traps. These are NOPs that look like real ops
+             * to a disassembler -- they consume an operand byte but do
+             * nothing with it. Sprinkle these in compiled bytecode to
+             * poison pattern analysis.
+             */
+            case OP_TRAP_A: {
+                if (state.ip < bytecode.size()) state.ip++;
                 break;
             }
+            case OP_TRAP_B: {
+                if (state.ip < bytecode.size()) state.ip += 2;
+                break;
+            }
+            case OP_TRAP_C: break;
 
             case OP_DEBUG_CHECK: {
                 ScopedFile f("/proc/self/status", "r");
@@ -369,192 +417,200 @@ private:
     }
 };
 
-static uint8_t encodeOpcode(VMOpcode op) {
-    return static_cast<uint8_t>(op) ^ VM_OBFUSCATION_KEY;
+/*
+ * Bytecode compiler helper. Tracks the rolling key so each opcode
+ * gets encoded against the correct state. Must be used sequentially.
+ */
+struct BytecodeEmitter {
+    std::vector<uint8_t> code;
+    uint8_t key;
+
+    BytecodeEmitter() : key(VM_KEY_SEED) {}
+
+    void emit(VMOpcode op) {
+        uint8_t raw = static_cast<uint8_t>(op);
+        code.push_back(raw ^ key);
+        key = (key * 31 + raw) & 0xFF;
+    }
+
+    void emit_byte(uint8_t b) {
+        code.push_back(b);
+    }
+
+    /* inject a dead-code trap with random junk operand */
+    void emit_trap() {
+        static uint8_t junk = 0xDE;
+        emit(OP_TRAP_A);
+        emit_byte(junk);
+        junk = (junk * 7 + 0x13) & 0xFF;
+    }
+
+    uint32_t hash() const {
+        uint32_t h = 5381;
+        for (auto b : code)
+            h = ((h << 5) + h) ^ b;
+        return h;
+    }
+};
+
+/*
+ * These compile functions build bytecode at runtime using the emitter.
+ * The rolling key means each program's encoding is position-dependent,
+ * so you can't just lift opcodes from one program and reuse them.
+ *
+ * Jump offsets are still raw bytes (not encoded) since the VM reads
+ * them as data, not opcodes. Yeah it's a bit ugly but it works.
+ */
+static std::tuple<std::vector<uint8_t>, std::vector<std::string>, uint32_t>
+compileZygiskDetection() {
+    BytecodeEmitter e;
+    std::vector<std::string> strings = {
+        "/proc/self/maps", "libzygisk.so", "libmagiskhide.so",
+        "lspd", "LSPosed", "[anon:zygisk]",
+        "ZYGISK_ENABLED", "MAGISK_VER_CODE",
+        "rezygisk", "zygisk_next", "libzygisk_",
+        "zygisk_assistant", "nohello", "shamiko"
+    };
+
+    e.emit(OP_PUSH_STR); e.emit_byte(6);
+    e.emit(OP_SYS_GETENV);
+    e.emit(OP_PUSH_STR); e.emit_byte(7);
+    e.emit(OP_SYS_GETENV);
+    e.emit(OP_OR);
+
+    e.emit(OP_DUP);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(60);
+
+    e.emit_trap();
+
+    e.emit(OP_PUSH_STR); e.emit_byte(0);
+    e.emit(OP_FILE_OPEN);
+    e.emit(OP_DUP);
+
+    e.emit(OP_PUSH_IMM8); e.emit_byte(0);
+    e.emit(OP_CMP_EQ);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(50);
+
+    e.emit(OP_DUP);
+    e.emit(OP_FILE_READ_LINE);
+    e.emit(OP_JUMP_IF_FALSE); e.emit_byte(30);
+
+    e.emit(OP_DUP); e.emit(OP_PUSH_STR); e.emit_byte(1);
+    e.emit(OP_STR_CONTAINS);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(20);
+
+    e.emit(OP_DUP); e.emit(OP_PUSH_STR); e.emit_byte(2);
+    e.emit(OP_STR_CONTAINS);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(15);
+
+    e.emit(OP_DUP); e.emit(OP_PUSH_STR); e.emit_byte(3);
+    e.emit(OP_STR_CONTAINS);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(10);
+
+    e.emit(OP_DUP); e.emit(OP_PUSH_STR); e.emit_byte(4);
+    e.emit(OP_STR_CONTAINS);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(5);
+
+    e.emit(OP_POP);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(static_cast<uint8_t>(-40));
+
+    e.emit(OP_FILE_CLOSE);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(0);
+    e.emit(OP_HALT);
+
+    e.emit(OP_FILE_CLOSE);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(1);
+    e.emit(OP_HALT);
+
+    return {e.code, strings, e.hash()};
 }
 
-static std::pair<std::vector<uint8_t>, std::vector<std::string>> compileZygiskDetection() {
-    std::vector<uint8_t> bytecode;
-    std::vector<std::string> strings;
+static std::tuple<std::vector<uint8_t>, std::vector<std::string>, uint32_t>
+compilePIFDetection() {
+    BytecodeEmitter e;
+    std::vector<std::string> strings = {
+        "/proc/self/maps",
+        "es.chiteroman.playintegrityfix", "CustomKeyStoreSpi",
+        "CustomProvider", "PlayIntegrityFix", "playintegrityfix",
+        "PlayIntegrityFork", "InMemoryDexClassLoader", "[anon:dalvik-DEX"
+    };
 
-    strings.push_back("/proc/self/maps");      // 0
-    strings.push_back("libzygisk.so");          // 1
-    strings.push_back("libmagiskhide.so");      // 2
-    strings.push_back("lspd");                  // 3
-    strings.push_back("LSPosed");               // 4
-    strings.push_back("[anon:zygisk]");         // 5
-    strings.push_back("ZYGISK_ENABLED");        // 6
-    strings.push_back("MAGISK_VER_CODE");       // 7
-    strings.push_back("rezygisk");              // 8
-    strings.push_back("zygisk_next");           // 9
-    strings.push_back("libzygisk_");            // 10
-    strings.push_back("zygisk_assistant");      // 11
-    strings.push_back("nohello");               // 12
-    strings.push_back("shamiko");               // 13
+    e.emit(OP_PUSH_STR); e.emit_byte(0);
+    e.emit(OP_FILE_OPEN);
+    e.emit(OP_DUP);
 
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(6);
-    bytecode.push_back(encodeOpcode(OP_SYS_GETENV));
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(7);
-    bytecode.push_back(encodeOpcode(OP_SYS_GETENV));
-    bytecode.push_back(encodeOpcode(OP_OR));
+    e.emit(OP_PUSH_IMM8); e.emit_byte(0);
+    e.emit(OP_CMP_EQ);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(45);
 
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(60);
+    e.emit_trap();
 
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_FILE_OPEN));
-    bytecode.push_back(encodeOpcode(OP_DUP));
-
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_CMP_EQ));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(50);
-
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_FILE_READ_LINE));
-
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_FALSE));
-    bytecode.push_back(30);
-
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(1);
-    bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(20);
-
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(2);
-    bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(15);
-
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(3);
-    bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(10);
-
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(4);
-    bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(5);
-
-    bytecode.push_back(encodeOpcode(OP_POP));
-
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(static_cast<uint8_t>(-40));
-
-    bytecode.push_back(encodeOpcode(OP_FILE_CLOSE));
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_HALT));
-
-    bytecode.push_back(encodeOpcode(OP_FILE_CLOSE));
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(1);
-    bytecode.push_back(encodeOpcode(OP_HALT));
-
-    return {bytecode, strings};
-}
-
-static std::pair<std::vector<uint8_t>, std::vector<std::string>> compilePIFDetection() {
-    std::vector<uint8_t> bytecode;
-    std::vector<std::string> strings;
-
-    strings.push_back("/proc/self/maps");                           // 0
-    strings.push_back("es.chiteroman.playintegrityfix");           // 1
-    strings.push_back("CustomKeyStoreSpi");                         // 2
-    strings.push_back("CustomProvider");                            // 3
-    strings.push_back("PlayIntegrityFix");                         // 4
-    strings.push_back("playintegrityfix");                         // 5
-    strings.push_back("PlayIntegrityFork");                        // 6
-    strings.push_back("InMemoryDexClassLoader");                   // 7
-    strings.push_back("[anon:dalvik-DEX");                         // 8
-
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_FILE_OPEN));
-    bytecode.push_back(encodeOpcode(OP_DUP));
-
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_CMP_EQ));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(45);
-
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_FILE_READ_LINE));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_FALSE));
-    bytecode.push_back(35);
+    e.emit(OP_DUP);
+    e.emit(OP_FILE_READ_LINE);
+    e.emit(OP_JUMP_IF_FALSE); e.emit_byte(35);
 
     for (int i = 1; i <= 8; i++) {
-        bytecode.push_back(encodeOpcode(OP_DUP));
-        bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(i);
-        bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
-        bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-        bytecode.push_back(20);
+        e.emit(OP_DUP); e.emit(OP_PUSH_STR); e.emit_byte(i);
+        e.emit(OP_STR_CONTAINS);
+        e.emit(OP_JUMP_IF_TRUE); e.emit_byte(20);
     }
 
-    bytecode.push_back(encodeOpcode(OP_POP));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(static_cast<uint8_t>(-30));
+    e.emit(OP_POP);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(static_cast<uint8_t>(-30));
 
-    bytecode.push_back(encodeOpcode(OP_FILE_CLOSE));
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_HALT));
+    e.emit(OP_FILE_CLOSE);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(0);
+    e.emit(OP_HALT);
 
-    bytecode.push_back(encodeOpcode(OP_FILE_CLOSE));
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(1);
-    bytecode.push_back(encodeOpcode(OP_HALT));
+    e.emit(OP_FILE_CLOSE);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(1);
+    e.emit(OP_HALT);
 
-    return {bytecode, strings};
+    return {e.code, strings, e.hash()};
 }
 
-static std::pair<std::vector<uint8_t>, std::vector<std::string>> compileFridaDetection() {
-    std::vector<uint8_t> bytecode;
-    std::vector<std::string> strings;
+static std::tuple<std::vector<uint8_t>, std::vector<std::string>, uint32_t>
+compileFridaDetection() {
+    BytecodeEmitter e;
+    std::vector<std::string> strings = {
+        "/proc/net/unix", "frida", "xposed", "re.frida",
+        "objection", "frida-agent", "libgadget"
+    };
 
-    strings.push_back("/proc/net/unix");   // 0
-    strings.push_back("frida");            // 1
-    strings.push_back("xposed");           // 2
-    strings.push_back("re.frida");         // 3
-    strings.push_back("objection");        // 4
-    strings.push_back("frida-agent");      // 5
-    strings.push_back("libgadget");        // 6
+    e.emit(OP_PUSH_STR); e.emit_byte(0);
+    e.emit(OP_FILE_OPEN);
+    e.emit(OP_DUP);
 
-    bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_FILE_OPEN));
-    bytecode.push_back(encodeOpcode(OP_DUP));
+    e.emit_trap();
 
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_CMP_EQ));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(40);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(0);
+    e.emit(OP_CMP_EQ);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(40);
 
-    bytecode.push_back(encodeOpcode(OP_DUP));
-    bytecode.push_back(encodeOpcode(OP_FILE_READ_LINE));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_FALSE));
-    bytecode.push_back(30);
+    e.emit(OP_DUP);
+    e.emit(OP_FILE_READ_LINE);
+    e.emit(OP_JUMP_IF_FALSE); e.emit_byte(30);
 
     for (int i = 1; i <= 6; i++) {
-        bytecode.push_back(encodeOpcode(OP_DUP));
-        bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(i);
-        bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
-        bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-        bytecode.push_back(15);
+        e.emit(OP_DUP); e.emit(OP_PUSH_STR); e.emit_byte(i);
+        e.emit(OP_STR_CONTAINS);
+        e.emit(OP_JUMP_IF_TRUE); e.emit_byte(15);
     }
 
-    bytecode.push_back(encodeOpcode(OP_POP));
-    bytecode.push_back(encodeOpcode(OP_JUMP_IF_TRUE));
-    bytecode.push_back(static_cast<uint8_t>(-25));
+    e.emit(OP_POP);
+    e.emit(OP_JUMP_IF_TRUE); e.emit_byte(static_cast<uint8_t>(-25));
 
-    bytecode.push_back(encodeOpcode(OP_FILE_CLOSE));
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(0);
-    bytecode.push_back(encodeOpcode(OP_HALT));
+    e.emit(OP_FILE_CLOSE);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(0);
+    e.emit(OP_HALT);
 
-    bytecode.push_back(encodeOpcode(OP_FILE_CLOSE));
-    bytecode.push_back(encodeOpcode(OP_PUSH_IMM8)); bytecode.push_back(1);
-    bytecode.push_back(encodeOpcode(OP_HALT));
+    e.emit_trap();
 
-    return {bytecode, strings};
+    e.emit(OP_FILE_CLOSE);
+    e.emit(OP_PUSH_IMM8); e.emit_byte(1);
+    e.emit(OP_HALT);
+
+    return {e.code, strings, e.hash()};
 }
 
 static const std::string base64Chars =
@@ -1082,9 +1138,9 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
         result |= DETECTION_DEBUGGER;
 
     {
-        auto [fridaBytecode, fridaStrings] = compileFridaDetection();
-        SecureVM fridaVM(fridaBytecode, fridaStrings);
-        if (fridaVM.execute() || detectFridaPort() || detectFridaThreads())
+        auto [code, strs, hash] = compileFridaDetection();
+        SecureVM vm(code, strs, hash);
+        if (vm.execute() || detectFridaPort() || detectFridaThreads())
             result |= DETECTION_FRIDA;
     }
 
@@ -1097,10 +1153,10 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
     // randomize execution order
     std::vector<DetectionCheck> checks = {
         {0, [](JNIEnv*, jobject) -> jint {
-            auto [zygiskBytecode, zygiskStrings] = compileZygiskDetection();
-            SecureVM zygiskVM(zygiskBytecode, zygiskStrings);
+            auto [code, strs, hash] = compileZygiskDetection();
+            SecureVM vm(code, strs, hash);
             jint r = 0;
-            if (zygiskVM.execute() || isZygiskActiveEnhanced())
+            if (vm.execute() || isZygiskActiveEnhanced())
                 r |= DETECTION_ZYGISK;
             if (detectMountNS() || detectOverlayFS() ||
                 detectSELinuxAnomaly() || detectRWXMappings())
@@ -1108,9 +1164,9 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
             return r;
         }},
         {1, [](JNIEnv*, jobject) -> jint {
-            auto [pifBytecode, pifStrings] = compilePIFDetection();
-            SecureVM pifVM(pifBytecode, pifStrings);
-            if (pifVM.execute() || detectPIFSideEffects())
+            auto [code, strs, hash] = compilePIFDetection();
+            SecureVM vm(code, strs, hash);
+            if (vm.execute() || detectPIFSideEffects())
                 return DETECTION_PIF;
             return 0;
         }},
@@ -1136,7 +1192,6 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
         }},
     };
 
-    // Shuffle execution order using a simple seed from clock
     auto seed = static_cast<unsigned>(
         std::chrono::steady_clock::now().time_since_epoch().count());
     std::mt19937 rng(seed);

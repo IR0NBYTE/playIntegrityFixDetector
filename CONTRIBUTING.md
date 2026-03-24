@@ -2,9 +2,9 @@
 
 ## Ways to contribute
 
-- Bug reports — open an issue with steps to reproduce
+- Bug reports -open an issue with steps to reproduce
 - New detection artifacts (PIF/Zygisk/Frida variants)
-- Bypasses found — open a `[SECURITY]` issue or contact the maintainer directly before going public
+- Bypasses found -open a `[SECURITY]` issue or contact the maintainer directly before going public
 - Code improvements, refactoring, tests
 
 ## Build

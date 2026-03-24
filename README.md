@@ -16,15 +16,15 @@ Detects [Play Integrity Fix](https://github.com/chiteroman/PlayIntegrityFix), [P
 
 ## What it detects
 
-- **Play Integrity Fix** — maps scan for PIF classes & `InMemoryDexClassLoader` DEX regions, `custom.pif.prop`/`custom.pif.json`, module dirs, known props
-- **TrickyStore** — `keybox.xml`, `target.txt`, `security_patch.txt` under `/data/adb/tricky_store/`, maps artifacts
-- **Zygisk / Magisk / KernelSU / APatch** — maps scan for zygisk libs (incl. ReZygisk, ZygiskNext, Shamiko, NoHello), env vars, `rwxp` anomalies, module dirs
-- **Root Hiders** — mount namespace divergence, OverlayFS on `/system`, SELinux context anomalies, elevated rwxp anonymous mapping count
-- **Frida / Xposed** — unix socket scan, maps scan for gadget libs, port 27042 check, `gmain`/`gum-js-loop` thread names, parent process cmdline, Objection
-- **Property Spoofing** — cross-validation of `ro.build.fingerprint` vs `ro.product.*`, security patch vs kernel date, property read timing analysis
-- **Bootloader** — `ro.boot.verifiedbootstate`, `ro.boot.flash.locked`, `ro.boot.veritymode`, `vbmeta.device_state`, `ro.debuggable`, `ro.secure`, `sys.oem_unlock_allowed`
-- **Debuggers** — `TracerPid` from `/proc/self/status`, `FLAG_DEBUGGABLE`
-- **APK Tampering** — signing certificate hash pinned in native code
+- **Play Integrity Fix** -maps scan for PIF classes & `InMemoryDexClassLoader` DEX regions, `custom.pif.prop`/`custom.pif.json`, module dirs, known props
+- **TrickyStore** -`keybox.xml`, `target.txt`, `security_patch.txt` under `/data/adb/tricky_store/`, maps artifacts
+- **Zygisk / Magisk / KernelSU / APatch** -maps scan for zygisk libs (incl. ReZygisk, ZygiskNext, Shamiko, NoHello), env vars, `rwxp` anomalies, module dirs
+- **Root Hiders** -mount namespace divergence, OverlayFS on `/system`, SELinux context anomalies, elevated rwxp anonymous mapping count
+- **Frida / Xposed** -unix socket scan, maps scan for gadget libs, port 27042 check, `gmain`/`gum-js-loop` thread names, parent process cmdline, Objection
+- **Property Spoofing** -cross-validation of `ro.build.fingerprint` vs `ro.product.*`, security patch vs kernel date, property read timing analysis
+- **Bootloader** -`ro.boot.verifiedbootstate`, `ro.boot.flash.locked`, `ro.boot.veritymode`, `vbmeta.device_state`, `ro.debuggable`, `ro.secure`, `sys.oem_unlock_allowed`
+- **Debuggers** -`TracerPid` from `/proc/self/status`, `FLAG_DEBUGGABLE`
+- **APK Tampering** -signing certificate hash pinned in native code
 
 ## How PIF bypasses integrity checks
 
@@ -42,11 +42,11 @@ PIF runs as a Zygisk module and:
 1. **Debug/instrumentation checks** run first (fail-fast): `isTraced()`, Frida VM + port/thread scan, parent process check, debuggable flag
 2. **Tampering checks** run in randomized order each time: Zygisk VM, PIF VM, mount namespace, OverlayFS, SELinux, bootloader props, APK signature, TrickyStore paths, property consistency
 
-The VM-based checks (Frida, Zygisk, PIF) use a custom bytecode interpreter with XOR-obfuscated opcodes — harder to hook than direct function calls. Sensitive strings are base64+XOR encoded and only decoded at runtime.
+The VM-based checks (Frida, Zygisk, PIF) use a custom bytecode interpreter with XOR-obfuscated opcodes -harder to hook than direct function calls. Sensitive strings are base64+XOR encoded and only decoded at runtime.
 
 ### Return value
 
-The native function returns a bitmask — `0` means clean, any set bit indicates a detection:
+The native function returns a bitmask -`0` means clean, any set bit indicates a detection:
 
 ```
 0x001  DEBUGGER       0x010  BOOTLOADER      0x100  ROOT_HIDER
@@ -84,6 +84,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[GPL-3.0](LICENSE) — derivative works must stay open source.
+[GPL-3.0](LICENSE) -derivative works must stay open source.
 
 > This tool is for defensive security research. Use it only on devices you own or have permission to test.
