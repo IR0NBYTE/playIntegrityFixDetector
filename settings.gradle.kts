@@ -20,6 +20,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "playIntegrityFixDetector"
+rootProject.name = "pifdetector"
 include(":app")
  

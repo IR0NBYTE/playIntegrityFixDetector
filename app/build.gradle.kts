@@ -1,13 +1,14 @@
 plugins {
     alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
 }
 
 android {
-    namespace = "com.example.playIntegrityFixDetector"
+    namespace = "io.github.ir0nbyte.pifdetector"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.playIntegrityFixDetector"
+        applicationId = "io.github.ir0nbyte.pifdetector"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
@@ -58,6 +59,9 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    kotlinOptions {
+        jvmTarget = "11"
+    }
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
@@ -74,6 +78,8 @@ dependencies {
     implementation(libs.appcompat)
     implementation(libs.material)
     implementation(libs.constraintlayout)
+    implementation(libs.recyclerview)
+    implementation(libs.core.ktx)
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)

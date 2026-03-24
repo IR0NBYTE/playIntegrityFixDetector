@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project("playIntegrityFixDetector")
+project("pifdetector")
 
 add_library(${CMAKE_PROJECT_NAME} SHARED native-lib.cpp)
 

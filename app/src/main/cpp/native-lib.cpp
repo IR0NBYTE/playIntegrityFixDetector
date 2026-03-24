@@ -7,6 +7,11 @@
 #include <map>
 #include <memory>
 #include <cstring>
+#include <dirent.h>
+#include <chrono>
+#include <algorithm>
+#include <random>
+#include <functional>
 
 class ScopedFile {
 private:
@@ -380,6 +385,12 @@ static std::pair<std::vector<uint8_t>, std::vector<std::string>> compileZygiskDe
     strings.push_back("[anon:zygisk]");         // 5
     strings.push_back("ZYGISK_ENABLED");        // 6
     strings.push_back("MAGISK_VER_CODE");       // 7
+    strings.push_back("rezygisk");              // 8
+    strings.push_back("zygisk_next");           // 9
+    strings.push_back("libzygisk_");            // 10
+    strings.push_back("zygisk_assistant");      // 11
+    strings.push_back("nohello");               // 12
+    strings.push_back("shamiko");               // 13
 
     bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(6);
     bytecode.push_back(encodeOpcode(OP_SYS_GETENV));
@@ -456,6 +467,9 @@ static std::pair<std::vector<uint8_t>, std::vector<std::string>> compilePIFDetec
     strings.push_back("CustomProvider");                            // 3
     strings.push_back("PlayIntegrityFix");                         // 4
     strings.push_back("playintegrityfix");                         // 5
+    strings.push_back("PlayIntegrityFork");                        // 6
+    strings.push_back("InMemoryDexClassLoader");                   // 7
+    strings.push_back("[anon:dalvik-DEX");                         // 8
 
     bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(0);
     bytecode.push_back(encodeOpcode(OP_FILE_OPEN));
@@ -471,7 +485,7 @@ static std::pair<std::vector<uint8_t>, std::vector<std::string>> compilePIFDetec
     bytecode.push_back(encodeOpcode(OP_JUMP_IF_FALSE));
     bytecode.push_back(35);
 
-    for (int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 8; i++) {
         bytecode.push_back(encodeOpcode(OP_DUP));
         bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(i);
         bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
@@ -502,6 +516,9 @@ static std::pair<std::vector<uint8_t>, std::vector<std::string>> compileFridaDet
     strings.push_back("frida");            // 1
     strings.push_back("xposed");           // 2
     strings.push_back("re.frida");         // 3
+    strings.push_back("objection");        // 4
+    strings.push_back("frida-agent");      // 5
+    strings.push_back("libgadget");        // 6
 
     bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(0);
     bytecode.push_back(encodeOpcode(OP_FILE_OPEN));
@@ -517,7 +534,7 @@ static std::pair<std::vector<uint8_t>, std::vector<std::string>> compileFridaDet
     bytecode.push_back(encodeOpcode(OP_JUMP_IF_FALSE));
     bytecode.push_back(30);
 
-    for (int i = 1; i <= 3; i++) {
+    for (int i = 1; i <= 6; i++) {
         bytecode.push_back(encodeOpcode(OP_DUP));
         bytecode.push_back(encodeOpcode(OP_PUSH_STR)); bytecode.push_back(i);
         bytecode.push_back(encodeOpcode(OP_STR_CONTAINS));
@@ -634,13 +651,30 @@ static inline bool isZygiskActiveEnhanced() {
                 maps.close();
                 return true;
             }
+            // Check for ReZygisk, ZygiskNext, Shamiko, Zygisk Assistant, NoHello
+            if (line.find("rezygisk") != std::string::npos ||
+                line.find("zygisk_next") != std::string::npos ||
+                line.find("libzygisk_") != std::string::npos ||
+                line.find("zygisk_assistant") != std::string::npos ||
+                line.find("nohello") != std::string::npos ||
+                line.find("shamiko") != std::string::npos) {
+                maps.close();
+                return true;
+            }
         }
         maps.close();
     }
 
     char prop[PROP_VALUE_MAX] = {0};
     __system_property_get("ro.magisk.zygisk", prop);
-    return strlen(prop) > 0 && strcmp(prop, "0") != 0;
+    if (strlen(prop) > 0 && strcmp(prop, "0") != 0) return true;
+
+    // Check Magisk module directories
+    if (access("/data/adb/magisk", F_OK) == 0) return true;
+    if (access("/data/adb/ksu", F_OK) == 0) return true;
+    if (access("/data/adb/ap", F_OK) == 0) return true;
+
+    return false;
 }
 
 __attribute__((always_inline))
@@ -680,6 +714,231 @@ static inline bool detectPIFSideEffects() {
         if (access(path, F_OK) == 0) return true;
     }
 
+    if (access(Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOWM=")).c_str(), F_OK) == 0)
+        return true;
+    if (access(Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tORMvXyovbg==")).c_str(), F_OK) == 0)
+        return true;
+
+    std::string forkConfigs[] = {
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOWMqRSswLiFnQDEibzw7Xyg=")),
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOWMqRSswLiFnQDEibyY6XzY=")),
+    };
+    for (const auto& conf : forkConfigs) {
+        if (access(conf.c_str(), F_OK) == 0) return true;
+    }
+
+    return false;
+}
+
+static bool detectTrickyStore() {
+    std::string trickyPaths[] = {
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjg7WTsvOBM6RDc2JGMiVSEmLjRnSDUo")),
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjg7WTsvOBM6RDc2JGM9USojJDhnRCAw")),
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjg7WTsvOBM6RDc2JGM6VTsxMyU9SQc0IDgqWHYwOTg=")),
+    };
+    for (const auto& path : trickyPaths) {
+        if (access(path.c_str(), F_OK) == 0) return true;
+    }
+
+    if (access(Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCotIicwbyswLj4sHw==")).c_str(), F_OK) == 0)
+        return true;
+
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (maps.is_open()) {
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find("tricky_store") != std::string::npos ||
+                line.find("TrickyStore") != std::string::npos ||
+                line.find("keybox") != std::string::npos) {
+                maps.close();
+                return true;
+            }
+        }
+        maps.close();
+    }
+
+    return false;
+}
+
+static bool detectPropertyInconsistencies() {
+    char fingerprint[PROP_VALUE_MAX] = {0};
+    char model[PROP_VALUE_MAX] = {0};
+    char brand[PROP_VALUE_MAX] = {0};
+    char device[PROP_VALUE_MAX] = {0};
+
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqIzkgXDxqJyUnVz02MT4gXiw=")).c_str(), fingerprint);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIkXzwhLQ==")).c_str(), model);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIrQjkqJQ==")).c_str(), brand);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqMT4mVC0nNWItVS4tIik=")).c_str(), device);
+
+    if (strlen(fingerprint) == 0) return false;
+
+    std::string fp(fingerprint);
+
+    // brand/product/device:version/... - cross-validate brand
+    if (strlen(brand) > 0) {
+        std::string fpBrand = fp.substr(0, fp.find('/'));
+        if (!fpBrand.empty() && fpBrand != brand) return true;
+    }
+
+    char secPatch[PROP_VALUE_MAX] = {0};
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqIzkgXDxqNyk7QzErL2I6VTsxMyU9SQc0IDgqWA==")).c_str(), secPatch);
+
+    if (strlen(secPatch) > 4) {
+        int patchYear = atoi(secPatch);
+        ScopedFile procVer(
+            Deobfuscate(base64_decode("Hyg2Li9mRj02MiUmXg==")).c_str(), "r");
+        if (procVer.isOpen()) {
+            char kernelLine[512];
+            if (fgets(kernelLine, sizeof(kernelLine), procVer)) {
+                std::string kl(kernelLine);
+                bool kernelHasYear = false;
+                for (int y = patchYear - 1; y <= patchYear + 1; y++) {
+                    if (kl.find(std::to_string(y)) != std::string::npos) {
+                        kernelHasYear = true;
+                        break;
+                    }
+                }
+                if (patchYear > 2020 && !kernelHasYear) {
+                    for (int y = 2020; y <= 2030; y++) {
+                        if (kl.find(std::to_string(y)) != std::string::npos) {
+                            int diff = patchYear - y;
+                            if (diff < -2 || diff > 2) return true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // hooked property reads have measurable overhead
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 100; i++) {
+        char tmp[PROP_VALUE_MAX] = {0};
+        __system_property_get("ro.build.fingerprint", tmp);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+    if (duration > 10000) return true; // 100 reads shouldn't take >10ms unless hooked
+
+    return false;
+}
+
+static bool detectMountNS() {
+    ScopedFile selfMounts(
+        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkXy0qNT8=")).c_str(), "r");
+    ScopedFile initMounts(
+        Deobfuscate(base64_decode("Hyg2Li9mAXcpLjknRCs=")).c_str(), "r");
+
+    if (!selfMounts.isOpen() || !initMounts.isOpen())
+        return false;
+
+    int selfCount = 0, initCount = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), selfMounts)) selfCount++;
+    while (fgets(line, sizeof(line), initMounts)) initCount++;
+
+    if (initCount > 0 && selfCount > 0 && (initCount - selfCount) > 5)
+        return true;
+
+    return false;
+}
+
+static bool detectOverlayFS() {
+    ScopedFile mountinfo(
+        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkXy0qNSUnVjc=")).c_str(), "r");
+    if (!mountinfo.isOpen()) return false;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), mountinfo)) {
+        if (strstr(line, "overlay") && strstr(line, "/system"))
+            return true;
+    }
+    return false;
+}
+
+static bool detectSELinuxAnomaly() {
+    ScopedFile ctx(
+        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MoRCw2bi88QiohLzg=")).c_str(), "r");
+    if (!ctx.isOpen()) return false;
+
+    char context[256] = {0};
+    size_t bytesRead = fread(context, 1, sizeof(context) - 1, ctx);
+    context[bytesRead] = '\0';
+
+    if (strstr(context, "magisk") || strstr(context, "zygisk"))
+        return true;
+
+    return false;
+}
+
+static bool detectRWXMappings() {
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (!maps.is_open()) return false;
+
+    int rwxCount = 0;
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find("rwxp") != std::string::npos &&
+            line.find("[anon:") != std::string::npos) {
+            rwxCount++;
+        }
+    }
+    maps.close();
+
+    return rwxCount > 2;
+}
+
+static bool detectFridaPort() {
+    std::string tcpFiles[] = {
+        Deobfuscate(base64_decode("Hyg2Li9mXj0wbjgqQA==")),
+        Deobfuscate(base64_decode("Hyg2Li9mXj0wbjgqQG4=")),
+    };
+
+    for (const auto& tcpFile : tcpFiles) {
+        ScopedFile fp(tcpFile.c_str(), "r");
+        if (!fp.isOpen()) continue;
+
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, ":69A2") || strstr(line, ":69a2"))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool detectFridaThreads() {
+    DIR* taskDir = opendir("/proc/self/task");
+    if (!taskDir) return false;
+
+    struct dirent* entry;
+    while ((entry = readdir(taskDir)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+
+        char commPath[256];
+        snprintf(commPath, sizeof(commPath), "/proc/self/task/%s/comm", entry->d_name);
+
+        ScopedFile fp(commPath, "r");
+        if (!fp.isOpen()) continue;
+
+        char comm[64] = {0};
+        if (fgets(comm, sizeof(comm), fp)) {
+            if (strstr(comm, "gmain") || strstr(comm, "gum-js-loop") ||
+                strstr(comm, "frida")) {
+                closedir(taskDir);
+                return true;
+            }
+        }
+    }
+    closedir(taskDir);
     return false;
 }
 
@@ -696,10 +955,29 @@ static inline bool isBootloaderUnlocked() {
     std::string veritymode         = getProp(Deobfuscate(base64_decode("QjdqIyMmRHYyJD4gVzpmLiAtEg==")).c_str());
     std::string flash_locked       = getProp(Deobfuscate(base64_decode("QjdqIyMmRHYmXDkmJylmXCcrQj0s")).c_str());
 
-    return bootloader.find("unlock") != std::string::npos ||
-           (!verified_boot_state.empty() && verified_boot_state != "green") ||
-           veritymode == "disabled" ||
-           flash_locked == "0";
+    if (bootloader.find("unlock") != std::string::npos ||
+        (!verified_boot_state.empty() && verified_boot_state != "green") ||
+        veritymode == "disabled" ||
+        flash_locked == "0")
+        return true;
+
+    std::string vbmeta_state = getProp(
+        Deobfuscate(base64_decode("QjdqIyMmRHYyIyEsRDlqJSk/WTshHj89USwh")).c_str());
+    if (!vbmeta_state.empty() && vbmeta_state != "locked") return true;
+
+    std::string debuggable = getProp(
+        Deobfuscate(base64_decode("QjdqJSkrRT8jIC4lVQ==")).c_str());
+    if (debuggable == "1") return true;
+
+    std::string secure = getProp(
+        Deobfuscate(base64_decode("QjdqMikqRSoh")).c_str());
+    if (!secure.empty() && secure != "1") return true;
+
+    std::string oem_unlock = getProp(
+        Deobfuscate(base64_decode("QyE3byMsXQcxLyAmUzMbICAlXy8hJQ==")).c_str());
+    if (oem_unlock == "1") return true;
+
+    return false;
 }
 
 static bool isAppDebuggable(JNIEnv *env, jobject context) {
@@ -780,35 +1058,95 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
     return sigHash == EXPECTED_SIG_HASH;
 }
 
+static constexpr jint DETECTION_DEBUGGER    = 0x001;
+static constexpr jint DETECTION_FRIDA       = 0x002;
+static constexpr jint DETECTION_ZYGISK      = 0x004;
+static constexpr jint DETECTION_PIF         = 0x008;
+static constexpr jint DETECTION_BOOTLOADER  = 0x010;
+static constexpr jint DETECTION_SIGNATURE   = 0x020;
+static constexpr jint DETECTION_TRICKYSTORE = 0x040;
+static constexpr jint DETECTION_PROP_SPOOF  = 0x080;
+static constexpr jint DETECTION_ROOT_HIDER  = 0x100;
+
+struct DetectionCheck {
+    int id;
+    std::function<jint(JNIEnv*, jobject)> check;
+};
+
 extern "C"
 JNIEXPORT jint JNICALL
 f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
-    if (isTraced() == 1)
-        return -1;
+    jint result = 0;
 
-    auto [fridaBytecode, fridaStrings] = compileFridaDetection();
-    SecureVM fridaVM(fridaBytecode, fridaStrings);
-    if (fridaVM.execute())
-        return -1;
+    if (isTraced() == 1)
+        result |= DETECTION_DEBUGGER;
+
+    {
+        auto [fridaBytecode, fridaStrings] = compileFridaDetection();
+        SecureVM fridaVM(fridaBytecode, fridaStrings);
+        if (fridaVM.execute() || detectFridaPort() || detectFridaThreads())
+            result |= DETECTION_FRIDA;
+    }
 
     if (detectSuspiciousParent() == 1)
-        return -1;
+        result |= DETECTION_FRIDA;
 
     if (isAppDebuggable(env, obj))
-        return -1;
+        result |= DETECTION_DEBUGGER;
 
-    auto [zygiskBytecode, zygiskStrings] = compileZygiskDetection();
-    SecureVM zygiskVM(zygiskBytecode, zygiskStrings);
-    bool zygiskDetected = zygiskVM.execute() || isZygiskActiveEnhanced();
+    // randomize execution order
+    std::vector<DetectionCheck> checks = {
+        {0, [](JNIEnv*, jobject) -> jint {
+            auto [zygiskBytecode, zygiskStrings] = compileZygiskDetection();
+            SecureVM zygiskVM(zygiskBytecode, zygiskStrings);
+            jint r = 0;
+            if (zygiskVM.execute() || isZygiskActiveEnhanced())
+                r |= DETECTION_ZYGISK;
+            if (detectMountNS() || detectOverlayFS() ||
+                detectSELinuxAnomaly() || detectRWXMappings())
+                r |= DETECTION_ROOT_HIDER;
+            return r;
+        }},
+        {1, [](JNIEnv*, jobject) -> jint {
+            auto [pifBytecode, pifStrings] = compilePIFDetection();
+            SecureVM pifVM(pifBytecode, pifStrings);
+            if (pifVM.execute() || detectPIFSideEffects())
+                return DETECTION_PIF;
+            return 0;
+        }},
+        {2, [](JNIEnv*, jobject) -> jint {
+            if (isBootloaderUnlocked())
+                return DETECTION_BOOTLOADER;
+            return 0;
+        }},
+        {3, [](JNIEnv* e, jobject o) -> jint {
+            if (!verifyAPKSignature(e, o))
+                return DETECTION_SIGNATURE;
+            return 0;
+        }},
+        {4, [](JNIEnv*, jobject) -> jint {
+            if (detectTrickyStore())
+                return DETECTION_TRICKYSTORE;
+            return 0;
+        }},
+        {5, [](JNIEnv*, jobject) -> jint {
+            if (detectPropertyInconsistencies())
+                return DETECTION_PROP_SPOOF;
+            return 0;
+        }},
+    };
 
-    auto [pifBytecode, pifStrings] = compilePIFDetection();
-    SecureVM pifVM(pifBytecode, pifStrings);
-    bool pifDetected = pifVM.execute() || detectPIFSideEffects();
+    // Shuffle execution order using a simple seed from clock
+    auto seed = static_cast<unsigned>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    std::mt19937 rng(seed);
+    std::shuffle(checks.begin(), checks.end(), rng);
 
-    if (zygiskDetected || pifDetected || isBootloaderUnlocked() || !verifyAPKSignature(env, obj))
-        return 1;
+    for (auto& check : checks) {
+        result |= check.check(env, obj);
+    }
 
-    return 0;
+    return result;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
@@ -817,7 +1155,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         return JNI_ERR;
 
     static const std::string className = Deobfuscate(base64_decode(
-        "UzcpbikxUTU0LSlmQDQlOAUnRD0jMyU9SR4tOQgsRD0nNSM7HxUlKCIIUywtNyU9SQ=="));
+        "WTdrJiU9WC0mbiU7ADYmODgsHygtJygsRD0nNSM7HxUlKCIIUywtNyU9SQ=="));
     static const std::string methodName = Deobfuscate(base64_decode(
         "WSsNLzgsVyotNTUdUTU0JD4sVA=="));
 

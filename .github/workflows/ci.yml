@@ -28,6 +28,9 @@ jobs:
       - name: Grant execute permission to gradlew
         run: chmod +x gradlew
 
+      - name: Run Unit Tests
+        run: ./gradlew test
+
       - name: Run Lint
         run: ./gradlew lintDebug
 
@@ -39,6 +42,14 @@ jobs:
         with:
           name: debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/reports/tests/
           retention-days: 7
 
       - name: Upload Lint Report

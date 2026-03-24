@@ -21,13 +21,14 @@ Requires Android Studio Hedgehog+, NDK r25+, SDK 35.
 
 Building from source means the APK integrity check will reject your binary since the signing key differs. To fix it:
 
-1. Add this temporarily to `MainActivity.java` inside `onCreate`:
-```java
+1. Add this temporarily to `MainActivity.kt` inside `onCreate`:
+```kotlin
 try {
-    PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), PackageManager.GET_SIGNATURES);
-    for (Signature sig : pi.signatures)
-        android.util.Log.w("SIG_HASH", "Hash: " + sig.hashCode());
-} catch (Exception ignored) {}
+    val pi = packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+    pi.signatures?.forEach { sig ->
+        android.util.Log.w("SIG_HASH", "Hash: ${sig.hashCode()}")
+    }
+} catch (_: Exception) {}
 ```
 2. `adb logcat | grep SIG_HASH` to grab the value
 3. Replace `EXPECTED_SIG_HASH` in `native-lib.cpp` with your hash
@@ -35,7 +36,7 @@ try {
 
 ## Code style
 
-- Java: standard Android conventions, no wildcard imports
+- Kotlin: standard Android conventions, no wildcard imports
 - C++: C++17, explicit `std::`, RAII for all resources, no debug logging in native code
 
 ## Pull requests
