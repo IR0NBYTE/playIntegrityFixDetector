@@ -16,6 +16,8 @@ data class DetectionResult(
         const val DETECTION_TRICKYSTORE = 0x040
         const val DETECTION_PROP_SPOOF = 0x080
         const val DETECTION_ROOT_HIDER = 0x100
+        const val DETECTION_PIF_STREAM = 0x200
+        const val DETECTION_CANARY_FP = 0x400
 
         fun fromBitmask(bitmask: Int): List<DetectionResult> = listOf(
             DetectionResult(
@@ -43,6 +45,12 @@ data class DetectionResult(
                 bitmask and DETECTION_PIF != 0
             ),
             DetectionResult(
+                "PIF Companion Streaming",
+                "inject-s v4.5 payload streamed via Zygisk companion / memfd",
+                DETECTION_PIF_STREAM,
+                bitmask and DETECTION_PIF_STREAM != 0
+            ),
+            DetectionResult(
                 "Bootloader Unlocked",
                 "Device bootloader is unlocked or verified boot compromised",
                 DETECTION_BOOTLOADER,
@@ -55,16 +63,22 @@ data class DetectionResult(
                 bitmask and DETECTION_SIGNATURE != 0
             ),
             DetectionResult(
-                "TrickyStore",
-                "TrickyStore keybox spoofing module detected",
+                "TrickyStore / KeyboxHub",
+                "Keybox spoofing module or auto-rotating KeyboxHub detected",
                 DETECTION_TRICKYSTORE,
                 bitmask and DETECTION_TRICKYSTORE != 0
             ),
             DetectionResult(
                 "Property Spoofing",
-                "Build properties inconsistent or hook detected",
+                "Build property inconsistency or motherboard spoof detected",
                 DETECTION_PROP_SPOOF,
                 bitmask and DETECTION_PROP_SPOOF != 0
+            ),
+            DetectionResult(
+                "Pixel Canary Fingerprint",
+                "autopif4 monthly Pixel Canary build fingerprint detected",
+                DETECTION_CANARY_FP,
+                bitmask and DETECTION_CANARY_FP != 0
             ),
             DetectionResult(
                 "Root Hider",

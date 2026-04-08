@@ -46,6 +46,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun performInitialSecurityCheck(): Boolean {
+        // Debug builds bypass the RootBeer gate so the detection engine can
+        // be tested on dev devices where RootBeer commonly false-positives
+        // (e.g. Samsung Knox). Release builds keep the gate enforced.
+        if (BuildConfig.DEBUG) return true
+
         if (rootChecker?.isRooted == true) {
             showSecurityAlert(
                 "Root Detected",

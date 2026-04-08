@@ -791,6 +791,9 @@ static bool detectTrickyStore() {
         Deobfuscate(base64_decode("HzwlNS1mUTwmbjg7WTsvOBM6RDc2JGMiVSEmLjRnSDUo")),
         Deobfuscate(base64_decode("HzwlNS1mUTwmbjg7WTsvOBM6RDc2JGM9USojJDhnRCAw")),
         Deobfuscate(base64_decode("HzwlNS1mUTwmbjg7WTsvOBM6RDc2JGM6VTsxMyU9SQc0IDgqWHYwOTg=")),
+        // PIFS KeyboxHub paths (auto-rotating keybox source, April 2026)
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mWz09IyMxWC0m")),  // /data/adb/modules/keyboxhub
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbicsSTorOWIxXTQ=")),          // /data/adb/keybox.xml
     };
     for (const auto& path : trickyPaths) {
         if (access(path.c_str(), F_OK) == 0) return true;
@@ -805,7 +808,9 @@ static bool detectTrickyStore() {
         while (std::getline(maps, line)) {
             if (line.find("tricky_store") != std::string::npos ||
                 line.find("TrickyStore") != std::string::npos ||
-                line.find("keybox") != std::string::npos) {
+                line.find("keybox") != std::string::npos ||
+                line.find("keyboxhub") != std::string::npos ||
+                line.find("KeyboxHub") != std::string::npos) {
                 maps.close();
                 return true;
             }
@@ -883,6 +888,64 @@ static bool detectPropertyInconsistencies() {
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
     if (duration > 10000) return true; // 100 reads shouldn't take >10ms unless hooked
+
+    /*
+     * Motherboard spoof check (PIFS April 2026): tryigit's PIFS rewrites
+     * ro.product.board to a Pixel motherboard but the kernel-exposed
+     * Hardware line in /proc/cpuinfo still reports the original SoC.
+     * Pixels run on Tensor (gs101/gs201/zuma/zumapro), so a Pixel board
+     * with non-Tensor cpuinfo is a strong spoof signal.
+     */
+    char board[PROP_VALUE_MAX] = {0};
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIrXzk2JQ==")).c_str(), board);
+
+    if (strlen(board) > 0) {
+        ScopedFile cpuinfo(
+            Deobfuscate(base64_decode("Hyg2Li9mUygxKCIvXw==")).c_str(), "r");
+        if (cpuinfo.isOpen()) {
+            char cpuLine[512];
+            std::string cpuHardware;
+            while (fgets(cpuLine, sizeof(cpuLine), cpuinfo)) {
+                if (strncmp(cpuLine, "Hardware", 8) == 0) {
+                    char* colon = strchr(cpuLine, ':');
+                    if (colon) {
+                        cpuHardware = colon + 1;
+                        size_t s = cpuHardware.find_first_not_of(" \t");
+                        size_t e = cpuHardware.find_last_not_of(" \t\r\n");
+                        if (s != std::string::npos && e != std::string::npos)
+                            cpuHardware = cpuHardware.substr(s, e - s + 1);
+                        break;
+                    }
+                }
+            }
+
+            if (!cpuHardware.empty()) {
+                std::string b(board);
+                std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+                std::string h = cpuHardware;
+                std::transform(h.begin(), h.end(), h.begin(), ::tolower);
+
+                static const char* pixelBoards[] = {
+                    "panther", "cheetah", "lynx", "felix", "tangorpro",
+                    "shiba", "husky", "akita", "comet", "tegu",
+                    "tokay", "caiman", "komodo", "redondo"
+                };
+                for (const char* pb : pixelBoards) {
+                    if (b.find(pb) != std::string::npos) {
+                        // Pixel boards must run on Tensor SoCs
+                        if (h.find("tensor") == std::string::npos &&
+                            h.find("gs101") == std::string::npos &&
+                            h.find("gs201") == std::string::npos &&
+                            h.find("zuma") == std::string::npos) {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     return false;
 }
@@ -995,6 +1058,186 @@ static bool detectFridaThreads() {
         }
     }
     closedir(taskDir);
+    return false;
+}
+
+/*
+ * Detects KOWX712/PlayIntegrityFix inject-s v4.5 (March 2026) technique:
+ * payload streamed over a Zygisk companion IPC channel as memfd, dropping
+ * the on-disk JSON config that older detectors looked for. We chase three
+ * orthogonal signals -- companion socket, memfd-backed dex, and the
+ * lightweight no-JSON module footprint -- so each one carries the check.
+ */
+static bool detectCompanionStreaming() {
+    std::string unixPaths[] = {
+        Deobfuscate(base64_decode("Hyg2Li9mXj0wbjknWSA=")),       // /proc/net/unix
+        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MnVSxrNCIgSA==")) // /proc/self/net/unix
+    };
+    for (const auto& path : unixPaths) {
+        ScopedFile fp(path.c_str(), "r");
+        if (!fp.isOpen()) continue;
+
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "zygisk_companion") ||
+                strstr(line, "zygisk-comp") ||
+                strstr(line, "pif_companion") ||
+                strstr(line, "@injects") ||
+                strstr(line, "inject-s")) {
+                return true;
+            }
+        }
+    }
+
+    /*
+     * memfd_create-backed mappings. Android 9+ ART legitimately uses memfd
+     * for jit-cache, dalvik-* regions, so we can only flag memfd regions
+     * that are BOTH rwxp (writable + executable, rare for legit code) AND
+     * not tagged with any known ART allocator name. Streamed DEX payloads
+     * tend to land as unnamed memfds or memfd:<custom> with rwxp.
+     */
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (maps.is_open()) {
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find("memfd:") == std::string::npos) continue;
+            if (line.find("rwxp") == std::string::npos) continue;
+
+            // Whitelist known ART allocator names
+            if (line.find("jit-cache") != std::string::npos) continue;
+            if (line.find("jit-zygote") != std::string::npos) continue;
+            if (line.find("dalvik-") != std::string::npos) continue;
+            if (line.find("dalvik_") != std::string::npos) continue;
+            if (line.find("scudo:") != std::string::npos) continue;
+            if (line.find("shmem") != std::string::npos) continue;
+
+            maps.close();
+            return true;
+        }
+        maps.close();
+    }
+
+    /*
+     * inject-s v4.5 signature: module installed but no pif.json config.
+     * Older PIF + the inject branch always shipped a config file. v4.5
+     * dropped the JSON format entirely.
+     */
+    std::string moduleDir =
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOQ=="));
+    std::string companionDir =
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOWMqXzU0ICIgXzY="));
+    std::string forkZygiskDir =
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4rMydmSiEjKD8i"));
+
+    if (access(companionDir.c_str(), F_OK) == 0) return true;
+    if (access(forkZygiskDir.c_str(), F_OK) == 0) return true;
+
+    if (access(moduleDir.c_str(), F_OK) == 0) {
+        std::string jsonPath = moduleDir + "/pif.json";
+        std::string customPath = moduleDir + "/custom.pif.json";
+        if (access(jsonPath.c_str(), F_OK) != 0 &&
+            access(customPath.c_str(), F_OK) != 0) {
+            return true;  // module live with no JSON -> v4.5 lightweight format
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Detects osm0sis PlayIntegrityFork autopif4 (Jan 2026) technique:
+ * monthly Pixel Canary build fingerprints. Canary IDs follow a strict
+ * format and rotate monthly to dodge fingerprint blacklists, but autopif4
+ * only spoofs ro.build.* -- the vendor and system partitions still leak
+ * the original build identity.
+ *
+ * All checks are gated on the fingerprint claiming to be a Google Pixel
+ * (`google/...`). Non-Google OEMs legitimately ship with different vendor
+ * vs system partition build IDs (e.g. Samsung's vendor may be 2 Android
+ * versions behind) and use Android-standard build ID formats like
+ * UP1A.231005.007, so we cannot apply these checks cross-vendor.
+ */
+static bool detectPixelCanaryFingerprint() {
+    char fingerprint[PROP_VALUE_MAX] = {0};
+    char buildId[PROP_VALUE_MAX] = {0};
+    char sysBuildId[PROP_VALUE_MAX] = {0};
+    char brand[PROP_VALUE_MAX] = {0};
+
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqIzkgXDxqJyUnVz02MT4gXiw=")).c_str(), fingerprint);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqIzkgXDxqKCg=")).c_str(), buildId);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqMjU6RD0pby48WTQgbyUt")).c_str(), sysBuildId);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIrQjkqJQ==")).c_str(), brand);
+
+    if (strlen(fingerprint) == 0 || strlen(buildId) == 0) return false;
+
+    std::string fp(fingerprint);
+    std::string id(buildId);
+
+    /* Gate: fingerprint must claim to be a Pixel build. Non-Google brands
+     * that claim google/ anywhere in the fingerprint are a direct spoof. */
+    if (fp.compare(0, 7, "google/") != 0) {
+        if (fp.find("google/") != std::string::npos) {
+            if (strlen(brand) > 0) {
+                std::string b(brand);
+                std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+                if (b != "google") return true;
+            }
+        }
+        return false;
+    }
+
+    /* From here fingerprint starts with "google/". Real Pixels report
+     * brand=google; anything else is a spoof. */
+    if (strlen(brand) > 0) {
+        std::string b(brand);
+        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+        if (b != "google") return true;
+    }
+
+    /* autopif4 spoofs ro.build.id but ro.system.build.id stays original */
+    if (strlen(sysBuildId) > 0 && strcmp(buildId, sysBuildId) != 0) {
+        return true;
+    }
+
+    /* Canary build ID format: 2 letters + digit + alnum + . + 6 digits + . + 3 digits
+     * e.g. BP31.250307.001, AP4A.250605.005, ZP3A.260118.012. Note this also
+     * matches Android-standard release IDs like UP1A.231005.007, so we only
+     * apply the vendor-leak check after confirming the fingerprint is Pixel. */
+    auto looksLikePixelBuildId = [](const std::string& s) -> bool {
+        if (s.size() < 15) return false;
+        if (!isalpha(static_cast<unsigned char>(s[0])) ||
+            !isalpha(static_cast<unsigned char>(s[1]))) return false;
+        if (!isdigit(static_cast<unsigned char>(s[2])) ||
+            !isalnum(static_cast<unsigned char>(s[3]))) return false;
+        if (s[4] != '.') return false;
+        for (int i = 5; i < 11; i++)
+            if (!isdigit(static_cast<unsigned char>(s[i]))) return false;
+        if (s[11] != '.') return false;
+        for (int i = 12; i < 15; i++)
+            if (!isdigit(static_cast<unsigned char>(s[i]))) return false;
+        return true;
+    };
+
+    if (looksLikePixelBuildId(id)) {
+        /* On a legit Pixel the vendor partition fp must reference the same
+         * build ID. autopif4 only touches top-level, leaving vendor at the
+         * original build. */
+        char vendorFp[PROP_VALUE_MAX] = {0};
+        __system_property_get("ro.vendor.build.fingerprint", vendorFp);
+        if (strlen(vendorFp) > 0) {
+            std::string vfp(vendorFp);
+            if (vfp.find(id) == std::string::npos) return true;
+        }
+    }
+
+    /* Real Pixel fingerprints always embed ro.build.id. PIFS sometimes
+     * spoofs only the fingerprint string without updating ro.build.id. */
+    if (fp.find(id) == std::string::npos) return true;
+
     return false;
 }
 
@@ -1123,6 +1366,8 @@ static constexpr jint DETECTION_SIGNATURE   = 0x020;
 static constexpr jint DETECTION_TRICKYSTORE = 0x040;
 static constexpr jint DETECTION_PROP_SPOOF  = 0x080;
 static constexpr jint DETECTION_ROOT_HIDER  = 0x100;
+static constexpr jint DETECTION_PIF_STREAM  = 0x200;  // inject-s v4.5 companion-IPC streaming
+static constexpr jint DETECTION_CANARY_FP   = 0x400;  // autopif4 Pixel Canary fingerprint
 
 struct DetectionCheck {
     int id;
@@ -1168,9 +1413,12 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
         {1, [](JNIEnv*, jobject) -> jint {
             auto [code, strs, hash] = compilePIFDetection();
             SecureVM vm(code, strs, hash);
+            jint r = 0;
             if (vm.execute() || detectPIFSideEffects())
-                return DETECTION_PIF;
-            return 0;
+                r |= DETECTION_PIF;
+            if (detectCompanionStreaming())
+                r |= DETECTION_PIF_STREAM;
+            return r;
         }},
         {2, [](JNIEnv*, jobject) -> jint {
             if (isBootloaderUnlocked())
@@ -1190,6 +1438,11 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
         {5, [](JNIEnv*, jobject) -> jint {
             if (detectPropertyInconsistencies())
                 return DETECTION_PROP_SPOOF;
+            return 0;
+        }},
+        {6, [](JNIEnv*, jobject) -> jint {
+            if (detectPixelCanaryFingerprint())
+                return DETECTION_CANARY_FP;
             return 0;
         }},
     };
