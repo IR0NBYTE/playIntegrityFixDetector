@@ -1,32 +1,40 @@
 package io.github.ir0nbyte.pifdetector
 
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.util.Log
 import android.view.View
+import android.widget.Button
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.scottyab.rootbeer.RootBeer
 import io.github.ir0nbyte.pifdetector.databinding.ActivityMainBinding
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
     private var binding: ActivityMainBinding? = null
-    private var rootChecker: RootBeer? = null
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val mainHandler = Handler(Looper.getMainLooper())
     private val resultAdapter = ResultAdapter()
+    private val runner = DetectionRunner()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (!nativeLibLoaded) {
-            showErrorAndExit("Native security module failed to load")
+        if (!DetectionRunner.isAvailable) {
+            showErrorAndExit(getString(R.string.dialog_native_lib_failed))
             return
+        }
+
+        if (!runner.verifyFlagsInSync(DetectionResult.ALL_FLAGS_MASK)) {
+            // SSOT drift: native and Kotlin disagree on the flag set.
+            // Always log; surface as a toast in debug builds so it can't
+            // be silently shipped.
+            Log.e(TAG, "Bitmask flag SSOT mismatch -- check DetectionResult.kt vs native-lib.cpp")
+            if (BuildConfig.DEBUG) {
+                Toast.makeText(this,
+                    "DEV: bitmask flag SSOT mismatch (see logcat)",
+                    Toast.LENGTH_LONG).show()
+            }
         }
 
         val activityBinding = ActivityMainBinding.inflate(layoutInflater)
@@ -38,119 +46,75 @@ class MainActivity : AppCompatActivity() {
             adapter = resultAdapter
         }
 
-        rootChecker = RootBeer(this)
-
-        if (performInitialSecurityCheck()) {
-            setupDetectionButton()
-        }
-    }
-
-    private fun performInitialSecurityCheck(): Boolean {
-        // Debug builds bypass the RootBeer gate so the detection engine can
-        // be tested on dev devices where RootBeer commonly false-positives
-        // (e.g. Samsung Knox). Release builds keep the gate enforced.
-        if (BuildConfig.DEBUG) return true
-
-        if (rootChecker?.isRooted == true) {
-            showSecurityAlert(
-                "Root Detected",
-                "This device has been rooted. The app cannot verify integrity on compromised systems."
-            )
-            return false
-        }
-        return true
+        setupDetectionButton()
     }
 
     private fun setupDetectionButton() {
         val detectBtn = binding?.button2 ?: return
-
         detectBtn.setOnClickListener {
             detectBtn.isEnabled = false
-            detectBtn.text = "Checking..."
-            binding?.statusSubtitle?.text = "Running integrity checks..."
+            detectBtn.setText(R.string.button_running)
+            binding?.statusSubtitle?.setText(R.string.status_running_subtitle)
             runIntegrityCheck(detectBtn)
         }
     }
 
-    private fun runIntegrityCheck(detectBtn: android.widget.Button) {
-        executor.execute {
-            val result = isIntegrityTampered()
+    private fun runIntegrityCheck(detectBtn: Button) {
+        runner.runCheck { bitmask ->
+            // DetectionRunner.shutdown() suppresses callbacks after destroy,
+            // so we don't need an isFinishing/isDestroyed guard here.
+            detectBtn.isEnabled = true
+            detectBtn.setText(R.string.button_run)
 
-            mainHandler.post {
-                if (isFinishing || isDestroyed) return@post
+            val results = DetectionResult.fromBitmask(bitmask)
+            val detectedCount = results.count { it.detected }
+            resultAdapter.submitList(results)
+            binding?.resultsRecyclerView?.visibility = View.VISIBLE
 
-                detectBtn.isEnabled = true
-                detectBtn.text = "Run Integrity Check"
-
-                val results = DetectionResult.fromBitmask(result)
-                val detectedCount = results.count { it.detected }
-
-                resultAdapter.submitResults(results)
-                binding?.resultsRecyclerView?.visibility = View.VISIBLE
-
-                updateStatusCard(detectedCount, results.size)
-            }
+            updateStatusCard(detectedCount, results.size)
         }
     }
 
     private fun updateStatusCard(detectedCount: Int, totalCount: Int) {
         val b = binding ?: return
-
-        if (detectedCount == 0) {
-            b.statusTitle.text = "Integrity Verified"
-            b.statusSubtitle.text = "All $totalCount checks passed"
-            b.statusIcon.setImageResource(R.drawable.ic_check)
-            b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_pass))
-            b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_clean))
-        } else {
-            b.statusTitle.text = "Integrity Violation"
-            b.statusSubtitle.text = "$detectedCount of $totalCount checks failed"
-            b.statusIcon.setImageResource(R.drawable.ic_warning)
-            b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_fail))
-            b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_detected))
-        }
+        if (detectedCount == 0) renderClean(b, totalCount)
+        else renderViolation(b, detectedCount, totalCount)
     }
 
-    private fun showSecurityAlert(title: String, message: String) {
-        if (isFinishing || isDestroyed) return
+    private fun renderClean(b: ActivityMainBinding, total: Int) {
+        b.statusTitle.setText(R.string.status_pass_title)
+        b.statusSubtitle.text = getString(R.string.status_pass_subtitle, total)
+        b.statusIcon.setImageResource(R.drawable.ic_check)
+        b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_pass))
+        b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_clean))
+    }
 
-        AlertDialog.Builder(this)
-            .setTitle(title)
-            .setMessage(message)
-            .setCancelable(false)
-            .setPositiveButton("Exit") { _, _ -> finish() }
-            .show()
+    private fun renderViolation(b: ActivityMainBinding, detected: Int, total: Int) {
+        b.statusTitle.setText(R.string.status_fail_title)
+        b.statusSubtitle.text = getString(R.string.status_fail_subtitle, detected, total)
+        b.statusIcon.setImageResource(R.drawable.ic_warning)
+        b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_fail))
+        b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_detected))
     }
 
     private fun showErrorAndExit(message: String) {
         if (isFinishing || isDestroyed) return
 
         AlertDialog.Builder(this)
-            .setTitle("Error")
+            .setTitle(R.string.dialog_error_title)
             .setMessage(message)
             .setCancelable(false)
-            .setPositiveButton("Exit") { _, _ -> finish() }
+            .setPositiveButton(R.string.dialog_button_exit) { _, _ -> finish() }
             .show()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        executor.shutdownNow()
+        runner.shutdown()
         binding = null
-        rootChecker = null
     }
 
-    private external fun isIntegrityTampered(): Int
-
-    companion object {
-        private var nativeLibLoaded = false
-
-        init {
-            try {
-                System.loadLibrary("pifdetector")
-                nativeLibLoaded = true
-            } catch (_: UnsatisfiedLinkError) {
-            }
-        }
+    private companion object {
+        const val TAG = "MainActivity"
     }
 }

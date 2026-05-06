@@ -6,16 +6,11 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 
-class ResultAdapter : RecyclerView.Adapter<ResultAdapter.ViewHolder>() {
-
-    private var results: List<DetectionResult> = emptyList()
-
-    fun submitResults(newResults: List<DetectionResult>) {
-        results = newResults
-        notifyDataSetChanged()
-    }
+class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIFF) {
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
@@ -24,10 +19,8 @@ class ResultAdapter : RecyclerView.Adapter<ResultAdapter.ViewHolder>() {
     }
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-        holder.bind(results[position])
+        holder.bind(getItem(position))
     }
-
-    override fun getItemCount(): Int = results.size
 
     class ViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val iconView: ImageView = itemView.findViewById(R.id.statusIcon)
@@ -36,20 +29,36 @@ class ResultAdapter : RecyclerView.Adapter<ResultAdapter.ViewHolder>() {
         private val statusView: TextView = itemView.findViewById(R.id.checkStatus)
 
         fun bind(result: DetectionResult) {
+            bindData(result)
+            applyStatusStyle(result.detected)
+        }
+
+        private fun bindData(result: DetectionResult) {
             nameView.text = result.name
             descView.text = result.description
+        }
 
-            if (result.detected) {
-                statusView.text = "DETECTED"
-                statusView.setTextColor(ContextCompat.getColor(itemView.context, R.color.status_fail))
-                iconView.setImageResource(R.drawable.ic_warning)
-                iconView.setColorFilter(ContextCompat.getColor(itemView.context, R.color.status_fail))
+        private fun applyStatusStyle(detected: Boolean) {
+            val ctx = itemView.context
+            val (textRes, colorRes, iconRes) = if (detected) {
+                Triple(R.string.result_status_detected, R.color.status_fail, R.drawable.ic_warning)
             } else {
-                statusView.text = "PASS"
-                statusView.setTextColor(ContextCompat.getColor(itemView.context, R.color.status_pass))
-                iconView.setImageResource(R.drawable.ic_check)
-                iconView.setColorFilter(ContextCompat.getColor(itemView.context, R.color.status_pass))
+                Triple(R.string.result_status_pass, R.color.status_pass, R.drawable.ic_check)
             }
+            statusView.setText(textRes)
+            val color = ContextCompat.getColor(ctx, colorRes)
+            statusView.setTextColor(color)
+            iconView.setImageResource(iconRes)
+            iconView.setColorFilter(color)
+        }
+    }
+
+    private companion object {
+        val DIFF = object : DiffUtil.ItemCallback<DetectionResult>() {
+            override fun areItemsTheSame(old: DetectionResult, new: DetectionResult) =
+                old.flag == new.flag
+            override fun areContentsTheSame(old: DetectionResult, new: DetectionResult) =
+                old == new
         }
     }
 }

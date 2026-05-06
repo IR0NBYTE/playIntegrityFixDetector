@@ -1,3 +1,21 @@
 <resources>
     <string name="app_name">PIF Detector</string>
+
+    <string name="status_initial_title">PIF Detector</string>
+    <string name="status_initial_subtitle">Tap below to run integrity checks</string>
+    <string name="status_running_subtitle">Running integrity checks…</string>
+    <string name="status_pass_title">Integrity Verified</string>
+    <string name="status_pass_subtitle">All %1$d checks passed</string>
+    <string name="status_fail_title">Integrity Violation</string>
+    <string name="status_fail_subtitle">%1$d of %2$d checks failed</string>
+
+    <string name="button_run">Run Integrity Check</string>
+    <string name="button_running">Checking…</string>
+
+    <string name="dialog_error_title">Error</string>
+    <string name="dialog_native_lib_failed">Native security module failed to load</string>
+    <string name="dialog_button_exit">Exit</string>
+
+    <string name="result_status_detected">DETECTED</string>
+    <string name="result_status_pass">PASS</string>
 </resources>

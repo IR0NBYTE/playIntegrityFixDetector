@@ -3,6 +3,12 @@
 #include <unistd.h>
 #include <fstream>
 #include <sys/system_properties.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <sys/select.h>
 #include <vector>
 #include <map>
 #include <memory>
@@ -12,6 +18,13 @@
 #include <algorithm>
 #include <random>
 #include <functional>
+
+#ifdef IS_DEBUG_BUILD
+#include <android/log.h>
+#define LOGD(fmt, ...) __android_log_print(ANDROID_LOG_DEBUG, "pifd", fmt, ##__VA_ARGS__)
+#else
+#define LOGD(fmt, ...) ((void)0)
+#endif
 
 class ScopedFile {
 private:
@@ -25,6 +38,29 @@ public:
 
     ScopedFile(const ScopedFile&) = delete;
     ScopedFile& operator=(const ScopedFile&) = delete;
+};
+
+/*
+ * RAII for JNI local references. The local-ref table defaults to 512 slots
+ * per native frame; long-running detection paths used to leak refs on every
+ * early-return branch. Wrapping every Find/Call/GetField in LocalRef makes
+ * cleanup automatic regardless of exit point.
+ */
+template <typename T>
+class LocalRef {
+    JNIEnv* env_;
+    T ref_;
+public:
+    LocalRef(JNIEnv* env, T ref) : env_(env), ref_(ref) {}
+    ~LocalRef() { if (ref_) env_->DeleteLocalRef(ref_); }
+
+    LocalRef(const LocalRef&) = delete;
+    LocalRef& operator=(const LocalRef&) = delete;
+    LocalRef(LocalRef&& o) noexcept : env_(o.env_), ref_(o.ref_) { o.ref_ = nullptr; }
+
+    operator T() const { return ref_; }
+    T get() const { return ref_; }
+    explicit operator bool() const { return ref_ != nullptr; }
 };
 
 /*
@@ -878,7 +914,13 @@ static bool detectPropertyInconsistencies() {
         }
     }
 
-    // hooked property reads have measurable overhead
+    /*
+     * Hooked property reads have measurable overhead. 50ms threshold for
+     * 100 reads tolerates thermal-throttled ARM cores under load -- the
+     * old 10ms threshold false-positived on slow devices. On unhooked
+     * Android the same loop runs in 1-2ms, so 50ms still has 25x headroom
+     * before flagging.
+     */
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 100; i++) {
         char tmp[PROP_VALUE_MAX] = {0};
@@ -887,7 +929,7 @@ static bool detectPropertyInconsistencies() {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-    if (duration > 10000) return true; // 100 reads shouldn't take >10ms unless hooked
+    if (duration > 50000) return true;
 
     /*
      * Motherboard spoof check (PIFS April 2026): tryigit's PIFS rewrites
@@ -1015,7 +1057,52 @@ static bool detectRWXMappings() {
     return rwxCount > 2;
 }
 
+/*
+ * Android 10+ filters /proc/net/tcp to empty for untrusted_app via SELinux,
+ * so the legacy procfs scan can't see a root-owned frida-server socket.
+ * A TCP connect to localhost is allowed for untrusted apps; if the port
+ * is listening, connect() returns 0. We probe 27042 (default frida-server
+ * control) and 27043 (D-Bus side channel some builds expose).
+ */
+static bool tryConnectLoopback(uint16_t port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int rc = connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    bool listening = false;
+    if (rc == 0) {
+        listening = true;
+    } else if (errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        timeval tv{0, 200000}; // 200 ms
+        if (select(sock + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
+                listening = true;
+        }
+    }
+    close(sock);
+    return listening;
+}
+
 static bool detectFridaPort() {
+    if (tryConnectLoopback(27042) || tryConnectLoopback(27043))
+        return true;
+
+    // Fallback: legacy procfs scan -- harmless on Android 10+ (returns empty)
+    // but still works on older devices and on systems where the SELinux
+    // policy doesn't filter /proc/net/tcp for untrusted apps.
     std::string tcpFiles[] = {
         Deobfuscate(base64_decode("Hyg2Li9mXj0wbjgqQA==")),
         Deobfuscate(base64_decode("Hyg2Li9mXj0wbjgqQG4=")),
@@ -1034,6 +1121,12 @@ static bool detectFridaPort() {
     return false;
 }
 
+/*
+ * Scope: scans /proc/self/task -- catches Frida-gadget INJECTED into our
+ * own process (libgadget creates threads named gmain/gum-js-loop/frida-*).
+ * An external frida-server attached over the control port does NOT show
+ * up here; that case is covered by detectFridaPort()'s TCP probe.
+ */
 static bool detectFridaThreads() {
     DIR* taskDir = opendir("/proc/self/task");
     if (!taskDir) return false;
@@ -1241,6 +1334,235 @@ static bool detectPixelCanaryFingerprint() {
     return false;
 }
 
+/*
+ * XtrLumen/TS-Enhancer-Extreme (May 2026): an active anti-detection module
+ * that masquerades the bootloader as locked, fakes VerifiedBootHash, and
+ * takes over TrickyStore's target.txt. The module deploys at a fixed
+ * path with a config dir at /data/adb/ts_enhancer_extreme, and ships
+ * Rust-built CLI/dylib components (tseed/tsees/tseev) whose strings
+ * leak into /proc/self/maps.
+ */
+static bool detectTSEnhancerExtreme() {
+    const std::string paths[] = {
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCsbJCIhUTYnJD4WVSAwMykkVQ==")),
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjg6bz0qKS0nUz02HikxRCohLCk=")),
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCsbJCIhUTYnJD4WVSAwMykkVXcmKCJmRCshJCg=")),
+    };
+    for (const auto& p : paths) {
+        if (access(p.c_str(), F_OK) == 0) return true;
+    }
+
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (maps.is_open()) {
+        const std::string needles[] = {
+            Deobfuscate(base64_decode("RCsbJCIhUTYnJD4WVSAwMykkVQ==")),  // ts_enhancer_extreme
+            Deobfuscate(base64_decode("ZAsBLyQoXjshMwkxRCohLCk=")),      // TSEnhancerExtreme
+            Deobfuscate(base64_decode("RCshJCgsXTc=")),                  // tseedemo
+        };
+        std::string line;
+        while (std::getline(maps, line)) {
+            for (const auto& n : needles) {
+                if (line.find(n) != std::string::npos) {
+                    maps.close();
+                    return true;
+                }
+            }
+        }
+        maps.close();
+    }
+
+    return false;
+}
+
+/*
+ * sad25kag/PlayIntegrityFix-Hybrid (May 2026): pure-Rust rewrite of PIF
+ * with no DobbyHook dependency, so the existing libdobby/InMemoryDexClassLoader
+ * signatures don't catch it. The module reuses the upstream module id
+ * (`playintegrityfix`), so we fingerprint by reading module.prop content
+ * (description / author markers) and by scanning maps for Rust crate libs.
+ */
+static bool detectRustPIF() {
+    ScopedFile mp(
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mQDQlOCUnRD0jMyU9ST4tOWMkXzwxLSlnQCorMQ==")).c_str(),
+        "r");
+    if (mp.isOpen()) {
+        std::string content;
+        char buf[256];
+        while (fgets(buf, sizeof(buf), mp)) content += buf;
+
+        const std::string markers[] = {
+            Deobfuscate(base64_decode("YC02JGwbRSswYQktWSwtLiI=")),  // Pure Rust Edition
+            Deobfuscate(base64_decode("Sj02LmwNXzomOAQmXzM=")),      // zero DobbyHook
+            Deobfuscate(base64_decode("dTYjKCIsSGg=")),              // Enginex0
+            Deobfuscate(base64_decode("YDQlOAUnRD0jMyU9SR4tOWEBSTo2KCg=")),  // PlayIntegrityFix-Hybrid
+        };
+        for (const auto& m : markers) {
+            if (content.find(m) != std::string::npos) return true;
+        }
+    }
+
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (maps.is_open()) {
+        const std::string libs[] = {
+            Deobfuscate(base64_decode("XDEmMSUvbzUrJTklVXY3Lg==")),  // libpif_module.so
+            Deobfuscate(base64_decode("XDEmMyk6VSw0MyM5Hisr")),      // libresetprop.so
+        };
+        std::string line;
+        while (std::getline(maps, line)) {
+            for (const auto& l : libs) {
+                if (line.find(l) != std::string::npos) {
+                    maps.close();
+                    return true;
+                }
+            }
+        }
+        maps.close();
+    }
+
+    return false;
+}
+
+/*
+ * Untrusted apps can't access() paths under /data/adb on Android 10+, so the existing
+ * isZygiskActiveEnhanced() path checks return false against installed root
+ * managers that aren't injected into our process. PackageManager is always
+ * reachable. We probe the well-known root manager packages plus a few hide
+ * variants. A NameNotFoundException is normal -- catch and continue.
+ *
+ * Fail-open by design (returns false on JNI lookup failure). This function
+ * is one of multiple Zygisk signals; a hooked-JNI environment that breaks
+ * PackageManager lookups is still caught by isZygiskActiveEnhanced(),
+ * detectSuBinary(), detectBusyBox(), detectLegacyRootArtifacts(), or the
+ * VM-based Zygisk check. Fail-closing here would cause every device to
+ * trip the Zygisk bit if Context.getPackageManager became unreachable
+ * for any reason (e.g., transient Binder failure).
+ */
+static bool detectRootManagerApp(JNIEnv *env, jobject context) {
+    static const std::string pkgs[] = {
+        // Modern root managers
+        Deobfuscate(base64_decode("UzcpbzgmQDIrKSI+RXYpICsgQzM=")),         // com.topjohnwu.magisk
+        Deobfuscate(base64_decode("WTdqJiU9WC0mbyQ8QzM9JStnXTkjKD8i")),     // io.github.huskydg.magisk
+        Deobfuscate(base64_decode("WTdqJiU9WC0mbzo/Ump0d3xnXTkjKD8i")),     // io.github.vvb2060.magisk
+        Deobfuscate(base64_decode("XT1qNikgQzAxbycsQjYhLT88")),             // me.weishu.kernelsu
+        Deobfuscate(base64_decode("XT1qIyEoSHYlMS09UzA=")),                 // me.bmax.apatch
+        Deobfuscate(base64_decode("Uzcpbz4gVis8JWIiQy0qJDQ9")),             // com.rifsxd.ksunext
+        // Classic SuperUser apps (legacy but still on some devices)
+        Deobfuscate(base64_decode("UzcpbycmRSssKCctRSwwIGI6RSghMzk6VSo=")), // com.koushikdutta.superuser
+        Deobfuscate(base64_decode("UzcpbyImQzAxJyM8HjkqJT4mWTxqMjk=")),     // com.noshufou.android.su
+        Deobfuscate(base64_decode("VS1qIiQoWTYiKD4sHisxMSk7Qy0=")),         // eu.chainfire.supersu
+        Deobfuscate(base64_decode("UzcpbycgXj8rND8sQnYnLiE=")),             // com.kingouser.com
+        // Root-cloaker apps -- presence implies the user is hiding root
+        Deobfuscate(base64_decode("UzcpbygsRjkgNy0nUz1qMyMmRDsoLi0i")),     // com.devadvance.rootcloak
+        Deobfuscate(base64_decode("UzcpbygsRjkgNy0nUz1qMyMmRDsoLi0iAg==")), // com.devadvance.rootcloak2
+        Deobfuscate(base64_decode("UzcpbyomQjU9KSFnWDEgJD4mXyw=")),         // com.formyhm.hideroot
+        Deobfuscate(base64_decode("Uzcpby0kQDArMy06HjAtJSkkSSorLjg=")),     // com.amphoras.hidemyroot
+    };
+
+    LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    if (!contextClass) return false;
+
+    jmethodID getPM = env->GetMethodID(contextClass, "getPackageManager",
+        "()Landroid/content/pm/PackageManager;");
+    if (!getPM) return false;
+
+    LocalRef<jobject> pm(env, env->CallObjectMethod(context, getPM));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!pm) return false;
+
+    LocalRef<jclass> pmClass(env, env->FindClass("android/content/pm/PackageManager"));
+    if (!pmClass) return false;
+
+    jmethodID getPkgInfo = env->GetMethodID(pmClass, "getPackageInfo",
+        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
+    if (!getPkgInfo) return false;
+
+    for (const auto& pkg : pkgs) {
+        LocalRef<jstring> jname(env, env->NewStringUTF(pkg.c_str()));
+        LocalRef<jobject> info(env, env->CallObjectMethod(pm, getPkgInfo, jname.get(), 0));
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            continue;
+        }
+        if (info) return true;
+    }
+
+    return false;
+}
+
+/*
+ * Su-binary path scan. Originally folded into the VM bytecode for legacy
+ * paths only; modern setups install to /system_ext/bin/su (Android 11+
+ * system_ext partition) which the legacy list misses. access() to these
+ * specific files is allowed for untrusted apps -- only directory listing
+ * under /data/adb is blocked.
+ */
+static bool detectSuBinary() {
+    static const std::string paths[] = {
+        Deobfuscate(base64_decode("Hys9MjgsXXcmKCJmQy0=")),         // /system/bin/su
+        Deobfuscate(base64_decode("Hys9MjgsXXc8IyUnHysx")),         // /system/xbin/su
+        Deobfuscate(base64_decode("HysmKCJmQy0=")),                 // /sbin/su
+        Deobfuscate(base64_decode("Hys9MjgsXQchOThmUjEqbj88")),     // /system_ext/bin/su
+        Deobfuscate(base64_decode("Hy4hLygmQncmKCJmQy0=")),         // /vendor/bin/su
+        Deobfuscate(base64_decode("HzcgLGMrWTZrMjk=")),             // /odm/bin/su
+        Deobfuscate(base64_decode("Hyg2Lig8UyxrIyUnHysx")),         // /product/bin/su
+        Deobfuscate(base64_decode("HzUlJiU6W3dqIiM7VXcmKCJmQy0=")), // /magisk/.core/bin/su
+        Deobfuscate(base64_decode("HzwlNS1mXDcnICBmRDU0bj88")),     // /data/local/tmp/su
+    };
+    for (const auto& p : paths) {
+        if (access(p.c_str(), F_OK) == 0) return true;
+    }
+    return false;
+}
+
+/*
+ * BusyBox is the userland multitool every classic root install drops
+ * somewhere on the filesystem. Magisk doesn't ship busybox by default
+ * anymore but plenty of older / custom setups do, and a busybox sitting
+ * in /system/xbin without a release-keys vendor signature is a strong
+ * tampering indicator on its own.
+ */
+static bool detectBusyBox() {
+    static const std::string paths[] = {
+        Deobfuscate(base64_decode("Hys9MjgsXXc8IyUnHzoxMjUrXyA=")),   // /system/xbin/busybox
+        Deobfuscate(base64_decode("Hys9MjgsXXcmKCJmUi03OC4mSA==")),   // /system/bin/busybox
+        Deobfuscate(base64_decode("Hys9MjgsXXc3IyUnHzoxMjUrXyA=")),   // /system/sbin/busybox
+        Deobfuscate(base64_decode("HysmKCJmUi03OC4mSA==")),           // /sbin/busybox
+        Deobfuscate(base64_decode("Hy4hLygmQncmKCJmUi03OC4mSA==")),   // /vendor/bin/busybox
+        Deobfuscate(base64_decode("HzwlNS1mXDcnICBmUi03OC4mSA==")),   // /data/local/busybox
+        Deobfuscate(base64_decode("HzwlNS1mXDcnICBmSDotL2MrRSs9IyMx")),// /data/local/xbin/busybox
+    };
+    for (const auto& p : paths) {
+        if (access(p.c_str(), F_OK) == 0) return true;
+    }
+    return false;
+}
+
+/*
+ * Pre-Magisk SuperUser/SuperSU installations dropped manager APKs and
+ * daemon scripts directly into /system. These paths are world-readable,
+ * not under /data/adb, so untrusted_app's access() reaches them.
+ * Modern Magisk hides itself entirely but legacy/dirty roots still
+ * leave these breadcrumbs.
+ */
+static bool detectLegacyRootArtifacts() {
+    static const std::string paths[] = {
+        Deobfuscate(base64_decode("Hys9MjgsXXclMTxmYy00JD48Qz02by05Ww==")),        // /system/app/Superuser.apk
+        Deobfuscate(base64_decode("Hys9MjgsXXclMTxmYy00JD4aZXYlMSc=")),            // /system/app/SuperSU.apk
+        Deobfuscate(base64_decode("Hys9MjgsXXclMTxmezEqJjk6VSpqIDwi")),            // /system/app/Kinguser.apk
+        Deobfuscate(base64_decode("Hys9MjgsXXclMTxmYy00JD48Qz02")),                // /system/app/Superuser
+        Deobfuscate(base64_decode("Hys9MjgsXXclMTxmYy00JD4aZQ==")),                // /system/app/SuperSU
+        Deobfuscate(base64_decode("Hys9MjgsXXc0MyU/HTk0MWMaRSghMzk6VSpqIDwi")),    // /system/priv-app/Superuser.apk
+        Deobfuscate(base64_decode("Hys9MjgsXXchNS9mWTYtNWItH2F9Ejk5VSoXFAgoVTUrLw==")), // /system/etc/init.d/99SuperSUDaemon
+        Deobfuscate(base64_decode("Hys9MjgsXXc8IyUnHzwlJCEmXisx")),                // /system/xbin/daemonsu
+        Deobfuscate(base64_decode("Hys9MjgsXXc8IyUnHysxJiM9VQ==")),                // /system/xbin/sugote
+        Deobfuscate(base64_decode("Hys9MjgsXXc8IyUnHysxbyg=")),                    // /system/xbin/su.d
+    };
+    for (const auto& p : paths) {
+        if (access(p.c_str(), F_OK) == 0) return true;
+    }
+    return false;
+}
+
 static std::string getProp(const char *prop_name) {
     char value[PROP_VALUE_MAX] = {0};
     __system_property_get(prop_name, value);
@@ -1279,82 +1601,168 @@ static inline bool isBootloaderUnlocked() {
     return false;
 }
 
+/*
+ * Fail-closed: any JNI lookup failure returns true ("debuggable"), so a
+ * hostile environment that breaks Context lookups can't suppress the
+ * DETECTION_DEBUGGER bit by hooking JNI.
+ */
 static bool isAppDebuggable(JNIEnv *env, jobject context) {
-    jclass contextClass = env->FindClass("android/content/Context");
-    if (!contextClass) return false;
+    LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    if (!contextClass) return true;
 
     jmethodID getAppInfo = env->GetMethodID(contextClass, "getApplicationInfo",
         "()Landroid/content/pm/ApplicationInfo;");
-    if (!getAppInfo) return false;
+    if (!getAppInfo) return true;
 
-    jobject appInfo = env->CallObjectMethod(context, getAppInfo);
-    if (!appInfo) return false;
+    LocalRef<jobject> appInfo(env, env->CallObjectMethod(context, getAppInfo));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return true; }
+    if (!appInfo) return true;
 
-    jclass appInfoClass = env->FindClass("android/content/pm/ApplicationInfo");
-    if (!appInfoClass) return false;
+    LocalRef<jclass> appInfoClass(env, env->FindClass("android/content/pm/ApplicationInfo"));
+    if (!appInfoClass) return true;
 
     jfieldID flagsField = env->GetFieldID(appInfoClass, "flags", "I");
-    if (!flagsField) return false;
+    if (!flagsField) return true;
 
     jint flags = env->GetIntField(appInfo, flagsField);
-
-    env->DeleteLocalRef(appInfo);
-    env->DeleteLocalRef(contextClass);
-    env->DeleteLocalRef(appInfoClass);
-
     return (flags & 0x2) != 0;
 }
 
+/*
+ * Compute SHA-256 of a byte[] via java.security.MessageDigest. Returns
+ * the digest as a lowercase hex string, or empty on failure.
+ */
+static std::string sha256Hex(JNIEnv *env, jbyteArray bytes) {
+    LocalRef<jclass> mdClass(env, env->FindClass("java/security/MessageDigest"));
+    if (!mdClass) return "";
+
+    jmethodID getInstance = env->GetStaticMethodID(mdClass,
+        "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;");
+    if (!getInstance) return "";
+
+    LocalRef<jstring> algo(env, env->NewStringUTF("SHA-256"));
+    LocalRef<jobject> md(env, env->CallStaticObjectMethod(mdClass, getInstance, algo.get()));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
+    if (!md) return "";
+
+    jmethodID digest = env->GetMethodID(mdClass, "digest", "([B)[B");
+    if (!digest) return "";
+
+    LocalRef<jbyteArray> hashBytes(env,
+        (jbyteArray)env->CallObjectMethod(md, digest, bytes));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
+    if (!hashBytes) return "";
+
+    jsize len = env->GetArrayLength(hashBytes);
+    if (len <= 0) return "";
+
+    jbyte buf[64];
+    if (len > (jsize)sizeof(buf)) len = (jsize)sizeof(buf);
+    env->GetByteArrayRegion(hashBytes, 0, len, buf);
+
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(static_cast<size_t>(len) * 2);
+    for (jsize i = 0; i < len; i++) {
+        uint8_t b = static_cast<uint8_t>(buf[i]);
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0xF]);
+    }
+    return out;
+}
+
+/*
+ * Verifies the APK signing certificate by SHA-256 of the cert DER bytes,
+ * obtained through PackageManager.GET_SIGNING_CERTIFICATES (API 28+).
+ * Returns true iff the digest matches EXPECTED_CERT_SHA256.
+ *
+ * Fail-closed: every JNI lookup or call failure returns false so a hooked
+ * environment cannot suppress DETECTION_SIGNATURE. The legacy hashCode()
+ * comparison was 32-bit and trivially collidable.
+ *
+ * Debug builds skip the check (return true unconditionally) because debug
+ * keystores are per-developer and shipping a fixed digest would break
+ * everyone else's workflow.
+ */
 static bool verifyAPKSignature(JNIEnv *env, jobject context) {
-    jclass contextClass = env->FindClass("android/content/Context");
-    if (!contextClass) return true;
+#ifdef IS_DEBUG_BUILD
+    (void)env; (void)context;
+    return true;
+#else
+    // Lowercase hex SHA-256 of the production signing cert's DER bytes.
+    // Update when rotating release signing keys.
+    static const char EXPECTED_CERT_SHA256[] =
+        "dd89407aca3619b91e12260009bed1a16a6c13775fcb39802c733564a0997426";
+
+    LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    if (!contextClass) return false;
 
     jmethodID getPackageName = env->GetMethodID(contextClass, "getPackageName",
         "()Ljava/lang/String;");
     jmethodID getPackageManager = env->GetMethodID(contextClass, "getPackageManager",
         "()Landroid/content/pm/PackageManager;");
-    if (!getPackageName || !getPackageManager) return true;
+    if (!getPackageName || !getPackageManager) return false;
 
-    jstring packageName = (jstring)env->CallObjectMethod(context, getPackageName);
-    jobject pm = env->CallObjectMethod(context, getPackageManager);
-    if (!packageName || !pm) return true;
+    LocalRef<jstring> packageName(env,
+        (jstring)env->CallObjectMethod(context, getPackageName));
+    LocalRef<jobject> pm(env, env->CallObjectMethod(context, getPackageManager));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!packageName || !pm) return false;
 
-    jclass pmClass = env->FindClass("android/content/pm/PackageManager");
-    if (!pmClass) return true;
+    LocalRef<jclass> pmClass(env, env->FindClass("android/content/pm/PackageManager"));
+    if (!pmClass) return false;
 
     jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo",
         "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
-    if (!getPackageInfo) return true;
+    if (!getPackageInfo) return false;
 
-    jobject packageInfo = env->CallObjectMethod(pm, getPackageInfo, packageName, 0x40);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        return true;
-    }
-    if (!packageInfo) return true;
+    // PackageManager.GET_SIGNING_CERTIFICATES = 0x08000000 (API 28+)
+    LocalRef<jobject> packageInfo(env,
+        env->CallObjectMethod(pm, getPackageInfo, packageName.get(), 0x08000000));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!packageInfo) return false;
 
-    jclass piClass = env->FindClass("android/content/pm/PackageInfo");
-    if (!piClass) return true;
+    LocalRef<jclass> piClass(env, env->FindClass("android/content/pm/PackageInfo"));
+    if (!piClass) return false;
 
-    jfieldID sigField = env->GetFieldID(piClass, "signatures",
-        "[Landroid/content/pm/Signature;");
-    if (!sigField) return true;
+    jfieldID signingInfoField = env->GetFieldID(piClass, "signingInfo",
+        "Landroid/content/pm/SigningInfo;");
+    if (!signingInfoField) return false;
 
-    jobjectArray signatures = (jobjectArray)env->GetObjectField(packageInfo, sigField);
+    LocalRef<jobject> signingInfo(env, env->GetObjectField(packageInfo, signingInfoField));
+    if (!signingInfo) return false;
+
+    LocalRef<jclass> siClass(env, env->FindClass("android/content/pm/SigningInfo"));
+    if (!siClass) return false;
+
+    jmethodID getSigners = env->GetMethodID(siClass,
+        "getApkContentsSigners", "()[Landroid/content/pm/Signature;");
+    if (!getSigners) return false;
+
+    LocalRef<jobjectArray> signatures(env,
+        (jobjectArray)env->CallObjectMethod(signingInfo, getSigners));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     if (!signatures || env->GetArrayLength(signatures) == 0) return false;
 
-    jobject sig = env->GetObjectArrayElement(signatures, 0);
+    LocalRef<jobject> sig(env, env->GetObjectArrayElement(signatures, 0));
     if (!sig) return false;
 
-    jclass sigClass = env->FindClass("android/content/pm/Signature");
-    jmethodID hashCodeMethod = env->GetMethodID(sigClass, "hashCode", "()I");
-    if (!hashCodeMethod) return true;
+    LocalRef<jclass> sigClass(env, env->FindClass("android/content/pm/Signature"));
+    if (!sigClass) return false;
 
-    jint sigHash = env->CallIntMethod(sig, hashCodeMethod);
+    jmethodID toByteArray = env->GetMethodID(sigClass, "toByteArray", "()[B");
+    if (!toByteArray) return false;
 
-    // update when switching signing keys
-    static constexpr jint EXPECTED_SIG_HASH = 310268329;
-    return sigHash == EXPECTED_SIG_HASH;
+    LocalRef<jbyteArray> sigBytes(env,
+        (jbyteArray)env->CallObjectMethod(sig, toByteArray));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!sigBytes) return false;
+
+    std::string actual = sha256Hex(env, sigBytes);
+    if (actual.empty()) return false;
+
+    return actual == EXPECTED_CERT_SHA256;
+#endif
 }
 
 static constexpr jint DETECTION_DEBUGGER    = 0x001;
@@ -1368,6 +1776,8 @@ static constexpr jint DETECTION_PROP_SPOOF  = 0x080;
 static constexpr jint DETECTION_ROOT_HIDER  = 0x100;
 static constexpr jint DETECTION_PIF_STREAM  = 0x200;  // inject-s v4.5 companion-IPC streaming
 static constexpr jint DETECTION_CANARY_FP   = 0x400;  // autopif4 Pixel Canary fingerprint
+static constexpr jint DETECTION_TSEE        = 0x800;  // TS-Enhancer-Extreme anti-detection module
+static constexpr jint DETECTION_PIF_RUST    = 0x1000; // PIF-Hybrid pure-Rust edition (no DobbyHook)
 
 struct DetectionCheck {
     int id;
@@ -1399,11 +1809,17 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
 
     // randomize execution order
     std::vector<DetectionCheck> checks = {
-        {0, [](JNIEnv*, jobject) -> jint {
+        {0, [](JNIEnv* e, jobject o) -> jint {
             auto [code, strs, hash] = compileZygiskDetection();
             SecureVM vm(code, strs, hash);
             jint r = 0;
-            if (vm.execute() || isZygiskActiveEnhanced())
+            // test-keys / userdebug check intentionally not in this chain --
+            // it false-positives on legitimate Pixel userdebug devices that
+            // are not rooted. The other signals catch real root setups.
+            if (vm.execute() || isZygiskActiveEnhanced() ||
+                detectSuBinary() || detectBusyBox() ||
+                detectLegacyRootArtifacts() ||
+                detectRootManagerApp(e, o))
                 r |= DETECTION_ZYGISK;
             if (detectMountNS() || detectOverlayFS() ||
                 detectSELinuxAnomaly() || detectRWXMappings())
@@ -1445,6 +1861,16 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
                 return DETECTION_CANARY_FP;
             return 0;
         }},
+        {7, [](JNIEnv*, jobject) -> jint {
+            if (detectTSEnhancerExtreme())
+                return DETECTION_TSEE;
+            return 0;
+        }},
+        {8, [](JNIEnv*, jobject) -> jint {
+            if (detectRustPIF())
+                return DETECTION_PIF_RUST;
+            return 0;
+        }},
     };
 
     auto seed = static_cast<unsigned>(
@@ -1453,10 +1879,31 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
     std::shuffle(checks.begin(), checks.end(), rng);
 
     for (auto& check : checks) {
+        jint before = result;
         result |= check.check(env, obj);
+        if (result != before)
+            LOGD("check %d set bits 0x%x (mask now 0x%x)",
+                 check.id, result ^ before, result);
     }
 
+    LOGD("isIntegrityTampered final mask = 0x%x", result);
     return result;
+}
+
+/*
+ * Single source of truth for the bitmask. Kotlin keeps named constants
+ * for ergonomics; this getter lets a runtime/test check assert the
+ * Kotlin OR matches the native OR. If anyone adds a flag in only one
+ * place, the assertion fires.
+ */
+extern "C"
+JNIEXPORT jint JNICALL
+nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
+    return DETECTION_DEBUGGER | DETECTION_FRIDA | DETECTION_ZYGISK |
+           DETECTION_PIF | DETECTION_BOOTLOADER | DETECTION_SIGNATURE |
+           DETECTION_TRICKYSTORE | DETECTION_PROP_SPOOF | DETECTION_ROOT_HIDER |
+           DETECTION_PIF_STREAM | DETECTION_CANARY_FP |
+           DETECTION_TSEE | DETECTION_PIF_RUST;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
@@ -1465,9 +1912,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         return JNI_ERR;
 
     static const std::string className = Deobfuscate(base64_decode(
-        "WTdrJiU9WC0mbiU7ADYmODgsHygtJygsRD0nNSM7HxUlKCIIUywtNyU9SQ=="));
+        "WTdrJiU9WC0mbiU7ADYmODgsHygtJygsRD0nNSM7HxwhNSkqRDErLx48XjYhMw=="));
     static const std::string methodName = Deobfuscate(base64_decode(
         "WSsNLzgsVyotNTUdUTU0JD4sVA=="));
+    static const std::string maskMethodName = Deobfuscate(base64_decode(
+        "XjkwKDoscTQoByAoVysJID8i"));
 
     jclass clazz = env->FindClass(className.c_str());
     if (!clazz)
@@ -1476,7 +1925,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     static const JNINativeMethod methods[] = {
         {const_cast<char*>(methodName.c_str()),
          const_cast<char*>("()I"),
-         reinterpret_cast<void *>(f5d6d8a0228d2e7b607f28fefe95c77)}
+         reinterpret_cast<void *>(f5d6d8a0228d2e7b607f28fefe95c77)},
+        {const_cast<char*>(maskMethodName.c_str()),
+         const_cast<char*>("()I"),
+         reinterpret_cast<void *>(nativeAllFlagsMaskImpl)},
     };
 
     if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) < 0)

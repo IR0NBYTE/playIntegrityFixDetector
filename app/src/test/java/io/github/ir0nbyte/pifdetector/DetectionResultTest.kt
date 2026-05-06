@@ -9,7 +9,7 @@ class DetectionResultTest {
     @Test
     fun cleanBitmaskReturnsAllPass() {
         val results = DetectionResult.fromBitmask(0)
-        assertEquals(11, results.size)
+        assertEquals(13, results.size)
         assertTrue(results.none { it.detected })
     }
 
@@ -32,9 +32,22 @@ class DetectionResultTest {
 
     @Test
     fun allFlagsSet() {
-        val all = 0x7FF // bits 0-10
-        val results = DetectionResult.fromBitmask(all)
+        val results = DetectionResult.fromBitmask(DetectionResult.ALL_FLAGS_MASK)
         assertTrue(results.all { it.detected })
+    }
+
+    @Test
+    fun allFlagsMaskMatchesIndividualOr() {
+        val computed = DetectionResult.fromBitmask(0)
+            .map { it.flag }
+            .reduce { a, b -> a or b }
+        assertEquals(DetectionResult.ALL_FLAGS_MASK, computed)
+    }
+
+    @Test
+    fun resultsSortedByFlagValue() {
+        val flags = DetectionResult.fromBitmask(0).map { it.flag }
+        assertEquals(flags.sorted(), flags)
     }
 
     @Test
@@ -81,5 +94,33 @@ class DetectionResultTest {
                 DetectionResult.DETECTION_PROP_SPOOF
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
         assertEquals(3, detected.size)
+    }
+
+    @Test
+    fun tseeFlagDetected() {
+        val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_TSEE)
+        val tsee = results.first { it.flag == DetectionResult.DETECTION_TSEE }
+        assertTrue(tsee.detected)
+        assertEquals("TS-Enhancer-Extreme", tsee.name)
+        assertTrue(
+            results.filter { it.flag != DetectionResult.DETECTION_TSEE }.none { it.detected }
+        )
+    }
+
+    @Test
+    fun rustPifFlagDetected() {
+        val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_PIF_RUST)
+        val rust = results.first { it.flag == DetectionResult.DETECTION_PIF_RUST }
+        assertTrue(rust.detected)
+        assertEquals("PIF Pure Rust", rust.name)
+    }
+
+    @Test
+    fun tseeAndTrickyStoreCoexist() {
+        // TS-Enhancer-Extreme requires TrickyStore as a base — typical combo
+        val mask = DetectionResult.DETECTION_TRICKYSTORE or DetectionResult.DETECTION_TSEE
+        val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
+        assertEquals(2, detected.size)
+        assertTrue(detected.any { it.flag == DetectionResult.DETECTION_TSEE })
     }
 }
