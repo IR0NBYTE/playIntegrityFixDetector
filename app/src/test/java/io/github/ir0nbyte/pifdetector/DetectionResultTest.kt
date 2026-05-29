@@ -128,7 +128,7 @@ class DetectionResultTest {
 
     @Test
     fun treatWheelAndRootHiderCoexist() {
-        // Treat Wheel is a ReZygisk root hider — typically rides alongside the
+        // Treat Wheel is a ReZygisk root hider that typically rides alongside the
         // generic root-hider anomaly signals (mount NS / OverlayFS / SELinux).
         val mask = DetectionResult.DETECTION_ROOT_HIDER or DetectionResult.DETECTION_TREAT_WHEEL
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
@@ -159,7 +159,7 @@ class DetectionResultTest {
 
     @Test
     fun tseeAndTrickyStoreCoexist() {
-        // TS-Enhancer-Extreme requires TrickyStore as a base — typical combo
+        // TS-Enhancer-Extreme requires TrickyStore as a base (typical combo)
         val mask = DetectionResult.DETECTION_TRICKYSTORE or DetectionResult.DETECTION_TSEE
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
         assertEquals(2, detected.size)

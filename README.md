@@ -16,21 +16,21 @@ Detects [Play Integrity Fix](https://github.com/chiteroman/PlayIntegrityFix), [P
 
 ## What it detects
 
-- **Play Integrity Fix** — maps scan for PIF classes & `InMemoryDexClassLoader` DEX regions, `custom.pif.prop`/`custom.pif.json`, module dirs, known props
-- **PIF Companion Streaming (inject-s v4.5)** — Zygisk companion IPC sockets, memfd-backed dex regions, module installed without `pif.json`
-- **Pixel Canary Fingerprint (autopif4)** — monthly Canary build IDs, vendor partition / `ro.build.id` mismatch, brand vs fingerprint cross-check
-- **PIF Pure Rust (PIF-Hybrid)** — module.prop markers ("Pure Rust Edition", "zero DobbyHook", "Enginex0"), Rust crate libs in maps
-- **TrickyStore / KeyboxHub** — `keybox.xml`, `target.txt`, `security_patch.txt` under `/data/adb/tricky_store/`, KeyboxHub auto-rotation paths, maps artifacts
-- **TS-Enhancer-Extreme** — anti-detection module that masquerades the bootloader as locked; module deploy path, config dir, `tseed`/`tsees`/`tseev` Rust binaries
-- **Zygisk / Magisk / KernelSU / APatch** — maps scan for zygisk libs (incl. ReZygisk, ZygiskNext, Shamiko, NoHello), env vars, `rwxp` anomalies, root-manager packages via `PackageManager` (Magisk + KernelSU + APatch + classic SuperSU/Koush/Kingo + cloakers), su binary paths (incl. `/system_ext/bin/su` on A11+), busybox, legacy SuperUser/SuperSU APKs in `/system`
-- **Root Hiders** — mount namespace divergence, OverlayFS on `/system`, SELinux context anomalies, elevated rwxp anonymous mapping count
-- **Treat Wheel** — closed-source "Shamiko for ReZygisk" root hider (written in C to dodge `__cxa_atexit` unload detection); `/proc/self/maps` scan for `treat_wheel/zygisk/` module mapping
-- **Key Attestation Anomaly** — generates an attested EC key in `AndroidKeyStore` and runs several low-false-positive checks: (1a) cryptographically validates the certificate chain — leaf-hacking spoof modes (TrickyStore/TrickyStoreOSS/TEESimulator `?` mode) mutate the TEE leaf's attestation extension, breaking the issuer's signature; (anti-replay) verifies the attestation echoes the random challenge nonce we passed, defeating cached/replayed certs; (1b) parses the attestation `RootOfTrust` (`deviceLocked`/`verifiedBootState`) and flags a contradiction when it claims a locked/verified device while the engine's own root-hider signals prove tampering; (1c) anchors the chain to Google's hardware-attestation roots (RSA→2042 and ECDSA P-384→2035, SHA-256-pinned offline) — a self-consistent chain that does not terminate at a genuine Google root is a software/fake-keybox spoof; (1d, opt-in) for a Google-anchored chain, checks each cert serial against Google's revocation list to catch generation-mode spoofers (a leaked-but-revoked real keybox). 1d is the only check that touches the network and is **OFF by default** behind a user toggle — the app is network-silent otherwise. Fails safe throughout: absence of attestation (old/AOSP devices), parse failure, an unrecognised root, or an offline revocation fetch never flags
-- **Frida / Xposed** — TCP connect probe to `127.0.0.1:27042` and `:27043`, maps scan for gadget libs, `gmain`/`gum-js-loop` thread names, parent process cmdline, Objection. The TCP probe replaces the legacy `/proc/net/tcp` scan, which Android 10+ filters to empty for `untrusted_app`.
-- **Property Spoofing** — cross-validation of `ro.build.fingerprint` vs `ro.product.*`, security patch vs kernel date, board (Pixel boards must run on Tensor SoCs), property read timing
-- **Bootloader** — `ro.boot.verifiedbootstate`, `ro.boot.flash.locked`, `ro.boot.veritymode`, `vbmeta.device_state`, `ro.debuggable`, `ro.secure`, `sys.oem_unlock_allowed`
-- **Debuggers** — `TracerPid` from `/proc/self/status`, `FLAG_DEBUGGABLE` (release builds only)
-- **APK Tampering** — SHA-256 of the signing cert obtained via `PackageManager.GET_SIGNING_CERTIFICATES` (API 28+), pinned in native code. Skipped in debug builds.
+- **Play Integrity Fix:** maps scan for PIF classes & `InMemoryDexClassLoader` DEX regions, `custom.pif.prop`/`custom.pif.json`, module dirs, known props
+- **PIF Companion Streaming (inject-s v4.5):** Zygisk companion IPC sockets, memfd-backed dex regions, module installed without `pif.json`
+- **Pixel Canary Fingerprint (autopif4):** monthly Canary build IDs, vendor partition / `ro.build.id` mismatch, brand vs fingerprint cross-check
+- **PIF Pure Rust (PIF-Hybrid):** module.prop markers ("Pure Rust Edition", "zero DobbyHook", "Enginex0"), Rust crate libs in maps
+- **TrickyStore / KeyboxHub:** `keybox.xml`, `target.txt`, `security_patch.txt` under `/data/adb/tricky_store/`, KeyboxHub auto-rotation paths, maps artifacts
+- **TS-Enhancer-Extreme:** anti-detection module that masquerades the bootloader as locked; module deploy path, config dir, `tseed`/`tsees`/`tseev` Rust binaries
+- **Zygisk / Magisk / KernelSU / APatch:** maps scan for zygisk libs (incl. ReZygisk, ZygiskNext, Shamiko, NoHello), env vars, `rwxp` anomalies, root-manager packages via `PackageManager` (Magisk + KernelSU + APatch + classic SuperSU/Koush/Kingo + cloakers), su binary paths (incl. `/system_ext/bin/su` on A11+), busybox, legacy SuperUser/SuperSU APKs in `/system`
+- **Root Hiders:** mount namespace divergence, OverlayFS on `/system`, SELinux context anomalies, elevated rwxp anonymous mapping count
+- **Treat Wheel:** closed-source "Shamiko for ReZygisk" root hider (written in C to dodge `__cxa_atexit` unload detection); `/proc/self/maps` scan for the `treat_wheel/zygisk/` module mapping
+- **Key Attestation Anomaly:** generates an attested EC key in `AndroidKeyStore` and runs several low-false-positive checks. (1a) Cryptographically validates the certificate chain: leaf-hacking spoof modes (TrickyStore/TrickyStoreOSS/TEESimulator `?` mode) mutate the TEE leaf's attestation extension, which breaks the issuer's signature. (anti-replay) Verifies the attestation echoes the random challenge nonce we passed, defeating cached/replayed certs. (1b) Parses the attestation `RootOfTrust` (`deviceLocked`/`verifiedBootState`) and flags a contradiction when it claims a locked/verified device while the engine's own root-hider signals prove tampering. (1c) Anchors the chain to Google's hardware-attestation roots (RSA valid through 2042 and ECDSA P-384 valid through 2035, SHA-256-pinned offline): a self-consistent chain that does not terminate at a genuine Google root is a software/fake-keybox spoof. (1d, opt-in) For a Google-anchored chain, checks each cert serial against Google's revocation list to catch generation-mode spoofers (a leaked-but-revoked real keybox). 1d is the only check that touches the network and is **OFF by default** behind a user toggle, so the app stays network-silent otherwise. Fails safe throughout: absence of attestation (old/AOSP devices), parse failure, an unrecognised root, or an offline revocation fetch never flags.
+- **Frida / Xposed:** TCP connect probe to `127.0.0.1:27042` and `:27043`, maps scan for gadget libs, `gmain`/`gum-js-loop` thread names, parent process cmdline, Objection. The TCP probe replaces the legacy `/proc/net/tcp` scan, which Android 10+ filters to empty for `untrusted_app`.
+- **Property Spoofing:** cross-validation of `ro.build.fingerprint` vs `ro.product.*`, security patch vs kernel date, board (Pixel boards must run on Tensor SoCs), property read timing
+- **Bootloader:** `ro.boot.verifiedbootstate`, `ro.boot.flash.locked`, `ro.boot.veritymode`, `vbmeta.device_state`, `ro.debuggable`, `ro.secure`, `sys.oem_unlock_allowed`
+- **Debuggers:** `TracerPid` from `/proc/self/status`, `FLAG_DEBUGGABLE` (release builds only)
+- **APK Tampering:** SHA-256 of the signing cert obtained via `PackageManager.GET_SIGNING_CERTIFICATES` (API 28+), pinned in native code. Skipped in debug builds.
 
 ## How PIF bypasses integrity checks
 
@@ -50,9 +50,9 @@ Newer forks add: streaming the dex payload over a Zygisk companion IPC channel (
 1. **Debug/instrumentation checks** run first (fail-fast): `isTraced()`, Frida VM + TCP-connect probe + thread scan, parent process check, debuggable flag (release only)
 2. **Tampering checks** run in randomized order each time: Zygisk VM + PackageManager root-app probe + su-binary scan, PIF VM + companion-streaming probe, mount namespace, OverlayFS, SELinux, bootloader props, APK signature (SHA-256), TrickyStore paths, property consistency, Pixel Canary fingerprint, TS-Enhancer-Extreme, PIF Pure Rust, Treat Wheel
 
-After the native call returns, `DetectionRunner` runs the **key-attestation probe** (`KeyAttestationProbe`, Kotlin — the `AndroidKeyStore` attestation API lives in Java land) and ORs `ATTEST_ANOMALY` into the bitmask. Its contradiction check reuses the root-hider bit the native engine already computed; its chain-anchor check uses the SHA-256-pinned Google roots in `AttestationRoots`. The optional online revocation check (1d) runs only when the user enables the toggle (SharedPreferences, default off), so the app stays network-silent by default. The flag bit is still registered in `nativeAllFlagsMask()` so the SSOT assertion holds; the pure validation/parse/anchor logic is isolated in `AttestationAnalysis` and unit-tested (including against real Google attestation bytes and the pinned root fingerprints). This is the only detection signal produced outside the native engine.
+After the native call returns, `DetectionRunner` runs the **key-attestation probe** (`KeyAttestationProbe`, written in Kotlin because the `AndroidKeyStore` attestation API lives in Java land) and ORs `ATTEST_ANOMALY` into the bitmask. Its contradiction check reuses the root-hider bit the native engine already computed; its chain-anchor check uses the SHA-256-pinned Google roots in `AttestationRoots`. The optional online revocation check (1d) runs only when the user enables the toggle (SharedPreferences, default off), so the app stays network-silent by default. The flag bit is still registered in `nativeAllFlagsMask()` so the SSOT assertion holds; the pure validation/parse/anchor logic is isolated in `AttestationAnalysis` and unit-tested (including against real Google attestation bytes and the pinned root fingerprints). This is the only detection signal produced outside the native engine.
 
-VM-based checks (Frida, Zygisk, PIF) use a custom bytecode interpreter with rolling-key XOR-encoded opcodes — harder to hook than direct function calls. Sensitive strings are base64+XOR encoded and only decoded at runtime.
+VM-based checks (Frida, Zygisk, PIF) use a custom bytecode interpreter with rolling-key XOR-encoded opcodes, which are harder to hook than direct function calls. Sensitive strings are base64+XOR encoded and only decoded at runtime.
 
 JNI helpers use a `LocalRef<T>` RAII wrapper for ref hygiene, and security checks (signature, debuggable) fail closed: any JNI lookup error fires the detection bit so a hooked-JNI environment can't suppress it.
 
@@ -62,7 +62,7 @@ JNI helpers use a `LocalRef<T>` RAII wrapper for ref hygiene, and security check
 
 ### Return value
 
-The native function returns a bitmask — `0` means clean, any set bit indicates a detection:
+The native function returns a bitmask: `0` means clean, any set bit indicates a detection.
 
 ```
 0x0001  DEBUGGER          0x0040  TRICKYSTORE       0x0400  CANARY_FP
@@ -84,7 +84,7 @@ Flag values are owned by the native side; `DetectionRunner.verifyFlagsInSync()` 
 ./gradlew lintDebug         # run lint checks
 ```
 
-Requires NDK r25+, Android Studio Hedgehog or later, SDK 35, Kotlin 2.0+. The manifest declares `INTERNET` (for Frida TCP probe) and a `<queries>` block listing root-manager package names (Android 11+ visibility requirement).
+Requires NDK r25+, Android Studio Hedgehog or later, SDK 35, Kotlin 2.0+. The manifest declares `INTERNET` (used by the Frida TCP probe and the opt-in attestation revocation check) and a `<queries>` block listing root-manager package names (Android 11+ visibility requirement).
 
 > If you build a release with your own signing key, update `EXPECTED_CERT_SHA256` in `native-lib.cpp` to the lowercase hex SHA-256 of your cert's DER bytes:
 > ```
@@ -108,6 +108,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[GPL-3.0](LICENSE) — derivative works must stay open source.
+[GPL-3.0](LICENSE). Derivative works must stay open source.
 
 > This tool is for defensive security research. Use it only on devices you own or have permission to test.
