@@ -9,7 +9,7 @@ class DetectionResultTest {
     @Test
     fun cleanBitmaskReturnsAllPass() {
         val results = DetectionResult.fromBitmask(0)
-        assertEquals(13, results.size)
+        assertEquals(15, results.size)
         assertTrue(results.none { it.detected })
     }
 
@@ -113,6 +113,48 @@ class DetectionResultTest {
         val rust = results.first { it.flag == DetectionResult.DETECTION_PIF_RUST }
         assertTrue(rust.detected)
         assertEquals("PIF Pure Rust", rust.name)
+    }
+
+    @Test
+    fun treatWheelFlagDetected() {
+        val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_TREAT_WHEEL)
+        val tw = results.first { it.flag == DetectionResult.DETECTION_TREAT_WHEEL }
+        assertTrue(tw.detected)
+        assertEquals("Treat Wheel", tw.name)
+        assertTrue(
+            results.filter { it.flag != DetectionResult.DETECTION_TREAT_WHEEL }.none { it.detected }
+        )
+    }
+
+    @Test
+    fun treatWheelAndRootHiderCoexist() {
+        // Treat Wheel is a ReZygisk root hider — typically rides alongside the
+        // generic root-hider anomaly signals (mount NS / OverlayFS / SELinux).
+        val mask = DetectionResult.DETECTION_ROOT_HIDER or DetectionResult.DETECTION_TREAT_WHEEL
+        val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
+        assertEquals(2, detected.size)
+        assertTrue(detected.any { it.flag == DetectionResult.DETECTION_TREAT_WHEEL })
+    }
+
+    @Test
+    fun attestAnomalyFlagDetected() {
+        val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_ATTEST_ANOMALY)
+        val attest = results.first { it.flag == DetectionResult.DETECTION_ATTEST_ANOMALY }
+        assertTrue(attest.detected)
+        assertEquals("Key Attestation", attest.name)
+        assertTrue(
+            results.filter { it.flag != DetectionResult.DETECTION_ATTEST_ANOMALY }.none { it.detected }
+        )
+    }
+
+    @Test
+    fun attestAnomalyAndBootloaderCoexist() {
+        // The typical STRONG-spoof contradiction: attestation claims a locked
+        // device while the bootloader signal proves otherwise.
+        val mask = DetectionResult.DETECTION_BOOTLOADER or DetectionResult.DETECTION_ATTEST_ANOMALY
+        val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
+        assertEquals(2, detected.size)
+        assertTrue(detected.any { it.flag == DetectionResult.DETECTION_ATTEST_ANOMALY })
     }
 
     @Test

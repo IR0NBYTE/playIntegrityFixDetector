@@ -27,6 +27,16 @@ data class DetectionResult(
         const val DETECTION_CANARY_FP = 0x400
         const val DETECTION_TSEE = 0x800
         const val DETECTION_PIF_RUST = 0x1000
+        const val DETECTION_TREAT_WHEEL = 0x2000
+
+        /*
+         * Produced Kotlin-side by KeyAttestationProbe (the AndroidKeyStore
+         * attestation API lives in Java land), not by the native engine. It is
+         * still registered in the native nativeAllFlagsMask() so the SSOT
+         * assertion holds -- the native mask is the registry of all defined
+         * flag bits, regardless of which layer sets them.
+         */
+        const val DETECTION_ATTEST_ANOMALY = 0x4000
 
         private data class Spec(val flag: Int, val name: String, val description: String)
 
@@ -58,6 +68,10 @@ data class DetectionResult(
                  "Anti-detection module masquerading bootloader status"),
             Spec(DETECTION_PIF_RUST,   "PIF Pure Rust",
                  "PIF-Hybrid Rust edition (DobbyHook-free) detected"),
+            Spec(DETECTION_TREAT_WHEEL,"Treat Wheel",
+                 "Treat Wheel ReZygisk root hider mapped into the process"),
+            Spec(DETECTION_ATTEST_ANOMALY, "Key Attestation",
+                 "Hardware key attestation chain invalid or contradicts device state"),
         )
 
         // Derived from SPECS so adding a Spec automatically updates the mask.

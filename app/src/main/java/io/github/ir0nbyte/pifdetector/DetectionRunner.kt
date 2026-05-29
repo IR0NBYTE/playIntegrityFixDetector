@@ -25,10 +25,23 @@ class DetectionRunner {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cancelled = AtomicBoolean(false)
+    private val attestationProbe = KeyAttestationProbe()
 
-    fun runCheck(onResult: (Int) -> Unit) {
+    /*
+     * @param revocationEnabled user setting (default false): when true, the
+     * attestation probe may make ONE bounded network call to Google's
+     * revocation list for a genuinely Google-anchored chain. When false the
+     * probe stays fully offline. The flag is read on the UI thread (from
+     * SharedPreferences) and passed in so this class needs no Context.
+     */
+    fun runCheck(revocationEnabled: Boolean, onResult: (Int) -> Unit) {
         executor.execute {
-            val bitmask = isIntegrityTampered()
+            // Native engine first; the key-attestation probe (Kotlin, since it
+            // drives the AndroidKeyStore API) then ORs in DETECTION_ATTEST_ANOMALY.
+            // It takes the native bitmask so its contradiction check can reuse
+            // the bootloader/root signals the engine already computed.
+            val nativeMask = isIntegrityTampered()
+            val bitmask = nativeMask or attestationProbe.probe(nativeMask, revocationEnabled)
             mainHandler.post {
                 if (!cancelled.get()) onResult(bitmask)
             }

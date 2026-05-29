@@ -46,8 +46,26 @@ class MainActivity : AppCompatActivity() {
             adapter = resultAdapter
         }
 
+        setupRevocationToggle()
         setupDetectionButton()
     }
+
+    /*
+     * Opt-in toggle for the online key-revocation check (1d). OFF by default so
+     * the app stays network-silent unless the user explicitly enables it; the
+     * preference is read at scan time and passed into DetectionRunner.
+     */
+    private fun setupRevocationToggle() {
+        val toggle = binding?.revocationSwitch ?: return
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        toggle.isChecked = prefs.getBoolean(KEY_REVOCATION, false)
+        toggle.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(KEY_REVOCATION, isChecked).apply()
+        }
+    }
+
+    private fun isRevocationEnabled(): Boolean =
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_REVOCATION, false)
 
     private fun setupDetectionButton() {
         val detectBtn = binding?.button2 ?: return
@@ -60,7 +78,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runIntegrityCheck(detectBtn: Button) {
-        runner.runCheck { bitmask ->
+        runner.runCheck(isRevocationEnabled()) { bitmask ->
             // DetectionRunner.shutdown() suppresses callbacks after destroy,
             // so we don't need an isFinishing/isDestroyed guard here.
             detectBtn.isEnabled = true
@@ -116,5 +134,7 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val TAG = "MainActivity"
+        const val PREFS_NAME = "pifd_settings"
+        const val KEY_REVOCATION = "revocation_check_enabled"
     }
 }

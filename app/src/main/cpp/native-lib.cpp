@@ -1423,6 +1423,36 @@ static bool detectRustPIF() {
 }
 
 /*
+ * Treat Wheel (May 2026): a closed-source "Shamiko for ReZygisk" root hider,
+ * written in C to dodge the __cxa_atexit / g_array zeroed-handler detection
+ * vector that catches C++ Zygisk modules on unload. It reads maps/mountinfo
+ * through a fork+socketpair child to defeat "procfs opened before app start"
+ * heuristics. None of that hides its own mapping name, though: the module
+ * still loads into our process from a path containing "treat_wheel/zygisk/",
+ * so a /proc/self/maps substring scan in-process catches it. Fully in-process
+ * → survives Android 10+ SELinux. Only pairs with ReZygisk (not Zygisk Next).
+ *
+ * Matching the bare "treat_wheel" token (rather than the full path) keeps this
+ * robust to module-layout changes and is FP-safe -- the token would never
+ * legitimately appear in a clean app's maps.
+ */
+static bool detectTreatWheel() {
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (!maps.is_open()) return false;
+
+    const std::string needle = Deobfuscate(base64_decode("RCohIDgWRzAhJCA="));  // treat_wheel
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find(needle) != std::string::npos) {
+            maps.close();
+            return true;
+        }
+    }
+    maps.close();
+    return false;
+}
+
+/*
  * Untrusted apps can't access() paths under /data/adb on Android 10+, so the existing
  * isZygiskActiveEnhanced() path checks return false against installed root
  * managers that aren't injected into our process. PackageManager is always
@@ -1778,6 +1808,14 @@ static constexpr jint DETECTION_PIF_STREAM  = 0x200;  // inject-s v4.5 companion
 static constexpr jint DETECTION_CANARY_FP   = 0x400;  // autopif4 Pixel Canary fingerprint
 static constexpr jint DETECTION_TSEE        = 0x800;  // TS-Enhancer-Extreme anti-detection module
 static constexpr jint DETECTION_PIF_RUST    = 0x1000; // PIF-Hybrid pure-Rust edition (no DobbyHook)
+static constexpr jint DETECTION_TREAT_WHEEL = 0x2000; // Treat Wheel ReZygisk root hider
+/*
+ * Produced Kotlin-side by KeyAttestationProbe (the AndroidKeyStore attestation
+ * API lives in Java land), never set by this engine. Registered here only so
+ * nativeAllFlagsMask() stays the single source of truth for the full set of
+ * defined flag bits and the Kotlin SSOT assertion still matches.
+ */
+static constexpr jint DETECTION_ATTEST_ANOMALY = 0x4000;
 
 struct DetectionCheck {
     int id;
@@ -1871,6 +1909,11 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
                 return DETECTION_PIF_RUST;
             return 0;
         }},
+        {9, [](JNIEnv*, jobject) -> jint {
+            if (detectTreatWheel())
+                return DETECTION_TREAT_WHEEL;
+            return 0;
+        }},
     };
 
     auto seed = static_cast<unsigned>(
@@ -1903,7 +1946,8 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_PIF | DETECTION_BOOTLOADER | DETECTION_SIGNATURE |
            DETECTION_TRICKYSTORE | DETECTION_PROP_SPOOF | DETECTION_ROOT_HIDER |
            DETECTION_PIF_STREAM | DETECTION_CANARY_FP |
-           DETECTION_TSEE | DETECTION_PIF_RUST;
+           DETECTION_TSEE | DETECTION_PIF_RUST | DETECTION_TREAT_WHEEL |
+           DETECTION_ATTEST_ANOMALY;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {

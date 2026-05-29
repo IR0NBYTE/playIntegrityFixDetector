@@ -18,4 +18,6 @@
 
     <string name="result_status_detected">DETECTED</string>
     <string name="result_status_pass">PASS</string>
+
+    <string name="setting_revocation_check">Check key revocation online (uses network)</string>
 </resources>
