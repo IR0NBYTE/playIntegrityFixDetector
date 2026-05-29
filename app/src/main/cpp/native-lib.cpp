@@ -1429,8 +1429,8 @@ static bool detectRustPIF() {
  * through a fork+socketpair child to defeat "procfs opened before app start"
  * heuristics. None of that hides its own mapping name, though: the module
  * still loads into our process from a path containing "treat_wheel/zygisk/",
- * so a /proc/self/maps substring scan in-process catches it. Fully in-process
- * → survives Android 10+ SELinux. Only pairs with ReZygisk (not Zygisk Next).
+ * so a /proc/self/maps substring scan in-process catches it. Fully in-process,
+ * so it survives Android 10+ SELinux. Only pairs with ReZygisk (not Zygisk Next).
  *
  * Matching the bare "treat_wheel" token (rather than the full path) keeps this
  * robust to module-layout changes and is FP-safe -- the token would never
