@@ -74,16 +74,14 @@ class DetectionRunner {
     companion object {
         private const val TAG = "DetectionRunner"
 
-        private var nativeLibLoaded = false
-        val isAvailable: Boolean get() = nativeLibLoaded
-
-        init {
-            try {
-                System.loadLibrary("pifdetector")
-                nativeLibLoaded = true
-            } catch (e: UnsatisfiedLinkError) {
-                Log.e(TAG, "Failed to load libpifdetector.so", e)
-            }
+        // Computed once at class init; immutable so there is no cross-thread
+        // visibility concern around the load result.
+        val isAvailable: Boolean = try {
+            System.loadLibrary("pifdetector")
+            true
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "Failed to load libpifdetector.so", e)
+            false
         }
     }
 }
