@@ -78,7 +78,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runIntegrityCheck(detectBtn: Button) {
-        runner.runCheck(isRevocationEnabled()) { bitmask ->
+        runner.runCheck(this, isRevocationEnabled()) { bitmask ->
             // DetectionRunner.shutdown() suppresses callbacks after destroy,
             // so we don't need an isFinishing/isDestroyed guard here.
             detectBtn.isEnabled = true

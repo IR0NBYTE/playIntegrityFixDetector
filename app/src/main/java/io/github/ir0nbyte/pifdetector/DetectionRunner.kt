@@ -1,5 +1,6 @@
 package io.github.ir0nbyte.pifdetector
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -34,13 +35,16 @@ class DetectionRunner {
      * probe stays fully offline. The flag is read on the UI thread (from
      * SharedPreferences) and passed in so this class needs no Context.
      */
-    fun runCheck(revocationEnabled: Boolean, onResult: (Int) -> Unit) {
+    fun runCheck(context: Context, revocationEnabled: Boolean, onResult: (Int) -> Unit) {
+        // applicationContext, not the caller's: the worker outlives the Activity
+        // and the native side only needs PackageManager / ApplicationInfo.
+        val appContext = context.applicationContext
         executor.execute {
             // Native engine first; the key-attestation probe (Kotlin, since it
             // drives the AndroidKeyStore API) then ORs in DETECTION_ATTEST_ANOMALY.
             // It takes the native bitmask so its contradiction check can reuse
             // the bootloader/root signals the engine already computed.
-            val nativeMask = isIntegrityTampered()
+            val nativeMask = isIntegrityTampered(appContext)
             val bitmask = nativeMask or attestationProbe.probe(nativeMask, revocationEnabled)
             mainHandler.post {
                 if (!cancelled.get()) onResult(bitmask)
@@ -53,7 +57,7 @@ class DetectionRunner {
         executor.shutdownNow()
     }
 
-    private external fun isIntegrityTampered(): Int
+    private external fun isIntegrityTampered(context: Context): Int
 
     private external fun nativeAllFlagsMask(): Int
 

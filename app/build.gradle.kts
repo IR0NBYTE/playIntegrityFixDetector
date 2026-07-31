@@ -47,6 +47,29 @@ android {
             isShrinkResources = true
             isDebuggable = false
 
+            /*
+             * SHA-256 of the release signing certificate, lowercase hex with no
+             * separators, supplied by whoever builds the release:
+             *   keytool -list -v -keystore <ks> -alias <alias> \
+             *     | grep SHA256: | sed 's/.*SHA256: //' | tr -d ':' | tr 'A-Z' 'a-z'
+             *
+             * Left unset, the APK signature check compiles out entirely. It used
+             * to be a constant baked into the source, which silently pinned every
+             * release to whichever machine last edited it; a build signed with any
+             * other key then reported its own signature as tampered. Absent is
+             * better than wrong here, because a wrong pin is a guaranteed false
+             * positive and this check is deliberately fail-closed.
+             */
+            System.getenv("RELEASE_CERT_SHA256")?.takeIf { it.isNotBlank() }?.let { hash ->
+                externalNativeBuild {
+                    cmake {
+                        // Passed as a bare token; native-lib.cpp stringizes it.
+                        // Quoting here does not survive the Gradle/CMake chain.
+                        cppFlags += "-DEXPECTED_CERT_SHA256=$hash"
+                    }
+                }
+            }
+
             val keystore = System.getenv("RELEASE_KEYSTORE_PATH")
             if (!keystore.isNullOrEmpty()) {
                 signingConfig = signingConfigs.getByName("release")

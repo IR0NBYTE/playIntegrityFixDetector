@@ -1173,16 +1173,26 @@ static std::string sha256Hex(JNIEnv *env, jbyteArray bytes) {
  * keystores are per-developer and shipping a fixed digest would break
  * everyone else's workflow.
  */
+/*
+ * Pinned release-certificate check.
+ *
+ * EXPECTED_CERT_SHA256 is injected by the release build from the
+ * RELEASE_CERT_SHA256 environment variable (see app/build.gradle.kts); it is
+ * the lowercase hex SHA-256 of the signing certificate's DER bytes. When the
+ * builder does not supply one the check compiles out, exactly as it does for
+ * debug builds.
+ *
+ * It is deliberately NOT a source constant any more. As a constant it pinned
+ * every release to whatever certificate the last editor happened to have, so a
+ * build signed with the real release key reported its own signature as
+ * tampered. Since the check is fail-closed, a wrong pin is not a weaker check,
+ * it is a guaranteed false positive on every device.
+ */
 static bool verifyAPKSignature(JNIEnv *env, jobject context) {
-#ifdef IS_DEBUG_BUILD
+#if defined(IS_DEBUG_BUILD) || !defined(EXPECTED_CERT_SHA256)
     (void)env; (void)context;
     return true;
 #else
-    // Lowercase hex SHA-256 of the production signing cert's DER bytes.
-    // Update when rotating release signing keys.
-    static const char EXPECTED_CERT_SHA256[] =
-        "dd89407aca3619b91e12260009bed1a16a6c13775fcb39802c733564a0997426";
-
     LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
     if (!contextClass) return false;
 
@@ -1250,7 +1260,10 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
     std::string actual = sha256Hex(env, sigBytes);
     if (actual.empty()) return false;
 
-    return actual == EXPECTED_CERT_SHA256;
+    /* -D passes the digest as a bare token, so stringize it here. */
+#define PIFD_STRINGIZE_(x) #x
+#define PIFD_STRINGIZE(x) PIFD_STRINGIZE_(x)
+    return actual == PIFD_STRINGIZE(EXPECTED_CERT_SHA256);
 #endif
 }
 
@@ -1281,9 +1294,20 @@ struct DetectionCheck {
     std::function<jint(JNIEnv*, jobject)> check;
 };
 
+/*
+ * `thiz` is the DetectionRunner instance, NOT a Context. The three checks that
+ * need framework access (root-manager package probe, debuggable flag, APK
+ * signature) take the Context passed explicitly as the second argument.
+ *
+ * This used to pass `thiz` to all three. Without CheckJNI that is undefined
+ * behaviour that merely returns garbage, so the checks silently failed open;
+ * with CheckJNI on it aborts the process outright:
+ *   "JNI DETECTED ERROR IN APPLICATION: can't call
+ *    Context.getPackageManager() on instance of ...DetectionRunner"
+ */
 extern "C"
 JNIEXPORT jint JNICALL
-f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject obj) {
+f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject /* thiz */, jobject obj) {
     jint result = 0;
 
     if (isTraced() == 1)
@@ -1419,7 +1443,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
 
     static const JNINativeMethod methods[] = {
         {const_cast<char*>(methodName.c_str()),
-         const_cast<char*>("()I"),
+         const_cast<char*>("(Landroid/content/Context;)I"),
          reinterpret_cast<void *>(f5d6d8a0228d2e7b607f28fefe95c77)},
         {const_cast<char*>(maskMethodName.c_str()),
          const_cast<char*>("()I"),

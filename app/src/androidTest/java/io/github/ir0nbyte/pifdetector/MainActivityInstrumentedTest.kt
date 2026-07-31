@@ -33,11 +33,32 @@ class MainActivityInstrumentedTest {
     @Test
     fun clickRunButtonShowsResults() {
         onView(withId(R.id.button2)).perform(click())
+        awaitDisplayed(R.id.resultsRecyclerView)
+    }
 
-        // Wait for background execution
-        Thread.sleep(3000)
+    /*
+     * Polls instead of sleeping a fixed interval. The detection pass now
+     * includes two AndroidKeyStore attestation probes, and key generation time
+     * varies by an order of magnitude between a software-backed emulator and a
+     * real TEE (StrongBox especially), so any single hardcoded wait is either
+     * flaky on slow devices or wasted time on fast ones.
+     */
+    private fun awaitDisplayed(viewId: Int, timeoutMs: Long = 60_000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var last: Throwable? = null
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                onView(withId(viewId)).check(matches(isDisplayed()))
+                return
+            } catch (t: Throwable) {
+                last = t
+                Thread.sleep(POLL_INTERVAL_MS)
+            }
+        }
+        throw AssertionError("view $viewId not displayed within ${timeoutMs}ms", last)
+    }
 
-        onView(withId(R.id.resultsRecyclerView))
-            .check(matches(isDisplayed()))
+    private companion object {
+        const val POLL_INTERVAL_MS = 250L
     }
 }
