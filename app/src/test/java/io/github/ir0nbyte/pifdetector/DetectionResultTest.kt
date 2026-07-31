@@ -13,6 +13,51 @@ class DetectionResultTest {
         assertTrue(results.none { it.detected })
     }
 
+    /*
+     * The five checks whose evidence lives outside this process (PIF forks
+     * dlclose everywhere but GMS; keybox spoofers hook keystore2; FSEE has no
+     * in-process component) plus /data/adb, which SELinux denies. They must be
+     * marked so the UI never renders them as a pass.
+     */
+    @Test
+    fun unreachableChecksAreMarkedPrivilegedOnly() {
+        val privileged = DetectionResult.fromBitmask(0)
+            .filter { it.privilegedOnly }
+            .map { it.flag }
+            .toSet()
+        assertEquals(
+            setOf(
+                DetectionResult.DETECTION_PIF,
+                DetectionResult.DETECTION_TRICKYSTORE,
+                DetectionResult.DETECTION_PIF_STREAM,
+                DetectionResult.DETECTION_TSEE,
+                DetectionResult.DETECTION_PIF_RUST,
+            ),
+            privileged
+        )
+    }
+
+    /*
+     * Treat Wheel is a ReZygisk root hider that loads into every app process,
+     * so unlike the PIF forks its in-process maps scan genuinely fires. Pinned
+     * here because it sits next to the unreachable set and is easy to lump in.
+     */
+    @Test
+    fun inProcessRootHiderIsNotMarkedPrivilegedOnly() {
+        val treatWheel = DetectionResult.fromBitmask(0)
+            .first { it.flag == DetectionResult.DETECTION_TREAT_WHEEL }
+        assertTrue(!treatWheel.privilegedOnly)
+    }
+
+    /* A privileged-only check still reports normally when it does fire. */
+    @Test
+    fun privilegedOnlyCheckStillReportsWhenDetected() {
+        val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_TSEE)
+        val tsee = results.first { it.flag == DetectionResult.DETECTION_TSEE }
+        assertTrue(tsee.detected)
+        assertTrue(tsee.privilegedOnly)
+    }
+
     @Test
     fun singleFlagDetected() {
         val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_PIF)

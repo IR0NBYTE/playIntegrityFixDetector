@@ -4,7 +4,14 @@ data class DetectionResult(
     val name: String,
     val description: String,
     val flag: Int,
-    val detected: Boolean
+    val detected: Boolean,
+    /*
+     * True for checks that CANNOT fire from an unprivileged untrusted_app, so a
+     * "pass" from them means "not observable", not "clean". See the
+     * PRIVILEGED_ONLY notes below. Surfaced in the UI so the result list never
+     * implies coverage the sandbox does not permit.
+     */
+    val privilegedOnly: Boolean = false
 ) {
     companion object {
         /*
@@ -37,6 +44,39 @@ data class DetectionResult(
          * flag bits, regardless of which layer sets them.
          */
         const val DETECTION_ATTEST_ANOMALY = 0x4000
+
+        /*
+         * Flags whose underlying checks cannot fire from an unprivileged
+         * untrusted_app, verified against both the module sources and AOSP
+         * sepolicy:
+         *
+         *  - PIF / PIF_STREAM / PIF_RUST: every Zygisk PIF fork gates on
+         *    app_data_dir ending in /com.google.android.gms or
+         *    /com.android.vending and calls DLCLOSE_MODULE_LIBRARY everywhere
+         *    else, so the module is never resident in this process to be found
+         *    in /proc/self/maps.
+         *  - TRICKYSTORE: the keybox spoofers ptrace-inject into keystore2 and
+         *    hook ioctl in that process, not ours. Their effect reaches us only
+         *    through the attestation chain, which ATTEST_ANOMALY and
+         *    ATTEST_FORGERY cover.
+         *  - TSEE: the current FS-Enhancer-Extreme has no Zygisk component at
+         *    all; it is root-side scripts plus global resetprop.
+         *
+         * All five also probe /data/adb, which SELinux denies. They are kept
+         * because they DO fire when the detector runs privileged (root/adb),
+         * but they must never be presented as unprivileged coverage.
+         *
+         * TREAT_WHEEL is deliberately NOT in this set: it is a ReZygisk root
+         * hider that loads into every app process including ours, so its
+         * in-process maps scan genuinely fires.
+         */
+        private val PRIVILEGED_ONLY = setOf(
+            DETECTION_PIF,
+            DETECTION_TRICKYSTORE,
+            DETECTION_PIF_STREAM,
+            DETECTION_TSEE,
+            DETECTION_PIF_RUST,
+        )
 
         private data class Spec(val flag: Int, val name: String, val description: String)
 
@@ -78,7 +118,13 @@ data class DetectionResult(
         val ALL_FLAGS_MASK: Int = SPECS.fold(0) { acc, s -> acc or s.flag }
 
         fun fromBitmask(bitmask: Int): List<DetectionResult> = SPECS.map {
-            DetectionResult(it.name, it.description, it.flag, bitmask and it.flag != 0)
+            DetectionResult(
+                it.name,
+                it.description,
+                it.flag,
+                bitmask and it.flag != 0,
+                PRIVILEGED_ONLY.contains(it.flag)
+            )
         }
     }
 }

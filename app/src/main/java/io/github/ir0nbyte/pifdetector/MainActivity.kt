@@ -86,22 +86,33 @@ class MainActivity : AppCompatActivity() {
 
             val results = DetectionResult.fromBitmask(bitmask)
             val detectedCount = results.count { it.detected }
+            /*
+             * A privileged-only check that did not fire has not passed -- it was
+             * never observable. Excluding those from the total keeps the summary
+             * from claiming coverage the app does not have. One that DID fire
+             * still counts, since running privileged makes it real.
+             */
+            val unobservableCount = results.count { it.privilegedOnly && !it.detected }
             resultAdapter.submitList(results)
             binding?.resultsRecyclerView?.visibility = View.VISIBLE
 
-            updateStatusCard(detectedCount, results.size)
+            updateStatusCard(detectedCount, results.size - unobservableCount, unobservableCount)
         }
     }
 
-    private fun updateStatusCard(detectedCount: Int, totalCount: Int) {
+    private fun updateStatusCard(detectedCount: Int, totalCount: Int, unobservableCount: Int) {
         val b = binding ?: return
-        if (detectedCount == 0) renderClean(b, totalCount)
+        if (detectedCount == 0) renderClean(b, totalCount, unobservableCount)
         else renderViolation(b, detectedCount, totalCount)
     }
 
-    private fun renderClean(b: ActivityMainBinding, total: Int) {
+    private fun renderClean(b: ActivityMainBinding, total: Int, unobservable: Int) {
         b.statusTitle.setText(R.string.status_pass_title)
-        b.statusSubtitle.text = getString(R.string.status_pass_subtitle, total)
+        b.statusSubtitle.text = if (unobservable > 0) {
+            getString(R.string.status_pass_subtitle_partial, total, unobservable)
+        } else {
+            getString(R.string.status_pass_subtitle, total)
+        }
         b.statusIcon.setImageResource(R.drawable.ic_check)
         b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_pass))
         b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_clean))

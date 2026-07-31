@@ -312,6 +312,67 @@ static bool detectPropertyInconsistencies() {
     }
 
     /*
+     * Build-identity self-contradiction. Verified against PIFork v17,
+     * inject-s v4.7 and FS-Enhancer-Extreme: all three globally resetprop
+     * ro.build.type to "user" and every ro.*.build.tags to "release-keys",
+     * but none of them rewrites a fingerprint property globally -- fingerprint
+     * spoofing lives in their Zygisk layer, which loads only inside GMS and
+     * the Play Store and dlcloses everywhere else. On a genuine build the
+     * fingerprint is emitted from the same make variables as the scalar props
+     * and always ends in ":<build_type>/<tags>", so the two cannot disagree.
+     *
+     * Directional on purpose: only flag when the scalars claim a clean
+     * production build while the fingerprint still says otherwise. That is the
+     * only direction a spoofer produces, and it makes the check inert on both
+     * genuine user builds (the two agree) and genuine userdebug builds (the
+     * scalars admit userdebug, so the guard never opens). Any fingerprint that
+     * does not parse cleanly yields no detection.
+     *
+     * Only fires on devices whose ROM is genuinely userdebug/eng; a stock user
+     * build gives the modules nothing to rewrite. Partial coverage by design.
+     */
+    char buildType[PROP_VALUE_MAX] = {0};
+    char buildTags[PROP_VALUE_MAX] = {0};
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqIzkgXDxqNTU5VQ==")).c_str(), buildType);
+    __system_property_get(
+        Deobfuscate(base64_decode("QjdqIzkgXDxqNS0uQw==")).c_str(), buildTags);
+
+    const bool claimsProductionBuild =
+        strcmp(buildType, "user") == 0 && strcmp(buildTags, "release-keys") == 0;
+
+    if (claimsProductionBuild) {
+        // Trailing ":<type>/<tags>" of brand/product/device:rel/id/inc:type/tags
+        size_t lastColon = fp.rfind(':');
+        if (lastColon != std::string::npos && lastColon + 1 < fp.size()) {
+            std::string tail = fp.substr(lastColon + 1);
+            size_t slash = tail.find('/');
+            if (slash != std::string::npos && slash > 0 && slash + 1 < tail.size()) {
+                std::string fpType = tail.substr(0, slash);
+                std::string fpTags = tail.substr(slash + 1);
+                if (fpType != "user" || fpTags != "release-keys") return true;
+            }
+        }
+
+        /*
+         * ro.build.flavor is "<product>-<build_type>", also untouched globally.
+         * Independent of the fingerprint, so it still catches an OEM whose
+         * fingerprint format is non-standard.
+         */
+        char flavor[PROP_VALUE_MAX] = {0};
+        __system_property_get(
+            Deobfuscate(base64_decode("QjdqIzkgXDxqJyAoRjc2")).c_str(), flavor);
+        if (strlen(flavor) > 0) {
+            std::string fl(flavor);
+            auto endsWith = [&fl](const char* suffix) {
+                size_t n = strlen(suffix);
+                return fl.size() >= n && fl.compare(fl.size() - n, n, suffix) == 0;
+            };
+            if (endsWith("-userdebug") || endsWith("-eng")) return true;
+        }
+    }
+
+    /*
      * (Removed a security-patch-year vs /proc/version kernel-build-year
      * consistency check. It assumed the two are within ~2 years, but that is
      * false for a large class of GENUINE devices: LTS/backported kernels keep

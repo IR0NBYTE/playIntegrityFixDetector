@@ -30,7 +30,7 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
 
         fun bind(result: DetectionResult) {
             bindData(result)
-            applyStatusStyle(result.detected)
+            applyStatusStyle(result)
         }
 
         private fun bindData(result: DetectionResult) {
@@ -38,12 +38,22 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
             descView.text = result.description
         }
 
-        private fun applyStatusStyle(detected: Boolean) {
+        /*
+         * Three states, not two. A privileged-only check that did not fire has
+         * not "passed" -- an unprivileged app cannot see what it looks for, so
+         * showing it green would claim coverage the sandbox forbids. It still
+         * renders as DETECTED when it does fire, which happens when the app runs
+         * with root/adb.
+         */
+        private fun applyStatusStyle(result: DetectionResult) {
             val ctx = itemView.context
-            val (textRes, colorRes, iconRes) = if (detected) {
-                Triple(R.string.result_status_detected, R.color.status_fail, R.drawable.ic_warning)
-            } else {
-                Triple(R.string.result_status_pass, R.color.status_pass, R.drawable.ic_check)
+            val (textRes, colorRes, iconRes) = when {
+                result.detected ->
+                    Triple(R.string.result_status_detected, R.color.status_fail, R.drawable.ic_warning)
+                result.privilegedOnly ->
+                    Triple(R.string.result_status_unobservable, R.color.text_secondary, R.drawable.ic_info)
+                else ->
+                    Triple(R.string.result_status_pass, R.color.status_pass, R.drawable.ic_check)
             }
             statusView.setText(textRes)
             val color = ContextCompat.getColor(ctx, colorRes)
