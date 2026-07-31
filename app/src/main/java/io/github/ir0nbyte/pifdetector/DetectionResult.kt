@@ -46,6 +46,15 @@ data class DetectionResult(
         const val DETECTION_ATTEST_ANOMALY = 0x4000
 
         /*
+         * Produced Kotlin-side by ActiveAttestationProbe. Where ATTEST_ANOMALY
+         * inspects an ordinary attested key, this one asks for keys that are
+         * awkward to forge (PURPOSE_ATTEST_KEY, and an auth-bound key requested
+         * with SHA-512) and catches the resulting chain contradicting itself.
+         * Registered in the native mask for the same SSOT reason as above.
+         */
+        const val DETECTION_ATTEST_FORGERY = 0x8000
+
+        /*
          * Flags whose underlying checks cannot fire from an unprivileged
          * untrusted_app, verified against both the module sources and AOSP
          * sepolicy:
@@ -112,6 +121,8 @@ data class DetectionResult(
                  "Treat Wheel ReZygisk root hider mapped into the process"),
             Spec(DETECTION_ATTEST_ANOMALY, "Key Attestation",
                  "Hardware key attestation chain invalid or contradicts device state"),
+            Spec(DETECTION_ATTEST_FORGERY, "Attestation Forgery (active)",
+                 "Provoked attestation chain contradicts itself or is keybox-signed"),
         )
 
         // Derived from SPECS so adding a Spec automatically updates the mask.

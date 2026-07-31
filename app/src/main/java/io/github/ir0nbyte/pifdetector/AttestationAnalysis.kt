@@ -128,6 +128,124 @@ object AttestationAnalysis {
     /* Google's status list keys serials as lowercase hex, no leading zeros. */
     fun normalizeSerial(serial: BigInteger): String = serial.toString(16)
 
+    // --- active-probe analysis (DETECTION_ATTEST_FORGERY) --------------------
+
+    /*
+     * AuthorizationList tags used by the active probe.
+     *
+     * A forged KeyDescription is BUILT rather than reported, so the builder has
+     * to decide each tag's value without a TEE to ask. Both known keybox
+     * spoofers emit NO_AUTH_REQUIRED unconditionally and emit none of the
+     * authentication tags at all, because they never model authentication.
+     */
+    const val TAG_NO_AUTH_REQUIRED = 503
+    const val TAG_USER_AUTH_TYPE = 504
+    const val TAG_AUTH_TIMEOUT = 505
+
+    /*
+     * DER identifier octets for a context-class CONSTRUCTED tag, as used for
+     * every EXPLICIT entry in an AuthorizationList. Low tag numbers (<31) use
+     * the short form (0xA0 | n); anything larger uses the high-tag-number form
+     * (0xBF followed by base-128, high bit set on all but the final byte).
+     * Tag 704 encodes to BF 85 40, matching ROOT_OF_TRUST_TAG above.
+     */
+    fun contextConstructedTag(tagNo: Int): ByteArray {
+        if (tagNo < 0x1F) return byteArrayOf((0xA0 or tagNo).toByte())
+        val digits = ArrayList<Int>()
+        var v = tagNo
+        while (v > 0) {
+            digits.add(0, v and 0x7F)
+            v = v shr 7
+        }
+        val out = ByteArray(1 + digits.size)
+        out[0] = 0xBF.toByte()
+        for (i in digits.indices) {
+            val last = i == digits.size - 1
+            out[i + 1] = (if (last) digits[i] else (digits[i] or 0x80)).toByte()
+        }
+        return out
+    }
+
+    /*
+     * True when the hardwareEnforced AuthorizationList carries `tagNo`.
+     *
+     * Scoped to the hardwareEnforced list (the last KeyDescription field) for
+     * the same reason parseRootOfTrust is: a value inside softwareEnforced, or
+     * a byte run that merely looks like the tag, must not be mistaken for a
+     * TEE-enforced entry. Any structural surprise yields false.
+     */
+    fun hasHardwareEnforcedTag(extensionValue: ByteArray, tagNo: Int): Boolean {
+        return try {
+            val unwrapped = readSingleOctetStringContent(extensionValue) ?: return false
+            val hardwareEnforced = lastSequenceChildContent(unwrapped) ?: return false
+            findTaggedContent(hardwareEnforced, contextConstructedTag(tagNo)) != null
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /*
+     * Authentication self-contradiction.
+     *
+     * Call ONLY for a key that was requested with setUserAuthenticationRequired
+     * (true). Real KeyMint then attests USER_AUTH_TYPE (504) and AUTH_TIMEOUT
+     * (505) and omits NO_AUTH_REQUIRED (503) entirely. Both known spoofers emit
+     * `teeTag(503, DERNull.INSTANCE)` with no surrounding condition -- note that
+     * in the same builder the patch-level tags ARE guarded, so this is not a
+     * generic "everything is unconditional" artifact -- and emit neither 504 nor
+     * 505, because nothing in the forged path models authentication.
+     *
+     * Requiring 503 present AND both 504/505 absent keeps this fail-safe: a
+     * device that reports the authentication tags cannot trip it, whatever else
+     * it does with 503.
+     */
+    fun authRequirementContradiction(extensionValue: ByteArray): Boolean {
+        val claimsNoAuth = hasHardwareEnforcedTag(extensionValue, TAG_NO_AUTH_REQUIRED)
+        if (!claimsNoAuth) return false
+        val hasAuthType = hasHardwareEnforcedTag(extensionValue, TAG_USER_AUTH_TYPE)
+        val hasAuthTimeout = hasHardwareEnforcedTag(extensionValue, TAG_AUTH_TIMEOUT)
+        return !hasAuthType && !hasAuthTimeout
+    }
+
+    /*
+     * Leaf signature-algorithm anomaly.
+     *
+     * A device's attestation batch key is provisioned once and signs every leaf
+     * with a fixed algorithm, always SHA-256 based. One spoofer instead builds
+     * its signer as "${requestedDigest}with${keyboxAlgorithm}", so the digest we
+     * asked for on the ATTESTED key leaks into the signature over the leaf. We
+     * request SHA-512, so a SHA-512-signed leaf means the signer tracked our
+     * request, which no real TEE does.
+     *
+     * Only a positively recognised non-SHA-256 digest flags; an unparseable or
+     * unfamiliar algorithm name yields false.
+     */
+    fun leafSignatureTracksRequestedDigest(sigAlgName: String?): Boolean {
+        if (sigAlgName.isNullOrBlank()) return false
+        val normalized = sigAlgName.uppercase().replace("-", "")
+        if (!normalized.contains("WITH")) return false
+        val digest = normalized.substringBefore("WITH")
+        return digest == "SHA512" || digest == "SHA384" || digest == "SHA1"
+    }
+
+    /*
+     * A single self-signed certificate that nonetheless carries an attestation
+     * extension. Real hardware attestation always returns a chain terminating at
+     * a Google CA, so length 1 with issuer == subject is one spoofer's
+     * documented fallback path and cannot occur genuinely. Returns false for any
+     * chain of length != 1 so ordinary chains are untouched.
+     */
+    fun isSelfSignedSingleCert(chain: List<X509Certificate>): Boolean {
+        if (chain.size != 1) return false
+        return try {
+            val cert = chain[0]
+            cert.getExtensionValue(ATTESTATION_OID) != null &&
+                cert.issuerX500Principal == cert.subjectX500Principal
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     /*
      * Pull the attestationChallenge (KeyDescription field index 4, OCTET STRING)
      * out of the extension. The first six KeyDescription fields are position-

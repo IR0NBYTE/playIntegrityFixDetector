@@ -1349,6 +1349,12 @@ static constexpr jint DETECTION_TREAT_WHEEL = 0x2000; // Treat Wheel ReZygisk ro
  * defined flag bits and the Kotlin SSOT assertion still matches.
  */
 static constexpr jint DETECTION_ATTEST_ANOMALY = 0x4000;
+/*
+ * Likewise Kotlin-side, from ActiveAttestationProbe: an attestation chain
+ * provoked with PURPOSE_ATTEST_KEY or an auth-bound key that then contradicts
+ * itself. Registered here for the same SSOT reason.
+ */
+static constexpr jint DETECTION_ATTEST_FORGERY = 0x8000;
 
 struct DetectionCheck {
     int id;
@@ -1483,7 +1489,7 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_TRICKYSTORE | DETECTION_PROP_SPOOF | DETECTION_ROOT_HIDER |
            DETECTION_PIF_STREAM | DETECTION_CANARY_FP |
            DETECTION_TSEE | DETECTION_PIF_RUST | DETECTION_TREAT_WHEEL |
-           DETECTION_ATTEST_ANOMALY;
+           DETECTION_ATTEST_ANOMALY | DETECTION_ATTEST_FORGERY;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {

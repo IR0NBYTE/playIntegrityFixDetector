@@ -1,5 +1,6 @@
 package io.github.ir0nbyte.pifdetector
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -227,26 +228,7 @@ class AttestationAnalysisTest {
 
     @Test
     fun parsesRealAkitaKeyDescriptionEndToEnd() {
-        // The actual inner DER of OID 1.3.6.1.4.1.11129.2.1.17 from Google's
-        // testdata/akita/sdk34/TEE_EC_NONE.pem (KeyMint, Pixel 8). This is a
-        // KeyDescription SEQUENCE; getExtensionValue() wraps it in an OCTET
-        // STRING, so we wrap to mirror real input. Exercises: multi-byte
-        // attestationVersion (0x012C = 300, two-byte INTEGER), positional
-        // challenge extraction past it, software+hardware AuthorizationLists
-        // (both carrying BF85xx tags), and hardwareEnforced-scoped [704] parse.
-        val keyDescription = hex(
-            "3082013E0202012C0A01010202012C0A010104096368616C6C656E67650400308183" +
-                "BF853D08020601923075E492BF8545730471306F314930470442636F6D2E676F6F" +
-                "676C652E776972656C6573732E616E64726F69642E73656375726974792E617474" +
-                "6573746174696F6E76657269666965722E636F6C6C6563746F7202010031220420" +
-                "103938EE4537E59E8EE792F654504FB8346FC6B346D0BBC4415FC339FCFC8EC130" +
-                "819AA1053103020102A203020103A30402020100AA03020101BF8377020500BF85" +
-                "3E03020100BF85404C304A04200000000000000000000000000000000000000000" +
-                "0000000000000000000000000101000A01020420882588576475AECCB392982FE2" +
-                "FBC5F62C69C9FC84BA73E6C53CC052A1161586BF85410502030222E0BF85420502" +
-                "030316A8BF854E0602040134D9A5BF854F0602040134D9A5"
-        )
-        val ext = tlv(0x04, keyDescription)  // mimic getExtensionValue() OCTET STRING wrap
+        val ext = realAkitaExtension()
 
         // challenge field (index 4) is the ASCII string "challenge"
         assertTrue(
@@ -273,7 +255,213 @@ class AttestationAnalysisTest {
         assertEquals(AttestationAnalysis.RootOfTrust(true, 0), parsed)
     }
 
+    // --- active probe: AuthorizationList tag encoding ------------------------
+
+    /*
+     * Expected bytes are hardcoded from the DER rules rather than produced by
+     * the function under test, so this is a real check and not a tautology.
+     * 704 must agree with the ROOT_OF_TRUST_TAG the existing parser already
+     * relies on, which is the anchor that proves the encoding is right.
+     */
+    @Test
+    fun contextTagUsesHighTagNumberFormAboveThirty() {
+        assertArrayEquals(
+            byteArrayOf(0xBF.toByte(), 0x85.toByte(), 0x40),
+            AttestationAnalysis.contextConstructedTag(704)
+        )
+        assertArrayEquals(hwTag(503), AttestationAnalysis.contextConstructedTag(503))
+        assertArrayEquals(hwTag(504), AttestationAnalysis.contextConstructedTag(504))
+        assertArrayEquals(hwTag(505), AttestationAnalysis.contextConstructedTag(505))
+    }
+
+    @Test
+    fun contextTagUsesShortFormBelowThirtyOne() {
+        assertArrayEquals(byteArrayOf(0xA1.toByte()), AttestationAnalysis.contextConstructedTag(1))
+        assertArrayEquals(byteArrayOf(0xAA.toByte()), AttestationAnalysis.contextConstructedTag(10))
+    }
+
+    // --- active probe: hardware-enforced tag lookup --------------------------
+
+    @Test
+    fun findsTagPresentInHardwareEnforcedList() {
+        val ext = extensionWithHardwareTags(503)
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 503))
+        assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(ext, 504))
+    }
+
+    @Test
+    fun tagLookupFailsSafeOnGarbage() {
+        assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(ByteArray(0), 503))
+        assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(byteArrayOf(1, 2, 3), 503))
+    }
+
+    // --- active probe: authentication self-contradiction ---------------------
+
+    /* Both spoofers emit 503 unconditionally and never emit 504/505. */
+    @Test
+    fun noAuthRequiredAloneIsAContradiction() {
+        assertTrue(AttestationAnalysis.authRequirementContradiction(extensionWithHardwareTags(503)))
+    }
+
+    /* Real KeyMint reports the auth tags, so their presence must clear it. */
+    @Test
+    fun authTagsPresentClearsTheContradiction() {
+        assertFalse(
+            AttestationAnalysis.authRequirementContradiction(extensionWithHardwareTags(503, 504))
+        )
+        assertFalse(
+            AttestationAnalysis.authRequirementContradiction(extensionWithHardwareTags(503, 505))
+        )
+    }
+
+    @Test
+    fun absentNoAuthTagIsNotAContradiction() {
+        assertFalse(
+            AttestationAnalysis.authRequirementContradiction(extensionWithHardwareTags(504, 505))
+        )
+        assertFalse(AttestationAnalysis.authRequirementContradiction(ByteArray(0)))
+    }
+
+    // --- active probe: leaf signature algorithm ------------------------------
+
+    @Test
+    fun leafSignedWithRequestedDigestIsAnomalous() {
+        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA512withECDSA"))
+        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA1withRSA"))
+        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("sha384withecdsa"))
+    }
+
+    /* A real batch key always signs SHA-256, whatever digest the key requested. */
+    @Test
+    fun sha256LeafSignatureIsNormal() {
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA256withECDSA"))
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA256withRSA"))
+    }
+
+    @Test
+    fun unknownSignatureAlgorithmFailsSafe() {
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest(null))
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest(""))
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("Ed25519"))
+    }
+
+    // --- active probe: self-signed single-cert chain -------------------------
+
+    @Test
+    fun multiCertAndEmptyChainsAreNotSelfSignedSingletons() {
+        assertFalse(AttestationAnalysis.isSelfSignedSingleCert(emptyList()))
+        val roots = AttestationRoots.pinnedRoots
+        if (roots.size >= 2) {
+            assertFalse(AttestationAnalysis.isSelfSignedSingleCert(roots))
+        }
+    }
+
+    /*
+     * A pinned Google root IS self-signed, but carries no attestation
+     * extension. Both conditions are required, so this must not flag -- it
+     * guards the AND from decaying into an "is self-signed" check.
+     */
+    @Test
+    fun selfSignedCertWithoutAttestationExtensionDoesNotFlag() {
+        val root = AttestationRoots.pinnedRoots.firstOrNull() ?: return
+        assertFalse(AttestationAnalysis.isSelfSignedSingleCert(listOf(root)))
+    }
+
+    // --- active probe against REAL device bytes ------------------------------
+
+    /*
+     * Validates the tag lookup against a genuine Pixel 8 KeyMint extension
+     * rather than only against fixtures this test file builds itself. The real
+     * hardwareEnforced list carries BF8377 02 0500, i.e. tag 503 wrapping a
+     * NULL, alongside 702/704/705/706/718/719; it carries no 504 or 505.
+     */
+    @Test
+    fun findsNoAuthRequiredTagInRealPixelExtension() {
+        val ext = realAkitaExtension()
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 503))
+        assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(ext, 504))
+        assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(ext, 505))
+    }
+
+    /* Tags that really are in the hardwareEnforced list of that same capture. */
+    @Test
+    fun findsOtherRealHardwareEnforcedTags() {
+        val ext = realAkitaExtension()
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 702))   // origin
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 704))   // RootOfTrust
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 719))   // bootPatchLevel
+    }
+
+    /*
+     * CONTRACT GUARD, and the most important test here.
+     *
+     * This genuine Pixel 8 key was generated WITHOUT setUserAuthenticationRequired,
+     * so NO_AUTH_REQUIRED is legitimately present and the raw predicate returns
+     * true for a completely clean device. The predicate is therefore NOT a
+     * detection on its own: it is only sound when the caller just demanded
+     * authentication for the key being inspected, which is why it is called
+     * exclusively from ActiveAttestationProbe.authRequiredProvocation and never
+     * from the passive probe.
+     *
+     * If someone later wires it up elsewhere, this test tells them why the
+     * result will be a false positive on every clean device.
+     */
+    @Test
+    fun authContradictionPredicateAloneIsNotADetection() {
+        assertTrue(AttestationAnalysis.authRequirementContradiction(realAkitaExtension()))
+    }
+
     // --- DER fixture builders -----------------------------------------------
+
+    /*
+     * The actual inner DER of OID 1.3.6.1.4.1.11129.2.1.17 from Google's
+     * testdata/akita/sdk34/TEE_EC_NONE.pem (KeyMint, Pixel 8), wrapped in the
+     * OCTET STRING that getExtensionValue() adds so it mirrors real input.
+     * Exercises multi-byte attestationVersion (0x012C = 300), positional
+     * challenge extraction past it, software+hardware AuthorizationLists that
+     * both carry BF85xx tags, and the hardwareEnforced-scoped [704] parse.
+     */
+    private fun realAkitaExtension(): ByteArray {
+        val keyDescription = hex(
+            "3082013E0202012C0A01010202012C0A010104096368616C6C656E67650400308183" +
+                "BF853D08020601923075E492BF8545730471306F314930470442636F6D2E676F6F" +
+                "676C652E776972656C6573732E616E64726F69642E73656375726974792E617474" +
+                "6573746174696F6E76657269666965722E636F6C6C6563746F7202010031220420" +
+                "103938EE4537E59E8EE792F654504FB8346FC6B346D0BBC4415FC339FCFC8EC130" +
+                "819AA1053103020102A203020103A30402020100AA03020101BF8377020500BF85" +
+                "3E03020100BF85404C304A04200000000000000000000000000000000000000000" +
+                "0000000000000000000000000101000A01020420882588576475AECCB392982FE2" +
+                "FBC5F62C69C9FC84BA73E6C53CC052A1161586BF85410502030222E0BF85420502" +
+                "030316A8BF854E0602040134D9A5BF854F0602040134D9A5"
+        )
+        return tlv(0x04, keyDescription)
+    }
+
+    /*
+     * Identifier octets for the AuthorizationList tags the active probe reads,
+     * written out by hand so the encoder can be tested against them.
+     */
+    private fun hwTag(tagNo: Int): ByteArray = when (tagNo) {
+        503 -> byteArrayOf(0xBF.toByte(), 0x83.toByte(), 0x77)
+        504 -> byteArrayOf(0xBF.toByte(), 0x83.toByte(), 0x78)
+        505 -> byteArrayOf(0xBF.toByte(), 0x83.toByte(), 0x79)
+        else -> throw IllegalArgumentException("no fixture for tag $tagNo")
+    }
+
+    /*
+     * extensionValue whose hardwareEnforced AuthorizationList carries exactly
+     * the given tags, each wrapping a NULL (the shape both spoofers use for
+     * NO_AUTH_REQUIRED).
+     */
+    private fun extensionWithHardwareTags(vararg tagNos: Int): ByteArray {
+        var entries = ByteArray(0)
+        for (t in tagNos) {
+            entries += tlv(hwTag(t), tlv(0x05, ByteArray(0)))
+        }
+        val hardwareEnforced = tlv(0x30, entries)
+        val keyDescription = tlv(0x30, tlv(0x02, byteArrayOf(0x03)) + hardwareEnforced)
+        return tlv(0x04, keyDescription)
+    }
 
     /* KeyDescription with five fields so index 4 is the challenge OCTET STRING. */
     private fun buildExtensionWithChallenge(challenge: ByteArray): ByteArray {

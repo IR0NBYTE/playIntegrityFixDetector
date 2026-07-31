@@ -27,6 +27,7 @@ class DetectionRunner {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cancelled = AtomicBoolean(false)
     private val attestationProbe = KeyAttestationProbe()
+    private val activeAttestationProbe = ActiveAttestationProbe()
 
     /*
      * @param revocationEnabled user setting (default false): when true, the
@@ -40,12 +41,18 @@ class DetectionRunner {
         // and the native side only needs PackageManager / ApplicationInfo.
         val appContext = context.applicationContext
         executor.execute {
-            // Native engine first; the key-attestation probe (Kotlin, since it
-            // drives the AndroidKeyStore API) then ORs in DETECTION_ATTEST_ANOMALY.
-            // It takes the native bitmask so its contradiction check can reuse
-            // the bootloader/root signals the engine already computed.
+            // Native engine first; the two Kotlin attestation probes (which drive
+            // the AndroidKeyStore API) then OR in their bits. The passive probe
+            // takes the native bitmask so its contradiction check can reuse the
+            // bootloader/root signals the engine already computed; the active one
+            // provokes its own evidence and needs no context.
             val nativeMask = isIntegrityTampered(appContext)
-            val bitmask = nativeMask or attestationProbe.probe(nativeMask, revocationEnabled)
+            val passiveMask = attestationProbe.probe(nativeMask, revocationEnabled)
+            // The active probe is told whether the passive one already flagged so
+            // it does not re-report a device that simply has no hardware
+            // attestation as a second, separate forgery finding.
+            val activeMask = activeAttestationProbe.probe(passiveMask != 0)
+            val bitmask = nativeMask or passiveMask or activeMask
             mainHandler.post {
                 if (!cancelled.get()) onResult(bitmask)
             }
