@@ -150,6 +150,62 @@ class AttestationAnalysisTest {
         )
     }
 
+    /*
+     * Google's status list is NOT uniformly hex. Sampled live on 2026-08-26,
+     * 974 of its 1742 keys (55.9%) are decimal: read as decimal each lands
+     * inside unsigned 64 bits, read as hex each overflows it. Looking up only
+     * the hex form silently missed every one of them, and revocation is the
+     * check that still works against a spoofer running a real KeyMint with a
+     * genuine Google-rooted keybox.
+     *
+     * The two serials below are real entries from that list.
+     */
+    @Test
+    fun decimalKeyedRevocationEntryIsFound() {
+        val serial = BigInteger("6681152659205225093")
+        val listedAsDecimal = setOf("6681152659205225093")
+
+        assertTrue(
+            AttestationAnalysis.anyCertRevoked(
+                AttestationAnalysis.serialLookupKeys(serial), listedAsDecimal
+            )
+        )
+        // The hex-only form is exactly what used to be sent, and it misses.
+        assertFalse(
+            AttestationAnalysis.anyCertRevoked(
+                listOf(AttestationAnalysis.normalizeSerial(serial)), listedAsDecimal
+            )
+        )
+    }
+
+    @Test
+    fun hexKeyedRevocationEntryStillFound() {
+        val serial = BigInteger("c35747a084470c3135aeefe2b8d40cd6", 16)
+        assertTrue(
+            AttestationAnalysis.anyCertRevoked(
+                AttestationAnalysis.serialLookupKeys(serial),
+                setOf("c35747a084470c3135aeefe2b8d40cd6")
+            )
+        )
+    }
+
+    @Test
+    fun serialLookupKeysCoversBothEncodings() {
+        val keys = AttestationAnalysis.serialLookupKeys(BigInteger("6681152659205225093"))
+        assertTrue(keys.contains("6681152659205225093"))
+        assertTrue(keys.contains("5cb838f1fe157a85"))
+        // A serial that renders identically in both bases is not duplicated.
+        assertEquals(1, AttestationAnalysis.serialLookupKeys(BigInteger.valueOf(7)).size)
+    }
+
+    /* A negative serial must not render with a leading '-'. */
+    @Test
+    fun negativeSerialsNormalizeToUnsigned() {
+        AttestationAnalysis.serialLookupKeys(BigInteger("-255")).forEach {
+            assertFalse(it.startsWith("-"))
+        }
+    }
+
     @Test
     fun revokedSerialInChainFlags() {
         assertTrue(AttestationAnalysis.anyCertRevoked(listOf("ff", "ab"), setOf("ab")))
@@ -324,11 +380,28 @@ class AttestationAnalysisTest {
 
     // --- active probe: leaf signature algorithm ------------------------------
 
+    /*
+     * SHA-512 is the digest the active probe requests, so it is the only one
+     * whose appearance in the leaf signature proves the signer echoed us.
+     */
     @Test
     fun leafSignedWithRequestedDigestIsAnomalous() {
         assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA512withECDSA"))
-        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA1withRSA"))
-        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("sha384withecdsa"))
+        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("sha512withecdsa"))
+        assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA-512withRSA"))
+    }
+
+    /*
+     * A batch key we never asked to use these digests proves nothing, and
+     * SHA-384 would be an outright false positive: Google's own attestation
+     * PKI uses P-384 keys (the pinned ECDSA root self-signs ecdsa-with-SHA384),
+     * so a device whose batch key is P-384 signs leaves SHA384withECDSA on
+     * completely stock hardware.
+     */
+    @Test
+    fun otherNonSha256DigestsAreNotEvidence() {
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("sha384withecdsa"))
+        assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA1withRSA"))
     }
 
     /* A real batch key always signs SHA-256, whatever digest the key requested. */

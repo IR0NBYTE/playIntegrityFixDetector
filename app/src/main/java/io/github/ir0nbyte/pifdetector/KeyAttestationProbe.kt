@@ -3,11 +3,9 @@ package io.github.ir0nbyte.pifdetector
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Log
-import java.security.InvalidKeyException
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.SecureRandom
-import java.security.SignatureException
 import java.security.cert.X509Certificate
 
 /*
@@ -64,27 +62,54 @@ class KeyAttestationProbe {
             val chain = attested.chain
             if (chain.isEmpty()) return 0
 
-            // 1a: cryptographic chain validation. Only a SignatureException /
-            // InvalidKeyException PROVES a bad signature -> link invalid. The
-            // other verify() failures (NoSuchAlgorithm/Provider, CertificateException)
-            // mean "couldn't check", not "invalid" -> treat the link as valid so
-            // an environment gap can never manufacture a spoof verdict.
-            val broken = AttestationAnalysis.chainIsCryptographicallyBroken(chain.size) { i ->
-                try {
-                    chain[i].verify(chain[i + 1].publicKey)
-                    true
-                } catch (_: SignatureException) {
-                    false
-                } catch (_: InvalidKeyException) {
-                    false
-                } catch (_: Exception) {
-                    true  // couldn't verify -> fail safe, do not flag
-                }
+            /*
+             * 1a: cryptographic chain validation, and 1a': every issuer in the
+             * chain must actually be a CA.
+             *
+             * Both run FIRST, before a single byte of the attestation extension
+             * is parsed. The extension is written by whoever is spoofing, and
+             * the parsers below are the only attacker-driven code here, so the
+             * two checks that need nothing from it are the two that must not be
+             * reachable-around.
+             *
+             * The CA check is what stops a chain that passes 1a and 1c anyway:
+             * a genuine attested key from a real device is an end-entity cert
+             * whose private key the attacker holds, so they can sign a forged
+             * leaf with it and hand back a chain that verifies link by link and
+             * terminates at a real Google root.
+             */
+            if (AttestationAnalysis.chainSignaturesBroken(chain)) {
+                return DetectionResult.DETECTION_ATTEST_ANOMALY
             }
-            if (broken) return DetectionResult.DETECTION_ATTEST_ANOMALY
+            if (AttestationAnalysis.chainHasNonCaIssuer(chain)) {
+                return DetectionResult.DETECTION_ATTEST_ANOMALY
+            }
 
             val extValue = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID)
                 ?: return 0  // no attestation extension -> not an attested key, don't flag
+
+            /*
+             * A Software-level chain is signed by the public AOSP software
+             * attestation key, which is deliberately not among the pinned roots.
+             * Anchoring therefore fails for it on clean emulators, GSI images
+             * and AOSP builds, and flagging that would contradict the rule at
+             * the top of this file that absence of attestation must never flag.
+             * Unknown level (null) keeps the old behaviour and still anchors.
+             */
+            val softwareBacked =
+                AttestationAnalysis.parseAttestationSecurityLevel(extValue) ==
+                    AttestationAnalysis.SECURITY_LEVEL_SOFTWARE
+
+            // 1c: anchor the (signature-valid) chain to a genuine Google root.
+            // A chain that is internally self-consistent but does NOT terminate
+            // at a pinned Google root is a fake-root spoof. chainAnchorsToPinnedRoot
+            // is fail-safe: any inconclusive case returns true, so only a chain
+            // proven unanchored flags.
+            val googleAnchored =
+                AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
+            if (!softwareBacked && !googleAnchored) {
+                return DetectionResult.DETECTION_ATTEST_ANOMALY
+            }
 
             // Anti-replay: the attestation must echo the nonce we just generated.
             val challenge = AttestationAnalysis.parseAttestationChallenge(extValue)
@@ -98,25 +123,17 @@ class KeyAttestationProbe {
                 return DetectionResult.DETECTION_ATTEST_ANOMALY
             }
 
-            // 1c: anchor the (signature-valid) chain to a genuine Google root.
-            // This is what makes 1a meaningful -- a chain that's internally
-            // self-consistent but does NOT terminate at a pinned Google root is
-            // a software/AOSP-software-keybox or fake-root spoof. chainAnchors..
-            // is fail-safe: any inconclusive case returns true, so only a chain
-            // proven unanchored flags.
-            val anchored = AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
-            if (!anchored) return DetectionResult.DETECTION_ATTEST_ANOMALY
-
             // 1d: revocation. Gated behind the user-visible setting (OFF by
             // default -> app stays network-silent unless the user opts in), and
             // only reached for a chain that anchors to a genuine Google root
             // (so the serials we query are actually Google's). Catches
             // generation-mode spoofers using a leaked-but-revoked real keybox.
             // Network call; bounded + fail-safe on every error path.
-            if (revocationEnabled) {
+            if (revocationEnabled && googleAnchored) {
                 val revoked = statusClient.fetchRevokedSerials()
                 if (revoked != null) {
-                    val serials = chain.map { AttestationAnalysis.normalizeSerial(it.serialNumber) }
+                    val serials =
+                        chain.flatMap { AttestationAnalysis.serialLookupKeys(it.serialNumber) }
                     if (AttestationAnalysis.anyCertRevoked(serials, revoked)) {
                         return DetectionResult.DETECTION_ATTEST_ANOMALY
                     }

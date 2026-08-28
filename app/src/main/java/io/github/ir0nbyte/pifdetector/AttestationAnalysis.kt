@@ -109,7 +109,7 @@ object AttestationAnalysis {
                 }
             }
             false
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             true
         }
     }
@@ -125,8 +125,106 @@ object AttestationAnalysis {
         return chainSerials.any { revokedSerials.contains(it) }
     }
 
-    /* Google's status list keys serials as lowercase hex, no leading zeros. */
-    fun normalizeSerial(serial: BigInteger): String = serial.toString(16)
+    /*
+     * Google's status list keys serials as lowercase hex, no leading zeros.
+     *
+     * abs() because BigInteger.toString(16) renders a negative value with a
+     * leading '-', which can never match an entry in the list. X.509 serials
+     * are defined positive, but the value is parsed from a certificate an
+     * attacker wrote, and a serial that silently fails every lookup would be a
+     * free way to opt out of revocation.
+     */
+    fun normalizeSerial(serial: BigInteger): String = serial.abs().toString(16)
+
+    /*
+     * Every form a serial may take as a key in Google's status list.
+     *
+     * The list is NOT uniformly hex. Measured against the live list
+     * (1742 entries, Last-Modified 2026-08-26): 768 keys are 30 to 32
+     * characters and contain a-f, which is a 128-bit serial in hex, while 974
+     * keys (55.9%) are 17 to 20 characters of pure digits. Those are decimal:
+     * read as decimal every one of them lands inside unsigned 64 bits, and read
+     * as hex every one of them overflows it. A 20-character hex serial
+     * containing no a-f at all has probability 8.3e-05, and there are 438 of
+     * them, so the digits are not a coincidence of hex encoding.
+     *
+     * Looking up the hex form only, as this did, therefore missed more than
+     * half of every revoked keybox Google publishes. That matters more now than
+     * it did: against a spoofer that runs a real KeyMint implementation and
+     * re-signs with a genuine, Google-rooted keybox, the chain verifies, the
+     * challenge echoes and the authorization tags are honest, so revocation is
+     * the check left standing.
+     *
+     * Both forms are returned rather than guessing per-serial, since a lookup
+     * is a set membership test and a wrong-encoding miss is silent. distinct()
+     * because small serials render identically in both bases.
+     */
+    fun serialLookupKeys(serial: BigInteger): List<String> {
+        val positive = serial.abs()
+        return listOf(positive.toString(16), positive.toString(10)).distinct()
+    }
+
+    /*
+     * 1a, applied to a real chain. Verifies every link with the platform's own
+     * signature implementation.
+     *
+     * Split out of the probes so both the passive and the active one run
+     * identical crypto, and so the actual verification is reachable from a JVM
+     * unit test instead of only from a device.
+     *
+     * The exception mapping is the security-relevant part:
+     *  - SignatureException / InvalidKeyException: the link is provably bad.
+     *  - NoSuchAlgorithmException: the signature algorithm OID is written by
+     *    whoever built the certificate. A leaf whose algorithm the platform
+     *    cannot even name is not "a link we failed to check", it is a link that
+     *    cannot have come from a real batch key, so it counts as broken. Left
+     *    as inconclusive it was a free bypass: forge the leaf, set a nonsense
+     *    algorithm OID, and the chain verifies.
+     *  - anything else (no provider, encoding trouble): genuinely inconclusive,
+     *    so the link is treated as valid and never manufactures a detection.
+     */
+    fun chainSignaturesBroken(chain: List<X509Certificate>): Boolean =
+        chainIsCryptographicallyBroken(chain.size) { i ->
+            try {
+                chain[i].verify(chain[i + 1].publicKey)
+                true
+            } catch (_: java.security.SignatureException) {
+                false
+            } catch (_: java.security.InvalidKeyException) {
+                false
+            } catch (_: java.security.NoSuchAlgorithmException) {
+                false
+            } catch (_: Throwable) {
+                true
+            }
+        }
+
+    /*
+     * Every certificate that ISSUES another one in the chain must be a CA.
+     *
+     * Without this, a signature-valid chain anchored at a genuine Google root
+     * still proves nothing: an ordinary attested key generated on a real device
+     * is an end-entity certificate whose private key lives in the attacker's
+     * own Keystore and can sign arbitrary bytes, including a certificate. They
+     * mint a forged leaf under it and present
+     * [forged leaf, their real attested leaf, intermediate, Google root]. Every
+     * link verifies and the chain anchors, so both the anchoring check and the
+     * signature check pass while the forged leaf's attestation extension says
+     * whatever they like. Standard PKIX rejects this on basicConstraints; this
+     * is that check.
+     *
+     * Index 0 is the leaf and is expected NOT to be a CA, so it is skipped.
+     * getBasicConstraints() returns -1 for a non-CA and the path-length
+     * constraint otherwise. Any error yields false, never a detection.
+     */
+    fun chainHasNonCaIssuer(chain: List<X509Certificate>): Boolean {
+        if (chain.size < 2) return false
+        return try {
+            (1 until chain.size).any { chain[it].basicConstraints < 0 }
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     // --- active-probe analysis (DETECTION_ATTEST_FORGERY) --------------------
 
@@ -179,7 +277,7 @@ object AttestationAnalysis {
             val unwrapped = readSingleOctetStringContent(extensionValue) ?: return false
             val hardwareEnforced = lastSequenceChildContent(unwrapped) ?: return false
             findTaggedContent(hardwareEnforced, contextConstructedTag(tagNo)) != null
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
     }
@@ -189,15 +287,26 @@ object AttestationAnalysis {
      *
      * Call ONLY for a key that was requested with setUserAuthenticationRequired
      * (true). Real KeyMint then attests USER_AUTH_TYPE (504) and AUTH_TIMEOUT
-     * (505) and omits NO_AUTH_REQUIRED (503) entirely. Both known spoofers emit
-     * `teeTag(503, DERNull.INSTANCE)` with no surrounding condition -- note that
-     * in the same builder the patch-level tags ARE guarded, so this is not a
-     * generic "everything is unconditional" artifact -- and emit neither 504 nor
-     * 505, because nothing in the forged path models authentication.
+     * (505) and omits NO_AUTH_REQUIRED (503) entirely. A spoofer that emits 503
+     * unconditionally while modelling no authentication at all contradicts
+     * itself, and requiring 503 present AND both 504/505 absent keeps that
+     * fail-safe: a device that reports the authentication tags cannot trip it.
      *
-     * Requiring 503 present AND both 504/505 absent keeps this fail-safe: a
-     * device that reports the authentication tags cannot trip it, whatever else
-     * it does with 503.
+     * COVERAGE, as of 2026-08-28: this now fires on nothing current, and is
+     * retained only for the TEESimulator v3 line and older installs.
+     * TrickyStoreOSS made the tag conditional in commit 2f15feb,
+     * 2026-07-31T16:23:55Z, about sixteen hours after the v2.5 release:
+     *     -        teeTag(503, DERNull.INSTANCE)
+     *     +        if (params.noAuthRequired == true) teeTag(503, DERNull.INSTANCE)
+     * Since the active probe asks for an auth-REQUIRED key, 503 is now absent
+     * there and the predicate returns false. ForgeStore carries the same guard,
+     * and TEESimulator v4 and OhMyKeymint emit the tag from a real KeyMint
+     * implementation, so it is honest for them too.
+     *
+     * Recorded rather than quietly left in place: a check whose comment claims
+     * coverage it no longer has is the same failure this project keeps hitting.
+     * The active probe's remaining live signal against that family is
+     * leafSignatureTracksRequestedDigest.
      */
     fun authRequirementContradiction(extensionValue: ByteArray): Boolean {
         val claimsNoAuth = hasHardwareEnforcedTag(extensionValue, TAG_NO_AUTH_REQUIRED)
@@ -219,13 +328,20 @@ object AttestationAnalysis {
      *
      * Only a positively recognised non-SHA-256 digest flags; an unparseable or
      * unfamiliar algorithm name yields false.
+     *
+     * Narrowed to SHA-512 only: that is the digest the active probe actually
+     * requests, so it is the sole value whose presence proves the signer echoed
+     * our request back. SHA-384 and SHA-1 proved nothing either way and
+     * SHA-384 carried real false-positive risk, because Google's own
+     * attestation PKI uses P-384 keys (the ECDSA root pinned in
+     * AttestationRoots self-signs with ecdsa-with-SHA384), so a device whose
+     * batch key is P-384 would sign leaves SHA384withECDSA on stock hardware.
      */
     fun leafSignatureTracksRequestedDigest(sigAlgName: String?): Boolean {
         if (sigAlgName.isNullOrBlank()) return false
         val normalized = sigAlgName.uppercase().replace("-", "")
         if (!normalized.contains("WITH")) return false
-        val digest = normalized.substringBefore("WITH")
-        return digest == "SHA512" || digest == "SHA384" || digest == "SHA1"
+        return normalized.substringBefore("WITH") == "SHA512"
     }
 
     /*
@@ -241,7 +357,7 @@ object AttestationAnalysis {
             val cert = chain[0]
             cert.getExtensionValue(ATTESTATION_OID) != null &&
                 cert.issuerX500Principal == cert.subjectX500Principal
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             false
         }
     }
@@ -276,7 +392,56 @@ object AttestationAnalysis {
                 index++
             }
             null
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /*
+     * KeyDescription field [1], attestationSecurityLevel: 0 Software,
+     * 1 TrustedEnvironment, 2 StrongBox. Position-stable across every
+     * attestation version, so positional access at index 1 is safe.
+     *
+     * Needed to tell "this chain is forged" apart from "this device has no
+     * hardware attestation to forge". A Software-level chain is signed by the
+     * public AOSP software attestation key, which is deliberately not pinned,
+     * so anchoring fails for it on perfectly clean emulators, GSI images and
+     * AOSP builds. Reporting that as an attestation anomaly contradicts the
+     * probe's own rule that absence of attestation must never flag.
+     *
+     * Safe to trust for THIS purpose even though a spoofer writes the field:
+     * declaring Software is declaring the key is not hardware-backed, which
+     * fails the integrity verdict the spoofer exists to pass.
+     *
+     * Returns null on any structural surprise -> caller keeps its old behaviour.
+     */
+    fun parseAttestationSecurityLevel(extensionValue: ByteArray): Int? {
+        return try {
+            val unwrapped = readSingleOctetStringContent(extensionValue) ?: return null
+            val r = Asn1Reader(unwrapped)
+            val seqTag = r.readTag()
+            if (seqTag.size != 1 || (seqTag[0].toInt() and 0xFF) != TAG_SEQUENCE) return null
+            val seqLen = r.readLength()
+            val inner = Asn1Reader(unwrapped, r.pos, r.pos + seqLen)
+            var index = 0
+            while (inner.hasMore()) {
+                val tag = inner.readTag()
+                val len = inner.readLength()
+                val start = inner.pos
+                inner.pos = start + len
+                if (index == ATTESTATION_SECURITY_LEVEL_INDEX) {
+                    return if (tag.size == 1 &&
+                        (tag[0].toInt() and 0xFF) == TAG_ENUMERATED && len >= 1
+                    ) {
+                        unwrapped[start].toInt() and 0xFF
+                    } else {
+                        null
+                    }
+                }
+                index++
+            }
+            null
+        } catch (_: Throwable) {
             null
         }
     }
@@ -302,7 +467,7 @@ object AttestationAnalysis {
             val hardwareEnforced = lastSequenceChildContent(unwrapped) ?: return null
             val rotContent = findTaggedContent(hardwareEnforced, ROOT_OF_TRUST_TAG) ?: return null
             parseRootOfTrustSequence(rotContent)
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -321,6 +486,10 @@ object AttestationAnalysis {
      * [3]kmSecLevel [4]attestationChallenge [5]uniqueId [6]swEnforced
      * [7]hwEnforced. The leading fields are position-stable across versions. */
     private const val ATTESTATION_CHALLENGE_INDEX = 4
+    private const val ATTESTATION_SECURITY_LEVEL_INDEX = 1
+
+    /* attestationSecurityLevel values. */
+    const val SECURITY_LEVEL_SOFTWARE = 0
 
     private class Asn1Reader(val buf: ByteArray, var pos: Int = 0, val end: Int = buf.size) {
         fun hasMore(): Boolean = pos < end
@@ -333,6 +502,14 @@ object AttestationAnalysis {
                 // high-tag-number form: subsequent bytes while high bit set
                 while (pos < end && (buf[pos].toInt() and 0x80) != 0) pos++
                 pos++ // final byte with high bit clear
+                /*
+                 * A high-tag-number form whose continuation bytes run to the end
+                 * of this element leaves pos at end + 1. Without this guard the
+                 * subsequent readLength() reads a byte belonging to the NEXT
+                 * element (the backing array outlives `end`), silently
+                 * mis-parsing instead of failing.
+                 */
+                if (pos > end) throw IllegalStateException("truncated tag")
             }
             return buf.copyOfRange(start, pos)
         }
@@ -348,7 +525,18 @@ object AttestationAnalysis {
                 len = 0
                 repeat(numBytes) { len = (len shl 8) or (buf[pos++].toInt() and 0xFF) }
             }
-            if (len < 0 || pos + len > end) throw IllegalStateException("length overflow")
+            /*
+             * Bounds math in Long, deliberately. The length field is chosen by
+             * whoever built the certificate, so `pos + len` in Int overflows to
+             * a negative number for a length near 0x7FFFFFFF and slips past both
+             * clauses. copyOfRange is then handed (pos, negative), whose own
+             * `to - from` underflows back to a positive 2 GB, so its range check
+             * passes too and the allocation is attempted: OutOfMemoryError, an
+             * Error rather than an Exception, unwinds past every `catch
+             * (_: Exception)` here and is read by the probes as "no anomaly".
+             */
+            if (len < 0 || pos.toLong() + len.toLong() > end.toLong())
+                throw IllegalStateException("length overflow")
             return len
         }
     }
@@ -389,10 +577,28 @@ object AttestationAnalysis {
     }
 
     /*
+     * Maximum nesting this search will follow. A real KeyDescription nests
+     * about six deep (extension octet string -> KeyDescription -> Authorization
+     * List -> [704] -> RootOfTrust -> field); 20 leaves generous headroom.
+     *
+     * The cap is a correctness requirement, not a tuning knob: nesting depth is
+     * chosen by whoever built the certificate, and unbounded recursion on a
+     * hostile extension raises StackOverflowError, an Error rather than an
+     * Exception, which unwinds past every `catch (_: Exception)` here and is
+     * read by the probes as "no anomaly".
+     */
+    private const val MAX_DER_DEPTH = 20
+
+    /*
      * Depth-first search for the first TLV whose tag equals `target`; returns
      * that element's content bytes. Recurses into constructed elements.
      */
-    private fun findTaggedContent(data: ByteArray, target: ByteArray): ByteArray? {
+    private fun findTaggedContent(
+        data: ByteArray,
+        target: ByteArray,
+        depth: Int = 0
+    ): ByteArray? {
+        if (depth > MAX_DER_DEPTH) return null
         val r = Asn1Reader(data)
         while (r.hasMore()) {
             val tag = r.readTag()
@@ -403,7 +609,7 @@ object AttestationAnalysis {
 
             if (tag.contentEquals(target)) return content
             if (r.isConstructed(tag)) {
-                val nested = findTaggedContent(content, target)
+                val nested = findTaggedContent(content, target, depth + 1)
                 if (nested != null) return nested
             }
         }

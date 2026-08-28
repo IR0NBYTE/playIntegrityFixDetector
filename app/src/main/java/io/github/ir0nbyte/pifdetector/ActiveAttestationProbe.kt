@@ -99,6 +99,8 @@ class ActiveAttestationProbe {
             return DetectionResult.DETECTION_ATTEST_FORGERY
         }
 
+        chainStructureForgery(chain)?.let { return it }
+
         val ext = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID) ?: return 0
 
         val challenge = AttestationAnalysis.parseAttestationChallenge(ext)
@@ -106,13 +108,49 @@ class ActiveAttestationProbe {
             return DetectionResult.DETECTION_ATTEST_FORGERY
         }
 
-        if (!passiveProbeFlagged &&
-            !AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
-        ) {
+        if (!passiveProbeFlagged && !anchorsToGoogle(chain, ext)) {
             return DetectionResult.DETECTION_ATTEST_FORGERY
         }
 
         return 0
+    }
+
+    /*
+     * Chain-shape checks that need nothing from the attestation extension.
+     *
+     * This probe used to run none of them: its only chain test was anchoring,
+     * and anchoring alone inspects `chain.last()` in isolation. The pinned
+     * roots are public -- they are embedded verbatim in AttestationRoots -- so
+     * appending a copy of one to a forged chain satisfied it outright, and the
+     * one probe built specifically to catch forced-forge could be defeated by
+     * pasting a certificate anyone can download.
+     *
+     * Signature validation closes that. The CA check closes the subtler version
+     * where every signature is genuine: a real attested key is an end-entity
+     * certificate whose private key the attacker controls, so they can sign a
+     * forged leaf with it and produce a chain that both verifies and anchors.
+     */
+    private fun chainStructureForgery(chain: List<X509Certificate>): Int? {
+        if (AttestationAnalysis.chainSignaturesBroken(chain)) {
+            return DetectionResult.DETECTION_ATTEST_FORGERY
+        }
+        if (AttestationAnalysis.chainHasNonCaIssuer(chain)) {
+            return DetectionResult.DETECTION_ATTEST_FORGERY
+        }
+        return null
+    }
+
+    /*
+     * Software-level attestation is not forgery: the AOSP software attestation
+     * key is public and deliberately unpinned, so a clean emulator or GSI build
+     * fails anchoring for every key it issues. Mirrors KeyAttestationProbe.
+     */
+    private fun anchorsToGoogle(chain: List<X509Certificate>, ext: ByteArray): Boolean {
+        val softwareBacked =
+            AttestationAnalysis.parseAttestationSecurityLevel(ext) ==
+                AttestationAnalysis.SECURITY_LEVEL_SOFTWARE
+        return softwareBacked ||
+            AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
     }
 
     /*
@@ -146,14 +184,28 @@ class ActiveAttestationProbe {
             return DetectionResult.DETECTION_ATTEST_FORGERY
         }
 
-        // The batch key's signing algorithm is fixed at provisioning and never
-        // follows the attested key's digest. Checked before the extension parse
-        // so it still applies if the extension is unreadable.
-        if (AttestationAnalysis.leafSignatureTracksRequestedDigest(chain[0].sigAlgName)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
-        }
+        chainStructureForgery(chain)?.let { return it }
 
         val ext = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID) ?: return 0
+
+        /*
+         * The batch key's signing algorithm is fixed at provisioning and never
+         * follows the attested key's digest, so a SHA-512-signed leaf means the
+         * signer tracked our request.
+         *
+         * Ordered AFTER the extension check, and requiring a real chain, on
+         * purpose. AOSP derives the signature algorithm of the SELF-SIGNED
+         * PLACEHOLDER certificate from the digests we asked for, so a ROM that
+         * returns a placeholder instead of throwing when attestation is
+         * unavailable would otherwise be flagged purely for the digest we
+         * requested. A placeholder carries no attestation extension and stands
+         * alone, so both guards below exclude it.
+         */
+        if (chain.size >= 2 &&
+            AttestationAnalysis.leafSignatureTracksRequestedDigest(chain[0].sigAlgName)
+        ) {
+            return DetectionResult.DETECTION_ATTEST_FORGERY
+        }
 
         val challenge = AttestationAnalysis.parseAttestationChallenge(ext)
         if (AttestationAnalysis.challengeMismatch(challenge, attested.challenge)) {
