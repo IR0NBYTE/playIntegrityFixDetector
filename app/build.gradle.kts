@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.ir0nbyte.pifdetector"
         minSdk = 24
         targetSdk = 35
-        versionCode = 7
-        versionName = "2.5"
+        versionCode = 8
+        versionName = "2.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
