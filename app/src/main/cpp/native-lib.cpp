@@ -19,6 +19,7 @@
 #include <random>
 #include <functional>
 #include <cstdlib>
+#include <android/api-level.h>
 
 #ifdef IS_DEBUG_BUILD
 #include <android/log.h>
@@ -40,6 +41,42 @@ public:
     ScopedFile(const ScopedFile&) = delete;
     ScopedFile& operator=(const ScopedFile&) = delete;
 };
+
+/*
+ * JNI lookup wrappers that clear the pending exception.
+ *
+ * FindClass raises NoClassDefFoundError, GetMethodID/GetStaticMethodID raise
+ * NoSuchMethodError and GetFieldID raises NoSuchFieldError. Returning on a null
+ * result without clearing leaves that exception pending, and every subsequent
+ * JNI call in the same frame is then undefined behaviour (an immediate abort
+ * under CheckJNI). Worse, it survives the return into Kotlin and is rethrown at
+ * the isIntegrityTampered call site, which runs inside a bare Runnable on the
+ * executor and so reaches the thread's default handler as a process crash
+ * rather than a caught failure.
+ */
+static jclass findClassChecked(JNIEnv* env, const char* name) {
+    jclass c = env->FindClass(name);
+    if (!c && env->ExceptionCheck()) env->ExceptionClear();
+    return c;
+}
+
+static jmethodID getMethodChecked(JNIEnv* env, jclass c, const char* name, const char* sig) {
+    jmethodID m = env->GetMethodID(c, name, sig);
+    if (!m && env->ExceptionCheck()) env->ExceptionClear();
+    return m;
+}
+
+static jmethodID getStaticMethodChecked(JNIEnv* env, jclass c, const char* name, const char* sig) {
+    jmethodID m = env->GetStaticMethodID(c, name, sig);
+    if (!m && env->ExceptionCheck()) env->ExceptionClear();
+    return m;
+}
+
+static jfieldID getFieldChecked(JNIEnv* env, jclass c, const char* name, const char* sig) {
+    jfieldID f = env->GetFieldID(c, name, sig);
+    if (!f && env->ExceptionCheck()) env->ExceptionClear();
+    return f;
+}
 
 /*
  * RAII for JNI local references. The local-ref table defaults to 512 slots
@@ -94,6 +131,74 @@ static std::string base64_decode(const std::string &input) {
         }
     }
     return output;
+}
+
+/*
+ * Obfuscated system-property names, in one place.
+ *
+ * These used to be written inline at each call site, and two of them were
+ * mis-encoded: ro.boot.veritymode decoded to `ro.boot.verigb"old"` and
+ * ro.boot.flash.locked to a run of control bytes. __system_property_get on a
+ * name that does not exist writes nothing and reports no error, so both
+ * comparisons in isBootloaderUnlocked() were constant-false on every device.
+ * Nothing looked wrong, because a clean device produces the same output as a
+ * broken check -- the same way the removed obfuscation VM hid for months.
+ *
+ * Collecting them here lets nativeSelfTest() below decode every one and check
+ * it against the Android property grammar, so a future typo fails a test
+ * instead of silently deleting a detection.
+ */
+namespace prop {
+    static const char* const kBuildFingerprint   = "QjdqIzkgXDxqJyUnVz02MT4gXiw=";
+    static const char* const kProductModel       = "QjdqMT4mVC0nNWIkXzwhLQ==";
+    static const char* const kProductBrand       = "QjdqMT4mVC0nNWIrQjkqJQ==";
+    static const char* const kProductDevice      = "QjdqMT4mVC0nNWItVS4tIik=";
+    static const char* const kBuildType          = "QjdqIzkgXDxqNTU5VQ==";
+    static const char* const kBuildTags          = "QjdqIzkgXDxqNS0uQw==";
+    static const char* const kBuildFlavor        = "QjdqIzkgXDxqJyAoRjc2";
+    static const char* const kProductBoard       = "QjdqMT4mVC0nNWIrXzk2JQ==";
+    static const char* const kBuildId            = "QjdqIzkgXDxqKCg=";
+    static const char* const kSystemBuildId      = "QjdqMjU6RD0pby48WTQgbyUt";
+    static const char* const kVerifiedBootState  = "QjdqIyMmRHYyJD4gVjEhJS4mXyw3NS09VQ==";
+    static const char* const kBootloader         = "QjdqIyMmRHYmLiM9XDclJSk7";
+    static const char* const kVerityMode         = "QjdqIyMmRHYyJD4gRCEpLigs";
+    static const char* const kFlashLocked        = "QjdqIyMmRHYiLS06WHYoLi8iVTw=";
+    static const char* const kVbmetaDeviceState  = "QjdqIyMmRHYyIyEsRDlqJSk/WTshHj89USwh";
+    static const char* const kDebuggable         = "QjdqJSkrRT8jIC4lVQ==";
+    static const char* const kSecure             = "QjdqMikqRSoh";
+    static const char* const kOemUnlockAllowed   = "QyE3byMsXQcxLyAmUzMbICAlXy8hJQ==";
+
+    static const char* const kAll[] = {
+        kBuildFingerprint, kProductModel, kProductBrand, kProductDevice,
+        kBuildType, kBuildTags, kBuildFlavor, kProductBoard, kBuildId,
+        kSystemBuildId, kVerifiedBootState, kBootloader, kVerityMode,
+        kFlashLocked, kVbmetaDeviceState, kDebuggable, kSecure,
+        kOemUnlockAllowed,
+    };
+}
+
+static std::string decodeProp(const char* encoded) {
+    return Deobfuscate(base64_decode(encoded));
+}
+
+/*
+ * Android property names are lowercase alphanumerics plus '.', '_' and '-',
+ * and start with a letter. Anything else means the literal is mis-encoded.
+ */
+static bool isValidPropName(const std::string& name) {
+    if (name.empty() || name.size() > PROP_NAME_MAX) return false;
+    if (name[0] < 'a' || name[0] > 'z') return false;
+    for (char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* Reads an obfuscated property name into a caller-supplied buffer. */
+static void readProp(const char* encoded, char* out) {
+    __system_property_get(decodeProp(encoded).c_str(), out);
 }
 
 __attribute__((always_inline))
@@ -169,6 +274,9 @@ static inline bool isZygiskActiveEnhanced() {
                 line.find("nohello") != std::string::npos ||
                 line.find("shamiko") != std::string::npos ||
                 line.find("lspd") != std::string::npos ||
+                // JingMatrix/Vector, the maintained LSPosed successor (renamed
+                // 2026-08); upstream LSPosed itself has had no commits since 2023.
+                line.find(Deobfuscate(base64_decode("SiEjKD8iby4hIjgmQg=="))) != std::string::npos ||
                 line.find("LSPosed") != std::string::npos ||
                 line.find("[anon:zygisk]") != std::string::npos) {
                 maps.close();
@@ -199,16 +307,35 @@ __attribute__((always_inline))
 static inline bool detectPIFSideEffects() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
+        /*
+         * A /proc/self/maps line carries a file path or a kernel/ART anon-region
+         * name set through PR_SET_VMA_ANON_NAME. It never carries a Java type
+         * name or an Android package name, because those live inside a DEX.
+         *
+         * Six needles here were exactly that and could not match anything:
+         * es.chiteroman.playintegrityfix (a package, mapped only in its own
+         * process), CustomKeyStoreSpi, CustomProvider and InMemoryDexClassLoader
+         * (class names), and the capitalised PlayIntegrityFix / PlayIntegrityFork
+         * (module paths are lowercase). They are folded into a single
+         * case-insensitive module-path match, which covers every casing a fork
+         * might use and is strictly broader than the two that worked.
+         *
+         * [anon:dalvik-DEX is the real in-process signal: ART names a region
+         * that way for InMemoryDexClassLoader and byte-array DexClassLoader
+         * only. Compressed-dex extraction uses a different name, and this app
+         * loads no dex from memory itself, so it is not a false-positive source.
+         */
+        const std::string modulePif  = Deobfuscate(base64_decode("QDQlOCUnRD0jMyU9ST4tOQ=="));  // playintegrityfix
+        const std::string modulePifk = Deobfuscate(base64_decode("QDQlOCUnRD0jMyU9ST4rMyc="));  // playintegrityfork
+        const std::string dexAnon    = Deobfuscate(base64_decode("azkqLiJzVDkoNyUiHRwBGQ=="));  // [anon:dalvik-DEX
+
         std::string line;
         while (std::getline(maps, line)) {
-            if (line.find(Deobfuscate(base64_decode("VStqIiQgRD02LiEoXnY0LS0wWTYwJCs7WSw9JyUx"))) != std::string::npos ||
-                line.find(Deobfuscate(base64_decode("cy03NSMkez09EjgmQj0XMSU="))) != std::string::npos ||
-                line.find(Deobfuscate(base64_decode("cy03NSMkYCorNyUtVSo="))) != std::string::npos ||
-                line.find(Deobfuscate(base64_decode("YDQlOAUnRD0jMyU9SR4tOQ=="))) != std::string::npos ||
-                line.find(Deobfuscate(base64_decode("QDQlOCUnRD0jMyU9ST4tOQ=="))) != std::string::npos ||
-                line.find(Deobfuscate(base64_decode("YDQlOAUnRD0jMyU9SR4rMyc="))) != std::string::npos ||         // PlayIntegrityFork
-                line.find(Deobfuscate(base64_decode("eTYJJCEmQiEAJDQKXDk3MgAmUTwhMw=="))) != std::string::npos || // InMemoryDexClassLoader
-                line.find(Deobfuscate(base64_decode("azkqLiJzVDkoNyUiHRwBGQ=="))) != std::string::npos) {          // [anon:dalvik-DEX
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            if (lower.find(modulePif) != std::string::npos ||
+                lower.find(modulePifk) != std::string::npos ||
+                line.find(dexAnon) != std::string::npos) {
                 maps.close();
                 return true;
             }
@@ -259,6 +386,27 @@ static bool detectTrickyStore() {
         // PIFS KeyboxHub paths (auto-rotating keybox source, April 2026)
         Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mWz09IyMxWC0m")),  // /data/adb/modules/keyboxhub
         Deobfuscate(base64_decode("HzwlNS1mUTwmbicsSTorOWIxXTQ=")),          // /data/adb/keybox.xml
+        /*
+         * August 2026. The keybox spoofers stopped hand-building certificates
+         * and started running a real KeyMint instead, so they are new modules
+         * rather than new versions of TrickyStore.
+         *
+         * TEESimulator v4 (id=teesim) vendors AOSP's Rust KeyMint reference TA
+         * and runs it inside keystore2, re-signing only the attestation under
+         * the keybox. Every field it emits therefore matches a genuine device,
+         * which is why the in-chain contradiction checks no longer catch it and
+         * why the revocation list is the signal that still does.
+         * OhMyKeymint (id=oh_my_keymint) reimplements the keystore AIDL
+         * interface outright. ForgeStore is what FS-Enhancer-Extreme now pairs
+         * with in place of TrickyStore.
+         */
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjgsVSstLA==")),                     // /data/adb/teesim
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjgsVSstLGMiVSEmLjRnSDUo")),         // /data/adb/teesim/keybox.xml
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRD0hMiUk")),             // /data/adb/modules/teesim
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mXzAbLDUWWz09LCUnRA==")), // /data/adb/modules/oh_my_keymint
+        Deobfuscate(base64_decode("HzwlNS1mXTE3ImMiVSE3NSM7VXcrLCc=")),             // /data/misc/keystore/omk
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mVjc2JikWQywrMyk=")),     // /data/adb/modules/forge_store
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiomQj8hHj89Xyoh")),                 // /data/adb/forge_store
     };
     for (const auto& path : trickyPaths) {
         if (access(path.c_str(), F_OK) == 0) return true;
@@ -286,29 +434,26 @@ static bool detectTrickyStore() {
     return false;
 }
 
-static bool detectPropertyInconsistencies() {
-    char fingerprint[PROP_VALUE_MAX] = {0};
-    char model[PROP_VALUE_MAX] = {0};
-    char brand[PROP_VALUE_MAX] = {0};
-    char device[PROP_VALUE_MAX] = {0};
-
-    __system_property_get(
-        Deobfuscate(base64_decode("QjdqIzkgXDxqJyUnVz02MT4gXiw=")).c_str(), fingerprint);
-    __system_property_get(
-        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIkXzwhLQ==")).c_str(), model);
-    __system_property_get(
-        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIrQjkqJQ==")).c_str(), brand);
-    __system_property_get(
-        Deobfuscate(base64_decode("QjdqMT4mVC0nNWItVS4tIik=")).c_str(), device);
-
-    if (strlen(fingerprint) == 0) return false;
-
-    std::string fp(fingerprint);
-
+/*
+ * Fingerprint-derived contradictions. Split out of detectPropertyInconsistencies
+ * so a fingerprint that is missing or does not parse simply skips these,
+ * instead of returning early and taking the timing and motherboard probes --
+ * which do not depend on the fingerprint at all -- down with it.
+ */
+static bool fingerprintContradicts(const std::string& fp, const char* brand) {
     // brand/product/device:version/... - cross-validate brand
     if (strlen(brand) > 0) {
+        /*
+         * Compared case-insensitively, matching the sibling board check below.
+         * Some OEMs ship a PRODUCT_BRAND whose casing differs from
+         * ro.product.brand, and an exact compare made that a false positive on
+         * stock hardware.
+         */
         std::string fpBrand = fp.substr(0, fp.find('/'));
-        if (!fpBrand.empty() && fpBrand != brand) return true;
+        std::string b(brand);
+        std::transform(fpBrand.begin(), fpBrand.end(), fpBrand.begin(), ::tolower);
+        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+        if (!fpBrand.empty() && fpBrand != b) return true;
     }
 
     /*
@@ -334,9 +479,9 @@ static bool detectPropertyInconsistencies() {
     char buildType[PROP_VALUE_MAX] = {0};
     char buildTags[PROP_VALUE_MAX] = {0};
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqIzkgXDxqNTU5VQ==")).c_str(), buildType);
+        decodeProp(prop::kBuildType).c_str(), buildType);
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqIzkgXDxqNS0uQw==")).c_str(), buildTags);
+        decodeProp(prop::kBuildTags).c_str(), buildTags);
 
     const bool claimsProductionBuild =
         strcmp(buildType, "user") == 0 && strcmp(buildTags, "release-keys") == 0;
@@ -361,7 +506,7 @@ static bool detectPropertyInconsistencies() {
          */
         char flavor[PROP_VALUE_MAX] = {0};
         __system_property_get(
-            Deobfuscate(base64_decode("QjdqIzkgXDxqJyAoRjc2")).c_str(), flavor);
+            decodeProp(prop::kBuildFlavor).c_str(), flavor);
         if (strlen(flavor) > 0) {
             std::string fl(flavor);
             auto endsWith = [&fl](const char* suffix) {
@@ -371,6 +516,32 @@ static bool detectPropertyInconsistencies() {
             if (endsWith("-userdebug") || endsWith("-eng")) return true;
         }
     }
+
+    return false;
+}
+
+static bool detectPropertyInconsistencies() {
+    char fingerprint[PROP_VALUE_MAX] = {0};
+    char brand[PROP_VALUE_MAX] = {0};
+
+    __system_property_get(
+        decodeProp(prop::kBuildFingerprint).c_str(), fingerprint);
+    __system_property_get(
+        decodeProp(prop::kProductBrand).c_str(), brand);
+
+    /*
+     * A missing or unparseable fingerprint is no signal either way, so the
+     * fingerprint-derived checks below are skipped. It is NOT an early return:
+     * the property-read timing probe and the motherboard/cpuinfo probe do not
+     * depend on the fingerprint, and returning here skipped both of them
+     * whenever ro.build.fingerprint read back empty -- which is exactly what a
+     * spoofer that blanks the property produces.
+     */
+    std::string fp(fingerprint);
+    const bool fingerprintParses =
+        strlen(fingerprint) > 0 && fp.find('/') != std::string::npos;
+
+    if (fingerprintParses && fingerprintContradicts(fp, brand)) return true;
 
     /*
      * (Removed a security-patch-year vs /proc/version kernel-build-year
@@ -392,16 +563,33 @@ static bool detectPropertyInconsistencies() {
      * old 10ms threshold false-positived on slow devices. On unhooked
      * Android the same loop runs in 1-2ms, so 50ms still has 25x headroom
      * before flagging.
+     *
+     * Take the MINIMUM of several rounds rather than one measurement. This runs
+     * on a worker thread interleaved with nine other checks that are all doing
+     * procfs I/O, so a single round can be stretched by a scheduler preemption,
+     * a GC pause or a big.LITTLE migration with nothing hooked at all. The
+     * minimum is the round that was not interrupted; a hook raises the floor and
+     * so raises the minimum too, while transient interference only ever affects
+     * the rounds we discard. A one-shot sample made this a nondeterministic
+     * false positive, which is the worst kind here because it cannot be
+     * reproduced from the report.
      */
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 100; i++) {
-        char tmp[PROP_VALUE_MAX] = {0};
-        __system_property_get("ro.build.fingerprint", tmp);
+    long long bestMicros = -1;
+    for (int round = 0; round < 5; round++) {
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < 100; i++) {
+            char tmp[PROP_VALUE_MAX] = {0};
+            __system_property_get("ro.build.fingerprint", tmp);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        auto micros =
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        if (bestMicros < 0 || micros < bestMicros) bestMicros = micros;
+        // An uncontended round is already conclusive; stop early.
+        if (bestMicros <= 50000) break;
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-    if (duration > 50000) return true;
+    if (bestMicros > 50000) return true;
 
     /*
      * Motherboard spoof check (PIFS April 2026): tryigit's PIFS rewrites
@@ -412,7 +600,7 @@ static bool detectPropertyInconsistencies() {
      */
     char board[PROP_VALUE_MAX] = {0};
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIrXzk2JQ==")).c_str(), board);
+        decodeProp(prop::kProductBoard).c_str(), board);
 
     if (strlen(board) > 0) {
         ScopedFile cpuinfo(
@@ -445,14 +633,28 @@ static bool detectPropertyInconsistencies() {
                     "shiba", "husky", "akita", "comet", "tegu",
                     "tokay", "caiman", "komodo", "redondo"
                 };
+                /*
+                 * Named non-Google SoC families. The test is deliberately a
+                 * DENYLIST: flag only when cpuinfo affirmatively names silicon
+                 * that a Pixel cannot contain.
+                 *
+                 * It used to be the inverse -- flag unless the SoC matched one
+                 * of four known Tensor tokens -- which is the wrong direction
+                 * for an FP-sensitive check against an open-ended board list.
+                 * Any genuine Pixel whose Hardware line named a Tensor
+                 * generation outside that set, including every future part,
+                 * reported DETECTION_PROP_SPOOF on stock hardware. Unknown or
+                 * absent silicon now means "no signal", never "spoofed".
+                 */
+                static const char* foreignSocs[] = {
+                    "qualcomm", "snapdragon", "sm8", "sm7", "sm6", "msm",
+                    "mediatek", "mt6", "mt8", "exynos", "kirin", "hisilicon",
+                    "unisoc", "spreadtrum", "rockchip", "allwinner"
+                };
                 for (const char* pb : pixelBoards) {
                     if (b.find(pb) != std::string::npos) {
-                        // Pixel boards must run on Tensor SoCs
-                        if (h.find("tensor") == std::string::npos &&
-                            h.find("gs101") == std::string::npos &&
-                            h.find("gs201") == std::string::npos &&
-                            h.find("zuma") == std::string::npos) {
-                            return true;
+                        for (const char* soc : foreignSocs) {
+                            if (h.find(soc) != std::string::npos) return true;
                         }
                         break;
                     }
@@ -497,20 +699,19 @@ static bool detectOverlayFS() {
     return false;
 }
 
-static bool detectSELinuxAnomaly() {
-    ScopedFile ctx(
-        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MoRCw2bi88QiohLzg=")).c_str(), "r");
-    if (!ctx.isOpen()) return false;
-
-    char context[256] = {0};
-    size_t bytesRead = fread(context, 1, sizeof(context) - 1, ctx);
-    context[bytesRead] = '\0';
-
-    if (strstr(context, "magisk") || strstr(context, "zygisk"))
-        return true;
-
-    return false;
-}
+/*
+ * (Removed detectSELinuxAnomaly(). It read /proc/self/attr/current -- OUR OWN
+ * SELinux context -- and looked for "magisk" or "zygisk" in it. An app process
+ * is labelled by the framework from seapp_contexts and is always
+ * u:r:untrusted_app*:s0:c...; Magisk relabels its own daemon and su-spawned
+ * shells, never the app it injects into, and Zygisk's entire design depends on
+ * the hooked app keeping its normal domain. Confirmed on device: the context
+ * reads u:r:untrusted_app:s0:c... with the module active. There was no state,
+ * privileged or not, in which it could return true, so unlike detectMountNS()
+ * it had no coverage to preserve. DETECTION_ROOT_HIDER keeps its three live
+ * contributors: OverlayFS on /system, mount-namespace divergence, and the rwxp
+ * anonymous-mapping count.)
+ */
 
 static bool detectRWXMappings() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
@@ -549,7 +750,8 @@ static bool tryConnectLoopback(uint16_t port) {
     if (sock < 0) return false;
 
     int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) { close(sock); return false; }
+    if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) { close(sock); return false; }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -594,7 +796,8 @@ static bool detectFridaPort() {
 
         char line[512];
         while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, ":69A2") || strstr(line, ":69a2"))
+            if (strstr(line, ":69A2") || strstr(line, ":69a2") ||
+                strstr(line, ":69A3") || strstr(line, ":69a3"))
                 return true;
         }
     }
@@ -770,13 +973,13 @@ static bool detectPixelCanaryFingerprint() {
     char brand[PROP_VALUE_MAX] = {0};
 
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqIzkgXDxqJyUnVz02MT4gXiw=")).c_str(), fingerprint);
+        decodeProp(prop::kBuildFingerprint).c_str(), fingerprint);
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqIzkgXDxqKCg=")).c_str(), buildId);
+        decodeProp(prop::kBuildId).c_str(), buildId);
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqMjU6RD0pby48WTQgbyUt")).c_str(), sysBuildId);
+        decodeProp(prop::kSystemBuildId).c_str(), sysBuildId);
     __system_property_get(
-        Deobfuscate(base64_decode("QjdqMT4mVC0nNWIrQjkqJQ==")).c_str(), brand);
+        decodeProp(prop::kProductBrand).c_str(), brand);
 
     if (strlen(fingerprint) == 0 || strlen(buildId) == 0) return false;
 
@@ -857,9 +1060,21 @@ static bool detectPixelCanaryFingerprint() {
  */
 static bool detectTSEnhancerExtreme() {
     const std::string paths[] = {
-        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCsbJCIhUTYnJD4WVSAwMykkVQ==")),
-        Deobfuscate(base64_decode("HzwlNS1mUTwmbjg6bz0qKS0nUz02HikxRCohLCk=")),
-        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCsbJCIhUTYnJD4WVSAwMykkVXcmKCJmRCshJCg=")),
+        /*
+         * Renamed TS-Enhancer-Extreme -> FS-Enhancer-Extreme on 2026-07-06, and
+         * the config directory moved with it. The current deployment is
+         * fs_enhancer_extreme; the ts_ paths below are kept because they still
+         * match a legacy install, but they no longer match a current one. The
+         * new module in fact lists "ts_enhancer_extreme" in its own
+         * conflict-module table and disables it, so matching only the old name
+         * meant detecting a module the live version turns off.
+         */
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mVisbJCIhUTYnJD4WVSAwMykkVQ==")),   // /data/adb/modules/fs_enhancer_extreme
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbio6bz0qKS0nUz02HikxRCohLCk=")),               // /data/adb/fs_enhancer_extreme
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbio6bz0qKS0nUz02HikxRCohLClmUzcqJyUu")),       // /data/adb/fs_enhancer_extreme/config
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCsbJCIhUTYnJD4WVSAwMykkVQ==")),   // legacy: /data/adb/modules/ts_enhancer_extreme
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbjg6bz0qKS0nUz02HikxRCohLCk=")),               // legacy: /data/adb/ts_enhancer_extreme
+        Deobfuscate(base64_decode("HzwlNS1mUTwmbiEmVC0oJD9mRCsbJCIhUTYnJD4WVSAwMykkVXcmKCJmRCshJCg=")), // legacy: .../bin/tseed
     };
     for (const auto& p : paths) {
         if (access(p.c_str(), F_OK) == 0) return true;
@@ -1008,10 +1223,10 @@ static bool detectRootManagerApp(JNIEnv *env, jobject context) {
         Deobfuscate(base64_decode("Uzcpby0kQDArMy06HjAtJSkkSSorLjg=")),     // com.amphoras.hidemyroot
     };
 
-    LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    LocalRef<jclass> contextClass(env, findClassChecked(env, "android/content/Context"));
     if (!contextClass) return false;
 
-    jmethodID getPM = env->GetMethodID(contextClass, "getPackageManager",
+    jmethodID getPM = getMethodChecked(env, contextClass, "getPackageManager",
         "()Landroid/content/pm/PackageManager;");
     if (!getPM) return false;
 
@@ -1019,10 +1234,10 @@ static bool detectRootManagerApp(JNIEnv *env, jobject context) {
     if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     if (!pm) return false;
 
-    LocalRef<jclass> pmClass(env, env->FindClass("android/content/pm/PackageManager"));
+    LocalRef<jclass> pmClass(env, findClassChecked(env, "android/content/pm/PackageManager"));
     if (!pmClass) return false;
 
-    jmethodID getPkgInfo = env->GetMethodID(pmClass, "getPackageInfo",
+    jmethodID getPkgInfo = getMethodChecked(env, pmClass, "getPackageInfo",
         "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
     if (!getPkgInfo) return false;
 
@@ -1121,10 +1336,10 @@ static std::string getProp(const char *prop_name) {
 
 __attribute__((always_inline))
 static inline bool isBootloaderUnlocked() {
-    std::string verified_boot_state = getProp(Deobfuscate(base64_decode("QjdqIyMmRHYyJD4gVjEhJS4mXyw3NS09VQ==")).c_str());
-    std::string bootloader         = getProp(Deobfuscate(base64_decode("QjdqIyMmRHYmLiM9XDclJSk7")).c_str());
-    std::string veritymode         = getProp(Deobfuscate(base64_decode("QjdqIyMmRHYyJD4gVzpmLiAtEg==")).c_str());
-    std::string flash_locked       = getProp(Deobfuscate(base64_decode("QjdqIyMmRHYmXDkmJylmXCcrQj0s")).c_str());
+    std::string verified_boot_state = getProp(decodeProp(prop::kVerifiedBootState).c_str());
+    std::string bootloader         = getProp(decodeProp(prop::kBootloader).c_str());
+    std::string veritymode         = getProp(decodeProp(prop::kVerityMode).c_str());
+    std::string flash_locked       = getProp(decodeProp(prop::kFlashLocked).c_str());
 
     if (bootloader.find("unlock") != std::string::npos ||
         (!verified_boot_state.empty() && verified_boot_state != "green") ||
@@ -1133,19 +1348,19 @@ static inline bool isBootloaderUnlocked() {
         return true;
 
     std::string vbmeta_state = getProp(
-        Deobfuscate(base64_decode("QjdqIyMmRHYyIyEsRDlqJSk/WTshHj89USwh")).c_str());
+        decodeProp(prop::kVbmetaDeviceState).c_str());
     if (!vbmeta_state.empty() && vbmeta_state != "locked") return true;
 
     std::string debuggable = getProp(
-        Deobfuscate(base64_decode("QjdqJSkrRT8jIC4lVQ==")).c_str());
+        decodeProp(prop::kDebuggable).c_str());
     if (debuggable == "1") return true;
 
     std::string secure = getProp(
-        Deobfuscate(base64_decode("QjdqMikqRSoh")).c_str());
+        decodeProp(prop::kSecure).c_str());
     if (!secure.empty() && secure != "1") return true;
 
     std::string oem_unlock = getProp(
-        Deobfuscate(base64_decode("QyE3byMsXQcxLyAmUzMbICAlXy8hJQ==")).c_str());
+        decodeProp(prop::kOemUnlockAllowed).c_str());
     if (oem_unlock == "1") return true;
 
     return false;
@@ -1157,10 +1372,10 @@ static inline bool isBootloaderUnlocked() {
  * DETECTION_DEBUGGER bit by hooking JNI.
  */
 static bool isAppDebuggable(JNIEnv *env, jobject context) {
-    LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    LocalRef<jclass> contextClass(env, findClassChecked(env, "android/content/Context"));
     if (!contextClass) return true;
 
-    jmethodID getAppInfo = env->GetMethodID(contextClass, "getApplicationInfo",
+    jmethodID getAppInfo = getMethodChecked(env, contextClass, "getApplicationInfo",
         "()Landroid/content/pm/ApplicationInfo;");
     if (!getAppInfo) return true;
 
@@ -1168,10 +1383,10 @@ static bool isAppDebuggable(JNIEnv *env, jobject context) {
     if (env->ExceptionCheck()) { env->ExceptionClear(); return true; }
     if (!appInfo) return true;
 
-    LocalRef<jclass> appInfoClass(env, env->FindClass("android/content/pm/ApplicationInfo"));
+    LocalRef<jclass> appInfoClass(env, findClassChecked(env, "android/content/pm/ApplicationInfo"));
     if (!appInfoClass) return true;
 
-    jfieldID flagsField = env->GetFieldID(appInfoClass, "flags", "I");
+    jfieldID flagsField = getFieldChecked(env, appInfoClass, "flags", "I");
     if (!flagsField) return true;
 
     jint flags = env->GetIntField(appInfo, flagsField);
@@ -1183,10 +1398,10 @@ static bool isAppDebuggable(JNIEnv *env, jobject context) {
  * the digest as a lowercase hex string, or empty on failure.
  */
 static std::string sha256Hex(JNIEnv *env, jbyteArray bytes) {
-    LocalRef<jclass> mdClass(env, env->FindClass("java/security/MessageDigest"));
+    LocalRef<jclass> mdClass(env, findClassChecked(env, "java/security/MessageDigest"));
     if (!mdClass) return "";
 
-    jmethodID getInstance = env->GetStaticMethodID(mdClass,
+    jmethodID getInstance = getStaticMethodChecked(env, mdClass,
         "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;");
     if (!getInstance) return "";
 
@@ -1195,7 +1410,7 @@ static std::string sha256Hex(JNIEnv *env, jbyteArray bytes) {
     if (env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
     if (!md) return "";
 
-    jmethodID digest = env->GetMethodID(mdClass, "digest", "([B)[B");
+    jmethodID digest = getMethodChecked(env, mdClass, "digest", "([B)[B");
     if (!digest) return "";
 
     LocalRef<jbyteArray> hashBytes(env,
@@ -1249,17 +1464,66 @@ static std::string sha256Hex(JNIEnv *env, jbyteArray bytes) {
  * tampered. Since the check is fail-closed, a wrong pin is not a weaker check,
  * it is a guaranteed false positive on every device.
  */
+#if !defined(IS_DEBUG_BUILD) && defined(EXPECTED_CERT_SHA256)
+/* -D passes the digest as a bare token, so stringize it here. */
+#define PIFD_STRINGIZE_(x) #x
+#define PIFD_STRINGIZE(x) PIFD_STRINGIZE_(x)
+
+/*
+ * API 24-27 path: PackageInfo.signatures (deprecated, but the only signing
+ * information those levels expose). GET_SIGNATURES = 0x40.
+ */
+static bool verifyLegacySignature(JNIEnv *env, jobject pm, jstring packageName,
+                                  jclass piClass) {
+    LocalRef<jclass> pmClass(env, findClassChecked(env, "android/content/pm/PackageManager"));
+    if (!pmClass) return false;
+
+    jmethodID getPackageInfo = getMethodChecked(env, pmClass, "getPackageInfo",
+        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
+    if (!getPackageInfo) return false;
+
+    LocalRef<jobject> info(env, env->CallObjectMethod(pm, getPackageInfo, packageName, 0x40));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!info) return false;
+
+    jfieldID signaturesField = getFieldChecked(env, piClass, "signatures",
+        "[Landroid/content/pm/Signature;");
+    if (!signaturesField) return false;
+
+    LocalRef<jobjectArray> signatures(env,
+        (jobjectArray)env->GetObjectField(info, signaturesField));
+    if (!signatures || env->GetArrayLength(signatures) == 0) return false;
+
+    LocalRef<jobject> sig(env, env->GetObjectArrayElement(signatures, 0));
+    if (!sig) return false;
+
+    LocalRef<jclass> sigClass(env, findClassChecked(env, "android/content/pm/Signature"));
+    if (!sigClass) return false;
+
+    jmethodID toByteArray = getMethodChecked(env, sigClass, "toByteArray", "()[B");
+    if (!toByteArray) return false;
+
+    LocalRef<jbyteArray> sigBytes(env, (jbyteArray)env->CallObjectMethod(sig, toByteArray));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!sigBytes) return false;
+
+    std::string actual = sha256Hex(env, sigBytes);
+    if (actual.empty()) return false;
+    return actual == PIFD_STRINGIZE(EXPECTED_CERT_SHA256);
+}
+#endif
+
 static bool verifyAPKSignature(JNIEnv *env, jobject context) {
 #if defined(IS_DEBUG_BUILD) || !defined(EXPECTED_CERT_SHA256)
     (void)env; (void)context;
     return true;
 #else
-    LocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    LocalRef<jclass> contextClass(env, findClassChecked(env, "android/content/Context"));
     if (!contextClass) return false;
 
-    jmethodID getPackageName = env->GetMethodID(contextClass, "getPackageName",
+    jmethodID getPackageName = getMethodChecked(env, contextClass, "getPackageName",
         "()Ljava/lang/String;");
-    jmethodID getPackageManager = env->GetMethodID(contextClass, "getPackageManager",
+    jmethodID getPackageManager = getMethodChecked(env, contextClass, "getPackageManager",
         "()Landroid/content/pm/PackageManager;");
     if (!getPackageName || !getPackageManager) return false;
 
@@ -1269,10 +1533,10 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
     if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     if (!packageName || !pm) return false;
 
-    LocalRef<jclass> pmClass(env, env->FindClass("android/content/pm/PackageManager"));
+    LocalRef<jclass> pmClass(env, findClassChecked(env, "android/content/pm/PackageManager"));
     if (!pmClass) return false;
 
-    jmethodID getPackageInfo = env->GetMethodID(pmClass, "getPackageInfo",
+    jmethodID getPackageInfo = getMethodChecked(env, pmClass, "getPackageInfo",
         "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
     if (!getPackageInfo) return false;
 
@@ -1282,20 +1546,37 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
     if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     if (!packageInfo) return false;
 
-    LocalRef<jclass> piClass(env, env->FindClass("android/content/pm/PackageInfo"));
+    LocalRef<jclass> piClass(env, findClassChecked(env, "android/content/pm/PackageInfo"));
     if (!piClass) return false;
 
-    jfieldID signingInfoField = env->GetFieldID(piClass, "signingInfo",
+    /*
+     * PackageInfo.signingInfo and android.content.pm.SigningInfo both arrived in
+     * API 28, but minSdk is 24. On API 24-27 getPackageInfo() happily ignores
+     * the unrecognised GET_SIGNING_CERTIFICATES flag bit and returns a valid
+     * PackageInfo, so control reached the field lookup, GetFieldID returned null
+     * with a pending NoSuchFieldError, and this fail-closed function reported
+     * DETECTION_SIGNATURE. Every Android 7/8 device running a pinned release
+     * build was told its own signature had been tampered with, and the pending
+     * error then crashed the process on return.
+     *
+     * The legacy PackageInfo.signatures array covers those levels and digests
+     * to the same value, so coverage is kept rather than compiled away.
+     */
+    if (android_get_device_api_level() < 28) {
+        return verifyLegacySignature(env, pm.get(), packageName.get(), piClass.get());
+    }
+
+    jfieldID signingInfoField = getFieldChecked(env, piClass, "signingInfo",
         "Landroid/content/pm/SigningInfo;");
     if (!signingInfoField) return false;
 
     LocalRef<jobject> signingInfo(env, env->GetObjectField(packageInfo, signingInfoField));
     if (!signingInfo) return false;
 
-    LocalRef<jclass> siClass(env, env->FindClass("android/content/pm/SigningInfo"));
+    LocalRef<jclass> siClass(env, findClassChecked(env, "android/content/pm/SigningInfo"));
     if (!siClass) return false;
 
-    jmethodID getSigners = env->GetMethodID(siClass,
+    jmethodID getSigners = getMethodChecked(env, siClass,
         "getApkContentsSigners", "()[Landroid/content/pm/Signature;");
     if (!getSigners) return false;
 
@@ -1307,10 +1588,10 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
     LocalRef<jobject> sig(env, env->GetObjectArrayElement(signatures, 0));
     if (!sig) return false;
 
-    LocalRef<jclass> sigClass(env, env->FindClass("android/content/pm/Signature"));
+    LocalRef<jclass> sigClass(env, findClassChecked(env, "android/content/pm/Signature"));
     if (!sigClass) return false;
 
-    jmethodID toByteArray = env->GetMethodID(sigClass, "toByteArray", "()[B");
+    jmethodID toByteArray = getMethodChecked(env, sigClass, "toByteArray", "()[B");
     if (!toByteArray) return false;
 
     LocalRef<jbyteArray> sigBytes(env,
@@ -1321,9 +1602,6 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
     std::string actual = sha256Hex(env, sigBytes);
     if (actual.empty()) return false;
 
-    /* -D passes the digest as a bare token, so stringize it here. */
-#define PIFD_STRINGIZE_(x) #x
-#define PIFD_STRINGIZE(x) PIFD_STRINGIZE_(x)
     return actual == PIFD_STRINGIZE(EXPECTED_CERT_SHA256);
 #endif
 }
@@ -1403,8 +1681,7 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject /* thiz */, jobject obj) {
                 detectLegacyRootArtifacts() ||
                 detectRootManagerApp(e, o))
                 r |= DETECTION_ZYGISK;
-            if (detectMountNS() || detectOverlayFS() ||
-                detectSELinuxAnomaly() || detectRWXMappings())
+            if (detectMountNS() || detectOverlayFS() || detectRWXMappings())
                 r |= DETECTION_ROOT_HIDER;
             return r;
         }},
@@ -1492,6 +1769,32 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_ATTEST_ANOMALY | DETECTION_ATTEST_FORGERY;
 }
 
+/*
+ * Returns the number of obfuscated property literals that do not decode to a
+ * well-formed Android property name.
+ *
+ * This exists because two of them were silently wrong: ro.boot.veritymode and
+ * ro.boot.flash.locked decoded to garbage, and since __system_property_get on a
+ * nonexistent name simply writes nothing and reports no error, the two
+ * bootloader-unlock comparisons that used them were constant-false on every
+ * device. A clean device and a broken check produce identical output, so it
+ * never surfaced. Asserted to be zero by an instrumented test, which turns the
+ * next such typo into a test failure instead of a deleted detection.
+ */
+extern "C"
+JNIEXPORT jint JNICALL
+nativeSelfTestImpl(JNIEnv *, jobject) {
+    jint malformed = 0;
+    for (const char* encoded : prop::kAll) {
+        const std::string name = decodeProp(encoded);
+        if (!isValidPropName(name)) {
+            LOGD("malformed property literal: '%s'", name.c_str());
+            malformed++;
+        }
+    }
+    return malformed;
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     JNIEnv *env;
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK)
@@ -1503,8 +1806,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         "WSsNLzgsVyotNTUdUTU0JD4sVA=="));
     static const std::string maskMethodName = Deobfuscate(base64_decode(
         "XjkwKDoscTQoByAoVysJID8i"));
+    static const std::string selfTestName = Deobfuscate(base64_decode(
+        "XjkwKDosYz0oJxgsQyw="));
 
-    jclass clazz = env->FindClass(className.c_str());
+    jclass clazz = findClassChecked(env, className.c_str());
     if (!clazz)
         return JNI_ERR;
 
@@ -1515,6 +1820,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         {const_cast<char*>(maskMethodName.c_str()),
          const_cast<char*>("()I"),
          reinterpret_cast<void *>(nativeAllFlagsMaskImpl)},
+        {const_cast<char*>(selfTestName.c_str()),
+         const_cast<char*>("()I"),
+         reinterpret_cast<void *>(nativeSelfTestImpl)},
     };
 
     if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) < 0)

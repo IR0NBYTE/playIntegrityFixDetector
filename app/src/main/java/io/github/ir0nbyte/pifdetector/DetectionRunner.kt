@@ -69,6 +69,24 @@ class DetectionRunner {
     private external fun nativeAllFlagsMask(): Int
 
     /*
+     * Number of obfuscated property-name literals in the native engine that do
+     * not decode to a well-formed Android property name. Must be 0.
+     *
+     * Two of them once decoded to garbage, which silently disabled both
+     * bootloader-unlock fallbacks without changing what a clean device reports.
+     * Exposed so an instrumented test can assert it rather than relying on
+     * anyone noticing.
+     */
+    private external fun nativeSelfTest(): Int
+
+    fun malformedPropertyLiterals(): Int = try {
+        nativeSelfTest()
+    } catch (e: UnsatisfiedLinkError) {
+        Log.e(TAG, "nativeSelfTest not bound", e)
+        -1
+    }
+
+    /*
      * SSOT verification: returns true if Kotlin's flag constants OR'd
      * together equal the native side's all-flags mask. Used at startup
      * to fail loudly if someone adds a flag in only one place.
