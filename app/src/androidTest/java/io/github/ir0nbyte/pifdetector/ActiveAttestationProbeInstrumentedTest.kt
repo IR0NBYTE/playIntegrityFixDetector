@@ -15,29 +15,8 @@ import java.security.KeyStore
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 
-/*
- * On-device behaviour of ActiveAttestationProbe.
- *
- * The unit tests cover the pure decision logic against hand-built and real
- * captured DER. They cannot cover the part that only exists on a device: does
- * the Keystore actually honour these two awkward requests, and what does the
- * resulting chain look like? That question decides whether the probe has any
- * coverage at all, so it gets exercised here.
- *
- * Deliberately does NOT assert "probe returns 0". Whether a clean device flags
- * depends on whether it has real hardware attestation: an emulator with
- * software-backed KeyMint legitimately produces a chain that anchors nowhere
- * near a Google root, and the probe is right to say so. Asserting 0 would
- * encode "this runs on real hardware" as a correctness requirement. What IS
- * asserted is the contract that must hold everywhere: the probe never throws
- * and never returns a bit outside its own flag.
- *
- * The diagnostics go to logcat under DIAG_TAG so a run on new hardware reports
- * what the device actually did rather than only pass/fail.
- */
 @RunWith(AndroidJUnit4::class)
 class ActiveAttestationProbeInstrumentedTest {
-
     @Test
     fun probeNeverThrowsAndReturnsOnlyItsOwnFlag() {
         for (passiveFlagged in listOf(false, true)) {
@@ -50,12 +29,6 @@ class ActiveAttestationProbeInstrumentedTest {
         }
     }
 
-    /*
-     * On a device with no hardware attestation the ordinary key already fails
-     * anchoring, so the active probe must stay quiet rather than report the same
-     * cause a second time. Only asserts the direction that must always hold:
-     * suppression can never turn a quiet probe into a loud one.
-     */
     @Test
     fun passiveFlaggedNeverIncreasesTheActiveVerdict() {
         val loud = ActiveAttestationProbe().probe(passiveProbeFlagged = false)
@@ -67,12 +40,6 @@ class ActiveAttestationProbeInstrumentedTest {
         )
     }
 
-    /*
-     * Provocation A capability. PURPOSE_ATTEST_KEY is API 31+ and is separately
-     * gated by FEATURE_KEYSTORE_APP_ATTEST_KEY; a device without it makes the
-     * probe silently skip, which is safe but is lost coverage worth knowing
-     * about. Reports rather than fails, since not supporting it is legitimate.
-     */
     @Test
     fun reportsAttestKeyProvocationCapability() {
         val pm = InstrumentationRegistry.getInstrumentation().targetContext.packageManager
@@ -92,11 +59,6 @@ class ActiveAttestationProbeInstrumentedTest {
         }
     }
 
-    /*
-     * Provocation B capability. Requires a secure lock screen, so on a device
-     * without one the probe skips. Reports the tags that decide the
-     * contradiction check so a real device's actual behaviour is visible.
-     */
     @Test
     fun reportsAuthBoundProvocationCapability() {
         describeChain("provocationB") {

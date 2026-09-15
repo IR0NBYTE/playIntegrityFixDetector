@@ -11,7 +11,6 @@ import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 
 class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIFF) {
-
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
             .inflate(R.layout.item_detection_result, parent, false)
@@ -38,13 +37,6 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
             descView.text = result.description
         }
 
-        /*
-         * Three states, not two. A privileged-only check that did not fire has
-         * not "passed" -- an unprivileged app cannot see what it looks for, so
-         * showing it green would claim coverage the sandbox forbids. It still
-         * renders as DETECTED when it does fire, which happens when the app runs
-         * with root/adb.
-         */
         private fun applyStatusStyle(result: DetectionResult) {
             val ctx = itemView.context
             val (textRes, colorRes, iconRes) = when {

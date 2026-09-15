@@ -5,14 +5,15 @@ plugins {
 
 android {
     namespace = "io.github.ir0nbyte.pifdetector"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "io.github.ir0nbyte.pifdetector"
         minSdk = 24
+
         targetSdk = 35
-        versionCode = 8
-        versionName = "2.6"
+        versionCode = 9
+        versionName = "2.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -47,24 +48,9 @@ android {
             isShrinkResources = true
             isDebuggable = false
 
-            /*
-             * SHA-256 of the release signing certificate, lowercase hex with no
-             * separators, supplied by whoever builds the release:
-             *   keytool -list -v -keystore <ks> -alias <alias> \
-             *     | grep SHA256: | sed 's/.*SHA256: //' | tr -d ':' | tr 'A-Z' 'a-z'
-             *
-             * Left unset, the APK signature check compiles out entirely. It used
-             * to be a constant baked into the source, which silently pinned every
-             * release to whichever machine last edited it; a build signed with any
-             * other key then reported its own signature as tampered. Absent is
-             * better than wrong here, because a wrong pin is a guaranteed false
-             * positive and this check is deliberately fail-closed.
-             */
             System.getenv("RELEASE_CERT_SHA256")?.takeIf { it.isNotBlank() }?.let { hash ->
                 externalNativeBuild {
                     cmake {
-                        // Passed as a bare token; native-lib.cpp stringizes it.
-                        // Quoting here does not survive the Gradle/CMake chain.
                         cppFlags += "-DEXPECTED_CERT_SHA256=$hash"
                     }
                 }
@@ -104,6 +90,15 @@ android {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    inputs.file("src/main/AndroidManifest.xml")
+        .withPropertyName("manifestForQueriesSyncTest")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file("src/main/cpp/native-lib.cpp")
+        .withPropertyName("nativeSourceForQueriesSyncTest")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+}
+
 dependencies {
     implementation(libs.appcompat)
     implementation(libs.material)
@@ -114,4 +109,3 @@ dependencies {
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
 }
-

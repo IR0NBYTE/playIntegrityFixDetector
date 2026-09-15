@@ -5,22 +5,10 @@ data class DetectionResult(
     val description: String,
     val flag: Int,
     val detected: Boolean,
-    /*
-     * True for checks that CANNOT fire from an unprivileged untrusted_app, so a
-     * "pass" from them means "not observable", not "clean". See the
-     * PRIVILEGED_ONLY notes below. Surfaced in the UI so the result list never
-     * implies coverage the sandbox does not permit.
-     */
+
     val privilegedOnly: Boolean = false
 ) {
     companion object {
-        /*
-         * Flag bit values are owned by the native side (see DETECTION_*
-         * constants in native-lib.cpp). These Kotlin mirrors exist for
-         * ergonomics; DetectionRunner.verifyFlagsInSync() asserts at
-         * runtime that the OR of all KNOWN_FLAGS matches the native
-         * nativeAllFlagsMask(). If you add a flag, add it in BOTH places.
-         */
         const val DETECTION_DEBUGGER = 0x001
         const val DETECTION_FRIDA = 0x002
         const val DETECTION_ZYGISK = 0x004
@@ -36,49 +24,10 @@ data class DetectionResult(
         const val DETECTION_PIF_RUST = 0x1000
         const val DETECTION_TREAT_WHEEL = 0x2000
 
-        /*
-         * Produced Kotlin-side by KeyAttestationProbe (the AndroidKeyStore
-         * attestation API lives in Java land), not by the native engine. It is
-         * still registered in the native nativeAllFlagsMask() so the SSOT
-         * assertion holds -- the native mask is the registry of all defined
-         * flag bits, regardless of which layer sets them.
-         */
         const val DETECTION_ATTEST_ANOMALY = 0x4000
 
-        /*
-         * Produced Kotlin-side by ActiveAttestationProbe. Where ATTEST_ANOMALY
-         * inspects an ordinary attested key, this one asks for keys that are
-         * awkward to forge (PURPOSE_ATTEST_KEY, and an auth-bound key requested
-         * with SHA-512) and catches the resulting chain contradicting itself.
-         * Registered in the native mask for the same SSOT reason as above.
-         */
         const val DETECTION_ATTEST_FORGERY = 0x8000
 
-        /*
-         * Flags whose underlying checks cannot fire from an unprivileged
-         * untrusted_app, verified against both the module sources and AOSP
-         * sepolicy:
-         *
-         *  - PIF / PIF_STREAM / PIF_RUST: every Zygisk PIF fork gates on
-         *    app_data_dir ending in /com.google.android.gms or
-         *    /com.android.vending and calls DLCLOSE_MODULE_LIBRARY everywhere
-         *    else, so the module is never resident in this process to be found
-         *    in /proc/self/maps.
-         *  - TRICKYSTORE: the keybox spoofers ptrace-inject into keystore2 and
-         *    hook ioctl in that process, not ours. Their effect reaches us only
-         *    through the attestation chain, which ATTEST_ANOMALY and
-         *    ATTEST_FORGERY cover.
-         *  - TSEE: the current FS-Enhancer-Extreme has no Zygisk component at
-         *    all; it is root-side scripts plus global resetprop.
-         *
-         * All five also probe /data/adb, which SELinux denies. They are kept
-         * because they DO fire when the detector runs privileged (root/adb),
-         * but they must never be presented as unprivileged coverage.
-         *
-         * TREAT_WHEEL is deliberately NOT in this set: it is a ReZygisk root
-         * hider that loads into every app process including ours, so its
-         * in-process maps scan genuinely fires.
-         */
         private val PRIVILEGED_ONLY = setOf(
             DETECTION_PIF,
             DETECTION_TRICKYSTORE,
@@ -89,7 +38,6 @@ data class DetectionResult(
 
         private data class Spec(val flag: Int, val name: String, val description: String)
 
-        // Ordered by flag value so display order matches numeric sequence.
         private val SPECS = listOf(
             Spec(DETECTION_DEBUGGER,   "Debugger",
                  "Debugger or tracing tool attached"),
@@ -125,7 +73,6 @@ data class DetectionResult(
                  "Provoked attestation chain contradicts itself or is keybox-signed"),
         )
 
-        // Derived from SPECS so adding a Spec automatically updates the mask.
         val ALL_FLAGS_MASK: Int = SPECS.fold(0) { acc, s -> acc or s.flag }
 
         fun fromBitmask(bitmask: Int): List<DetectionResult> = SPECS.map {

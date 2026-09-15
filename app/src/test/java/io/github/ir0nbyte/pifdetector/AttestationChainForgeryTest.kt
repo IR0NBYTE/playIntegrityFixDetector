@@ -17,25 +17,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-/*
- * Chain-validation tests driven by REAL certificates and REAL signatures.
- *
- * Everything else in the suite drives chainIsCryptographicallyBroken through a
- * boolean stub, so until now no test ever executed the verification itself, and
- * the chain shapes a keybox spoofer actually produces went unexercised. Each
- * test here builds the exact shape and asserts the verdict.
- *
- * Certificates are assembled by hand rather than with BouncyCastle so the test
- * suite stays dependency-free; only java.security does the crypto.
- */
 class AttestationChainForgeryTest {
-
-    /*
-     * The shape that defeated the active probe: a forged leaf with a copy of a
-     * pinned Google root appended. The roots ship inside the APK, so pasting one
-     * costs an attacker nothing, and an anchor check that only looks at
-     * chain.last() is satisfied by it.
-     */
     @Test
     fun forgedLeafWithAppendedPinnedRootIsRejected() {
         val attacker = ca("CN=Attacker")
@@ -44,19 +26,11 @@ class AttestationChainForgeryTest {
 
         val chain = listOf(forgedLeaf, pinnedRoot)
 
-        // The anchor check alone is happy: the top cert IS a pinned root.
         assertTrue(AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots))
-        // Signature validation is what actually rejects it.
+
         assertTrue(AttestationAnalysis.chainSignaturesBroken(chain))
     }
 
-    /*
-     * The subtler shape: every signature is genuine and the chain really does
-     * terminate at a trusted root, but one link is an end-entity certificate.
-     * An ordinary attested key from a real device is exactly that, and its
-     * private key lives in the attacker's own Keystore, so they can sign a
-     * forged leaf with it.
-     */
     @Test
     fun genuineSignaturesThroughNonCaIssuerAreRejected() {
         val root = ca("CN=Root")
@@ -65,18 +39,11 @@ class AttestationChainForgeryTest {
 
         val chain = listOf(forged.cert, endEntity.cert, root.cert)
 
-        // Every link verifies -- signature validation cannot see this one.
         assertFalse(AttestationAnalysis.chainSignaturesBroken(chain))
-        // basicConstraints is what rejects it.
+
         assertTrue(AttestationAnalysis.chainHasNonCaIssuer(chain))
     }
 
-    /*
-     * A leaf whose signature algorithm OID the platform cannot resolve. verify()
-     * raises NoSuchAlgorithmException, which used to be treated as "could not
-     * check" and therefore as a valid link -- a free bypass, since the OID is
-     * written by whoever forged the certificate.
-     */
     @Test
     fun unresolvableSignatureAlgorithmCountsAsBroken() {
         val root = ca("CN=Root")
@@ -87,7 +54,6 @@ class AttestationChainForgeryTest {
         assertTrue(AttestationAnalysis.chainSignaturesBroken(chain))
     }
 
-    /* A well-formed chain must survive all of the above unflagged. */
     @Test
     fun genuinelyShapedChainIsAccepted() {
         val root = ca("CN=Root")
@@ -100,7 +66,6 @@ class AttestationChainForgeryTest {
         assertFalse(AttestationAnalysis.chainHasNonCaIssuer(chain))
     }
 
-    /* A chain of one cannot be cryptographically judged and must not flag. */
     @Test
     fun singleCertChainIsNotJudged() {
         val root = ca("CN=Root")
@@ -108,7 +73,6 @@ class AttestationChainForgeryTest {
         assertFalse(AttestationAnalysis.chainHasNonCaIssuer(listOf(root.cert)))
     }
 
-    /* A self-signed root that is not one of ours must not anchor. */
     @Test
     fun unrelatedSelfSignedRootDoesNotAnchor() {
         val root = ca("CN=NotGoogle")
@@ -118,8 +82,6 @@ class AttestationChainForgeryTest {
             )
         )
     }
-
-    // --- minimal X.509 builder ----------------------------------------------
 
     private class Issued(
         val cert: X509Certificate,
@@ -175,20 +137,17 @@ class AttestationChainForgeryTest {
     ): X509Certificate {
         val algId = seq(algOid)
         val tbs = seq(
-            explicit(0, int(2)) +                       // version v3
+            explicit(0, int(2)) +
                 int(nextSerial()) +
                 algId +
                 name(issuerDn) +
                 validity() +
                 name(subjectDn) +
                 spki +
-                // [3] EXPLICIT Extensions ::= SEQUENCE OF Extension,
-                // and each Extension is itself a SEQUENCE.
+
                 if (isCa) explicit(3, seq(seq(basicConstraintsCa()))) else ByteArray(0)
         )
 
-        // Always sign with a real algorithm; only the DECLARED OID varies, which
-        // is what an attacker controls.
         val sig = Signature.getInstance("SHA256withECDSA").run {
             initSign(signingKey)
             update(tbs)
@@ -199,8 +158,6 @@ class AttestationChainForgeryTest {
         return CertificateFactory.getInstance("X.509")
             .generateCertificate(ByteArrayInputStream(der)) as X509Certificate
     }
-
-    // --- DER primitives ------------------------------------------------------
 
     private var serialCounter = 1L
     private fun nextSerial(): Long = serialCounter++
@@ -226,13 +183,12 @@ class AttestationChainForgeryTest {
     }
 
     private fun basicConstraintsCa(): ByteArray =
-        // Extension ::= SEQUENCE { extnID, critical, extnValue }
+
         BASIC_CONSTRAINTS_OID +
-            tlv(0x01, byteArrayOf(0xFF.toByte())) +          // critical TRUE
-            tlv(0x04, seq(tlv(0x01, byteArrayOf(0xFF.toByte()))))  // cA TRUE
+            tlv(0x01, byteArrayOf(0xFF.toByte())) +
+            tlv(0x04, seq(tlv(0x01, byteArrayOf(0xFF.toByte()))))
 
     private fun name(dn: String): ByteArray {
-        // Only CN=<value> is used by these fixtures.
         val cn = dn.substringAfter("CN=").substringBefore(",").trim()
         return seq(set(seq(CN_OID + tlv(0x0C, cn.toByteArray()))))
     }
@@ -250,20 +206,16 @@ class AttestationChainForgeryTest {
     }
 
     private companion object {
-        /* ecdsa-with-SHA256, 1.2.840.10045.4.3.2 */
         val ECDSA_SHA256_OID = byteArrayOf(
             0x06, 0x08, 0x2A, 0x86.toByte(), 0x48, 0xCE.toByte(), 0x3D, 0x04, 0x03, 0x02
         )
 
-        /* 1.2.840.10045.4.3.99 -- deliberately not a real algorithm. */
         val UNKNOWN_SIG_ALG_OID = byteArrayOf(
             0x06, 0x08, 0x2A, 0x86.toByte(), 0x48, 0xCE.toByte(), 0x3D, 0x04, 0x03, 0x63
         )
 
-        /* id-at-commonName, 2.5.4.3 */
         val CN_OID = byteArrayOf(0x06, 0x03, 0x55, 0x04, 0x03)
 
-        /* id-ce-basicConstraints, 2.5.29.19 */
         val BASIC_CONSTRAINTS_OID = byteArrayOf(0x06, 0x03, 0x55, 0x1D, 0x13)
     }
 }
