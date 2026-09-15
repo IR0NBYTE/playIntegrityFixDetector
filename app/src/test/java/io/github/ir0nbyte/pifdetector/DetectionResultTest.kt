@@ -5,7 +5,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DetectionResultTest {
-
     @Test
     fun cleanBitmaskReturnsAllPass() {
         val results = DetectionResult.fromBitmask(0)
@@ -13,12 +12,6 @@ class DetectionResultTest {
         assertTrue(results.none { it.detected })
     }
 
-    /*
-     * The five checks whose evidence lives outside this process (PIF forks
-     * dlclose everywhere but GMS; keybox spoofers hook keystore2; FSEE has no
-     * in-process component) plus /data/adb, which SELinux denies. They must be
-     * marked so the UI never renders them as a pass.
-     */
     @Test
     fun unreachableChecksAreMarkedPrivilegedOnly() {
         val privileged = DetectionResult.fromBitmask(0)
@@ -37,11 +30,6 @@ class DetectionResultTest {
         )
     }
 
-    /*
-     * Treat Wheel is a ReZygisk root hider that loads into every app process,
-     * so unlike the PIF forks its in-process maps scan genuinely fires. Pinned
-     * here because it sits next to the unreachable set and is easy to lump in.
-     */
     @Test
     fun inProcessRootHiderIsNotMarkedPrivilegedOnly() {
         val treatWheel = DetectionResult.fromBitmask(0)
@@ -49,7 +37,6 @@ class DetectionResultTest {
         assertTrue(!treatWheel.privilegedOnly)
     }
 
-    /* A privileged-only check still reports normally when it does fire. */
     @Test
     fun privilegedOnlyCheckStillReportsWhenDetected() {
         val results = DetectionResult.fromBitmask(DetectionResult.DETECTION_TSEE)
@@ -123,7 +110,6 @@ class DetectionResultTest {
 
     @Test
     fun newFlagsCoexistWithLegacyFlags() {
-        // PIF + companion streaming together (typical inject-s v4.5 case)
         val mask = DetectionResult.DETECTION_PIF or DetectionResult.DETECTION_PIF_STREAM
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
         assertEquals(2, detected.size)
@@ -133,7 +119,6 @@ class DetectionResultTest {
 
     @Test
     fun trickyStoreAndCanaryCoexist() {
-        // PIFS detection scenario: TrickyStore keybox + canary fingerprint + motherboard spoof
         val mask = DetectionResult.DETECTION_TRICKYSTORE or
                 DetectionResult.DETECTION_CANARY_FP or
                 DetectionResult.DETECTION_PROP_SPOOF
@@ -173,8 +158,6 @@ class DetectionResultTest {
 
     @Test
     fun treatWheelAndRootHiderCoexist() {
-        // Treat Wheel is a ReZygisk root hider that typically rides alongside the
-        // generic root-hider anomaly signals (mount NS / OverlayFS / SELinux).
         val mask = DetectionResult.DETECTION_ROOT_HIDER or DetectionResult.DETECTION_TREAT_WHEEL
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
         assertEquals(2, detected.size)
@@ -194,8 +177,6 @@ class DetectionResultTest {
 
     @Test
     fun attestAnomalyAndBootloaderCoexist() {
-        // The typical STRONG-spoof contradiction: attestation claims a locked
-        // device while the bootloader signal proves otherwise.
         val mask = DetectionResult.DETECTION_BOOTLOADER or DetectionResult.DETECTION_ATTEST_ANOMALY
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
         assertEquals(2, detected.size)
@@ -204,7 +185,6 @@ class DetectionResultTest {
 
     @Test
     fun tseeAndTrickyStoreCoexist() {
-        // TS-Enhancer-Extreme requires TrickyStore as a base (typical combo)
         val mask = DetectionResult.DETECTION_TRICKYSTORE or DetectionResult.DETECTION_TSEE
         val detected = DetectionResult.fromBitmask(mask).filter { it.detected }
         assertEquals(2, detected.size)

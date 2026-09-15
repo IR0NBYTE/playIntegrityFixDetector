@@ -4,35 +4,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Test
 
-/*
- * Hostile-input tests for the attestation DER parsers.
- *
- * A module that spoofs attestation controls every byte of the extension we
- * parse, so "malformed input yields no detection" is only true if the parsers
- * fail with an Exception. Anything that escapes as an Error unwinds past the
- * `catch (_: Exception)` in AttestationAnalysis and past the probes' own
- * handlers, and both probes then return 0, which reads as CLEAN. Worse, the
- * extension is parsed BEFORE the chain is anchored to a pinned Google root, so
- * a parser blow-up skips the anchoring check entirely.
- *
- * Each fixture here is the smallest input that reaches a distinct failure mode.
- */
 class AttestationHostileDerTest {
-
-    /*
-     * Long-form length whose value overflows the bounds guard.
-     *
-     *   04 0D                      OCTET STRING, 13 bytes  (getExtensionValue wrapper)
-     *     30 0B                    KeyDescription SEQUENCE, 11 bytes
-     *       02 01 03               INTEGER 3               (a leading field)
-     *       30 06                  hardwareEnforced SEQUENCE, 6 bytes (the LAST child)
-     *         30 84 7FFFFFFF       SEQUENCE, long-form length 0x7FFFFFFF
-     *
-     * In readLength(), `pos + len` overflows Int and goes negative, so neither
-     * `len < 0` nor `pos + len > end` fires. copyOfRange is then asked for
-     * (6, -2147483643); its own `to - from` underflows back to a positive 2 GB,
-     * so the range check passes too and the allocation is attempted.
-     */
     private val overflowLength = byteArrayOf(
         0x04, 0x0D,
         0x30, 0x0B,
@@ -41,14 +13,9 @@ class AttestationHostileDerTest {
         0x30, 0x84.toByte(), 0x7F, 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte()
     )
 
-    /* Deeply nested constructed elements: findTaggedContent recurses once per
-     * level with no depth cap, and the nesting depth is attacker-chosen. */
     private fun deeplyNested(depth: Int): ByteArray {
-        // Innermost: an empty SEQUENCE.
         var body = byteArrayOf(0x30, 0x00)
         repeat(depth) {
-            // Wrap in a SEQUENCE. Short-form length is enough below 128 bytes;
-            // past that use the 2-byte long form, which stays valid DER.
             body = if (body.size < 0x80) {
                 byteArrayOf(0x30, body.size.toByte()) + body
             } else {
@@ -59,7 +26,7 @@ class AttestationHostileDerTest {
                 ) + body
             }
         }
-        // hardwareEnforced must be the last child of the KeyDescription SEQUENCE.
+
         val keyDescription = byteArrayOf(0x02, 0x01, 0x03) + body
         val seq = byteArrayOf(
             0x30, 0x82.toByte(),
@@ -73,8 +40,6 @@ class AttestationHostileDerTest {
         ) + seq
     }
 
-    /* High-tag-number form whose continuation bytes run to the end of the
-     * element, leaving readTag() with pos == end + 1. */
     private val truncatedHighTag = byteArrayOf(
         0x04, 0x08,
         0x30, 0x06,
@@ -117,10 +82,6 @@ class AttestationHostileDerTest {
         assertNull(AttestationAnalysis.parseRootOfTrust(truncatedHighTag))
     }
 
-    /*
-     * A real Pixel (Akita) KeyMint KeyDescription must still parse, so the
-     * guards above cannot be satisfied by simply rejecting everything.
-     */
     @Test
     fun benignExtensionStillParses() {
         val rot = AttestationAnalysis.parseRootOfTrust(realAkitaExtension())

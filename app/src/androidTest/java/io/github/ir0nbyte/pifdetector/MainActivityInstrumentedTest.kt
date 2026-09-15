@@ -14,7 +14,6 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class MainActivityInstrumentedTest {
-
     @get:Rule
     val activityRule = ActivityScenarioRule(MainActivity::class.java)
 
@@ -36,13 +35,6 @@ class MainActivityInstrumentedTest {
         awaitDisplayed(R.id.resultsRecyclerView)
     }
 
-    /*
-     * Polls instead of sleeping a fixed interval. The detection pass now
-     * includes two AndroidKeyStore attestation probes, and key generation time
-     * varies by an order of magnitude between a software-backed emulator and a
-     * real TEE (StrongBox especially), so any single hardcoded wait is either
-     * flaky on slow devices or wasted time on fast ones.
-     */
     private fun awaitDisplayed(viewId: Int, timeoutMs: Long = 60_000) {
         val deadline = System.currentTimeMillis() + timeoutMs
         var last: Throwable? = null

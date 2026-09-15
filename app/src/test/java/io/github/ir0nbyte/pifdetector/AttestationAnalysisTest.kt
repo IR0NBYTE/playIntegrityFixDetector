@@ -3,29 +3,13 @@ package io.github.ir0nbyte.pifdetector
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.math.BigInteger
 
-/*
- * Unit tests for the pure decision/parsing logic behind KeyAttestationProbe.
- * The live AndroidKeyStore probe needs a real device and is NOT exercised here;
- * these cover the parts that determine whether a real attestation result is
- * treated as an anomaly. DER fixtures are hand-built below.
- *
- * NOTE: these fixtures encode the attestation schema as we understand it
- * (RootOfTrust under [704] EXPLICIT, deviceLocked at index 1, verifiedBootState
- * at index 2). They verify the parser/decision logic is internally correct and
- * regression-safe; they do NOT substitute for validating against a real
- * device's Keymaster/KeyMint output. The parser fails safe (returns null) on
- * anything unexpected, so a schema gap degrades to "no detection", never a
- * false positive.
- */
 class AttestationAnalysisTest {
-
-    // --- 1a: chain signature validation logic -------------------------------
-
     @Test
     fun chainTooShortIsNotBroken() {
         assertFalse(AttestationAnalysis.chainIsCryptographicallyBroken(0) { true })
@@ -39,12 +23,9 @@ class AttestationAnalysisTest {
 
     @Test
     fun anyBrokenLinkBreaksChain() {
-        // link 0 valid, link 1 (leaf-hacked leaf) invalid
         assertTrue(AttestationAnalysis.chainIsCryptographicallyBroken(3) { i -> i != 0 })
         assertTrue(AttestationAnalysis.chainIsCryptographicallyBroken(2) { false })
     }
-
-    // --- 1b: attestation-vs-device contradiction ----------------------------
 
     @Test
     fun nullRootOfTrustNeverContradicts() {
@@ -71,13 +52,9 @@ class AttestationAnalysisTest {
 
     @Test
     fun honestUnlockedAttestationDoesNotContradict() {
-        // Attestation truthfully reports unlocked + unverified on a tampered
-        // device -> no spoof, no flag.
         val rot = AttestationAnalysis.RootOfTrust(deviceLocked = false, verifiedBootState = 2)
         assertFalse(AttestationAnalysis.isBootContradiction(rot, deviceTampered = true))
     }
-
-    // --- RootOfTrust DER parsing --------------------------------------------
 
     @Test
     fun parsesDeviceLockedAndVerifiedState() {
@@ -101,13 +78,49 @@ class AttestationAnalysisTest {
 
     @Test
     fun returnsNullWhenNoRootOfTrustTag() {
-        // OCTET STRING wrapping a SEQUENCE with an INTEGER but no [704].
         val keyDesc = tlv(0x30, tlv(0x02, byteArrayOf(0x01)))
         val ext = tlv(0x04, keyDesc)
         assertNull(AttestationAnalysis.parseRootOfTrust(ext))
     }
 
-    // --- challenge anti-replay ----------------------------------------------
+    @Test
+    fun propertiesClaimingLockedAgainstUnlockedAttestationIsASpoof() {
+        val rot = AttestationAnalysis.RootOfTrust(deviceLocked = false, verifiedBootState = 2)
+        assertTrue(
+            AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked = true)
+        )
+    }
+
+    @Test
+    fun lockedButUnverifiedAttestationStillContradictsLockedProperties() {
+        val rot = AttestationAnalysis.RootOfTrust(deviceLocked = true, verifiedBootState = 2)
+        assertTrue(
+            AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked = true)
+        )
+    }
+
+    @Test
+    fun genuinelyLockedDeviceDoesNotContradict() {
+        val rot = AttestationAnalysis.RootOfTrust(deviceLocked = true, verifiedBootState = 0)
+        assertFalse(
+            AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked = true)
+        )
+    }
+
+    @Test
+    fun honestlyUnlockedDeviceDoesNotContradict() {
+        val rot = AttestationAnalysis.RootOfTrust(deviceLocked = false, verifiedBootState = 2)
+        assertFalse(
+            AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked = false)
+        )
+    }
+
+    @Test
+    fun nullRootOfTrustNeverContradictsProperties() {
+        assertFalse(
+            AttestationAnalysis.bootPropertiesContradictAttestation(null, propertiesClaimLocked = true)
+        )
+    }
 
     @Test
     fun matchingChallengeIsNotMismatch() {
@@ -139,7 +152,53 @@ class AttestationAnalysisTest {
         assertNull(AttestationAnalysis.parseAttestationChallenge(byteArrayOf(0x05, 0x00)))
     }
 
-    // --- revocation (1d) logic ----------------------------------------------
+    @Test
+    fun realPixelChainParsesAsTrustedEnvironmentNotSoftware() {
+        val level = AttestationAnalysis.parseAttestationSecurityLevel(realAkitaExtension())
+        assertEquals(TRUSTED_ENVIRONMENT, level)
+        assertNotEquals(AttestationAnalysis.SECURITY_LEVEL_SOFTWARE, level)
+    }
+
+    @Test
+    fun softwareBackedChainParsesAsSoftware() {
+        assertEquals(
+            AttestationAnalysis.SECURITY_LEVEL_SOFTWARE,
+            AttestationAnalysis.parseAttestationSecurityLevel(
+                buildExtensionWithSecurityLevel(AttestationAnalysis.SECURITY_LEVEL_SOFTWARE)
+            )
+        )
+    }
+
+    @Test
+    fun strongBoxChainIsNotTreatedAsSoftware() {
+        assertEquals(2, AttestationAnalysis.parseAttestationSecurityLevel(
+            buildExtensionWithSecurityLevel(2)))
+    }
+
+    @Test
+    fun unparseableSecurityLevelIsNullNotSoftware() {
+        for (bad in listOf(byteArrayOf(0x01, 0x02, 0x03), ByteArray(0), byteArrayOf(0x05, 0x00))) {
+            val level = AttestationAnalysis.parseAttestationSecurityLevel(bad)
+            assertNull(level)
+            assertNotEquals(AttestationAnalysis.SECURITY_LEVEL_SOFTWARE, level)
+        }
+    }
+
+    private fun buildExtensionWithSecurityLevel(level: Int): ByteArray {
+        val keyDescription = tlv(
+            0x30,
+            tlv(0x02, byteArrayOf(0x03)) +
+                tlv(0x0A, byteArrayOf(level.toByte())) +
+                tlv(0x02, byteArrayOf(0x04)) +
+                tlv(0x0A, byteArrayOf(0x01)) +
+                tlv(0x04, byteArrayOf(0x01, 0x02))
+        )
+        return tlv(0x04, keyDescription)
+    }
+
+    private companion object {
+        const val TRUSTED_ENVIRONMENT = 1
+    }
 
     @Test
     fun normalizeSerialIsLowercaseHexNoLeadingZeros() {
@@ -150,16 +209,6 @@ class AttestationAnalysisTest {
         )
     }
 
-    /*
-     * Google's status list is NOT uniformly hex. Sampled live on 2026-08-26,
-     * 974 of its 1742 keys (55.9%) are decimal: read as decimal each lands
-     * inside unsigned 64 bits, read as hex each overflows it. Looking up only
-     * the hex form silently missed every one of them, and revocation is the
-     * check that still works against a spoofer running a real KeyMint with a
-     * genuine Google-rooted keybox.
-     *
-     * The two serials below are real entries from that list.
-     */
     @Test
     fun decimalKeyedRevocationEntryIsFound() {
         val serial = BigInteger("6681152659205225093")
@@ -170,7 +219,7 @@ class AttestationAnalysisTest {
                 AttestationAnalysis.serialLookupKeys(serial), listedAsDecimal
             )
         )
-        // The hex-only form is exactly what used to be sent, and it misses.
+
         assertFalse(
             AttestationAnalysis.anyCertRevoked(
                 listOf(AttestationAnalysis.normalizeSerial(serial)), listedAsDecimal
@@ -194,11 +243,10 @@ class AttestationAnalysisTest {
         val keys = AttestationAnalysis.serialLookupKeys(BigInteger("6681152659205225093"))
         assertTrue(keys.contains("6681152659205225093"))
         assertTrue(keys.contains("5cb838f1fe157a85"))
-        // A serial that renders identically in both bases is not duplicated.
+
         assertEquals(1, AttestationAnalysis.serialLookupKeys(BigInteger.valueOf(7)).size)
     }
 
-    /* A negative serial must not render with a leading '-'. */
     @Test
     fun negativeSerialsNormalizeToUnsigned() {
         AttestationAnalysis.serialLookupKeys(BigInteger("-255")).forEach {
@@ -217,12 +265,10 @@ class AttestationAnalysisTest {
         assertFalse(AttestationAnalysis.anyCertRevoked(listOf("ff", "ab"), emptySet()))
     }
 
-    // --- 1c: chain anchoring to pinned Google roots -------------------------
-
     @Test
     fun chainEndingInPinnedRootAnchors() {
         val roots = AttestationRoots.pinnedRoots
-        // A chain whose terminal cert IS a pinned root (SHA-256 match path).
+
         assertTrue(AttestationAnalysis.chainAnchorsToPinnedRoot(listOf(roots[0]), roots))
         assertTrue(AttestationAnalysis.chainAnchorsToPinnedRoot(listOf(roots[1]), roots))
     }
@@ -230,25 +276,20 @@ class AttestationAnalysisTest {
     @Test
     fun chainNotAnchoredWhenNoPinnedRootMatches() {
         val roots = AttestationRoots.pinnedRoots
-        // RSA root is self-signed; it neither equals the EC root nor is signed
-        // by it -> conclusively not anchored -> false (the flag condition).
+
         assertFalse(AttestationAnalysis.chainAnchorsToPinnedRoot(listOf(roots[0]), listOf(roots[1])))
     }
 
     @Test
     fun anchorCheckFailsSafeOnEmptyInputs() {
         val roots = AttestationRoots.pinnedRoots
-        // Inconclusive cases must return true (never flag).
+
         assertTrue(AttestationAnalysis.chainAnchorsToPinnedRoot(emptyList(), roots))
         assertTrue(AttestationAnalysis.chainAnchorsToPinnedRoot(listOf(roots[0]), emptyList()))
     }
 
-    // --- real-device byte layouts (decoded from Google's keyattestation corpus) ---
-
     @Test
     fun parsesRealKeymasterRootOfTrustLayout() {
-        // blueline sdk28: 302A( 0400 010100 0A0102 0420<32B> ) -- empty bootKey,
-        // deviceLocked=false, verifiedBootState=Unverified(2).
         val rot = byteArrayOf(0x04, 0x00) +
             byteArrayOf(0x01, 0x01, 0x00) +
             byteArrayOf(0x0A, 0x01, 0x02) +
@@ -259,8 +300,6 @@ class AttestationAnalysisTest {
 
     @Test
     fun parsesRealKeyMintRootOfTrustLayout() {
-        // akita sdk34: 304A( 0420<32B> 010100 0A0102 0420<32B> ) -- 32B bootKey,
-        // deviceLocked=false, verifiedBootState=Unverified(2).
         val rot = byteArrayOf(0x04, 0x20) + ByteArray(32) +
             byteArrayOf(0x01, 0x01, 0x00) +
             byteArrayOf(0x0A, 0x01, 0x02) +
@@ -271,8 +310,6 @@ class AttestationAnalysisTest {
 
     @Test
     fun detectsForgedLockedVerifiedRootOfTrust() {
-        // The invalid/malformed_rot_device_locked combo: 010101 (deviceLocked=TRUE)
-        // + 0A0100 (verifiedBootState=Verified 0) -- exactly what a spoofer forges.
         val rot = byteArrayOf(0x04, 0x20) + ByteArray(32) +
             byteArrayOf(0x01, 0x01, 0x01) +
             byteArrayOf(0x0A, 0x01, 0x00) +
@@ -286,12 +323,11 @@ class AttestationAnalysisTest {
     fun parsesRealAkitaKeyDescriptionEndToEnd() {
         val ext = realAkitaExtension()
 
-        // challenge field (index 4) is the ASCII string "challenge"
         assertTrue(
             AttestationAnalysis.parseAttestationChallenge(ext)!!
                 .contentEquals("challenge".toByteArray(Charsets.US_ASCII))
         )
-        // RootOfTrust: deviceLocked=FALSE (0101 00), verifiedBootState=Unverified (0A01 02)
+
         assertEquals(
             AttestationAnalysis.RootOfTrust(false, 2),
             AttestationAnalysis.parseRootOfTrust(ext)
@@ -300,9 +336,6 @@ class AttestationAnalysisTest {
 
     @Test
     fun parsesRootOfTrustWithLongFormLengths() {
-        // A 200-byte verifiedBootKey forces the RootOfTrust SEQUENCE (and the
-        // wrappers above it) past 127 bytes, exercising readLength()'s long-form
-        // branch that always runs against a real attestation extension.
         val rot = byteArrayOf(0x04.toByte(), 0x81.toByte(), 0xC8.toByte()) + ByteArray(200) +
             byteArrayOf(0x01, 0x01, 0x01) +
             byteArrayOf(0x0A, 0x01, 0x00) +
@@ -311,14 +344,6 @@ class AttestationAnalysisTest {
         assertEquals(AttestationAnalysis.RootOfTrust(true, 0), parsed)
     }
 
-    // --- active probe: AuthorizationList tag encoding ------------------------
-
-    /*
-     * Expected bytes are hardcoded from the DER rules rather than produced by
-     * the function under test, so this is a real check and not a tautology.
-     * 704 must agree with the ROOT_OF_TRUST_TAG the existing parser already
-     * relies on, which is the anchor that proves the encoding is right.
-     */
     @Test
     fun contextTagUsesHighTagNumberFormAboveThirty() {
         assertArrayEquals(
@@ -336,8 +361,6 @@ class AttestationAnalysisTest {
         assertArrayEquals(byteArrayOf(0xAA.toByte()), AttestationAnalysis.contextConstructedTag(10))
     }
 
-    // --- active probe: hardware-enforced tag lookup --------------------------
-
     @Test
     fun findsTagPresentInHardwareEnforcedList() {
         val ext = extensionWithHardwareTags(503)
@@ -351,15 +374,11 @@ class AttestationAnalysisTest {
         assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(byteArrayOf(1, 2, 3), 503))
     }
 
-    // --- active probe: authentication self-contradiction ---------------------
-
-    /* Both spoofers emit 503 unconditionally and never emit 504/505. */
     @Test
     fun noAuthRequiredAloneIsAContradiction() {
         assertTrue(AttestationAnalysis.authRequirementContradiction(extensionWithHardwareTags(503)))
     }
 
-    /* Real KeyMint reports the auth tags, so their presence must clear it. */
     @Test
     fun authTagsPresentClearsTheContradiction() {
         assertFalse(
@@ -378,12 +397,6 @@ class AttestationAnalysisTest {
         assertFalse(AttestationAnalysis.authRequirementContradiction(ByteArray(0)))
     }
 
-    // --- active probe: leaf signature algorithm ------------------------------
-
-    /*
-     * SHA-512 is the digest the active probe requests, so it is the only one
-     * whose appearance in the leaf signature proves the signer echoed us.
-     */
     @Test
     fun leafSignedWithRequestedDigestIsAnomalous() {
         assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA512withECDSA"))
@@ -391,20 +404,12 @@ class AttestationAnalysisTest {
         assertTrue(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA-512withRSA"))
     }
 
-    /*
-     * A batch key we never asked to use these digests proves nothing, and
-     * SHA-384 would be an outright false positive: Google's own attestation
-     * PKI uses P-384 keys (the pinned ECDSA root self-signs ecdsa-with-SHA384),
-     * so a device whose batch key is P-384 signs leaves SHA384withECDSA on
-     * completely stock hardware.
-     */
     @Test
     fun otherNonSha256DigestsAreNotEvidence() {
         assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("sha384withecdsa"))
         assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA1withRSA"))
     }
 
-    /* A real batch key always signs SHA-256, whatever digest the key requested. */
     @Test
     fun sha256LeafSignatureIsNormal() {
         assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("SHA256withECDSA"))
@@ -418,8 +423,6 @@ class AttestationAnalysisTest {
         assertFalse(AttestationAnalysis.leafSignatureTracksRequestedDigest("Ed25519"))
     }
 
-    // --- active probe: self-signed single-cert chain -------------------------
-
     @Test
     fun multiCertAndEmptyChainsAreNotSelfSignedSingletons() {
         assertFalse(AttestationAnalysis.isSelfSignedSingleCert(emptyList()))
@@ -429,25 +432,12 @@ class AttestationAnalysisTest {
         }
     }
 
-    /*
-     * A pinned Google root IS self-signed, but carries no attestation
-     * extension. Both conditions are required, so this must not flag -- it
-     * guards the AND from decaying into an "is self-signed" check.
-     */
     @Test
     fun selfSignedCertWithoutAttestationExtensionDoesNotFlag() {
         val root = AttestationRoots.pinnedRoots.firstOrNull() ?: return
         assertFalse(AttestationAnalysis.isSelfSignedSingleCert(listOf(root)))
     }
 
-    // --- active probe against REAL device bytes ------------------------------
-
-    /*
-     * Validates the tag lookup against a genuine Pixel 8 KeyMint extension
-     * rather than only against fixtures this test file builds itself. The real
-     * hardwareEnforced list carries BF8377 02 0500, i.e. tag 503 wrapping a
-     * NULL, alongside 702/704/705/706/718/719; it carries no 504 or 505.
-     */
     @Test
     fun findsNoAuthRequiredTagInRealPixelExtension() {
         val ext = realAkitaExtension()
@@ -456,44 +446,19 @@ class AttestationAnalysisTest {
         assertFalse(AttestationAnalysis.hasHardwareEnforcedTag(ext, 505))
     }
 
-    /* Tags that really are in the hardwareEnforced list of that same capture. */
     @Test
     fun findsOtherRealHardwareEnforcedTags() {
         val ext = realAkitaExtension()
-        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 702))   // origin
-        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 704))   // RootOfTrust
-        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 719))   // bootPatchLevel
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 702))
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 704))
+        assertTrue(AttestationAnalysis.hasHardwareEnforcedTag(ext, 719))
     }
 
-    /*
-     * CONTRACT GUARD, and the most important test here.
-     *
-     * This genuine Pixel 8 key was generated WITHOUT setUserAuthenticationRequired,
-     * so NO_AUTH_REQUIRED is legitimately present and the raw predicate returns
-     * true for a completely clean device. The predicate is therefore NOT a
-     * detection on its own: it is only sound when the caller just demanded
-     * authentication for the key being inspected, which is why it is called
-     * exclusively from ActiveAttestationProbe.authRequiredProvocation and never
-     * from the passive probe.
-     *
-     * If someone later wires it up elsewhere, this test tells them why the
-     * result will be a false positive on every clean device.
-     */
     @Test
     fun authContradictionPredicateAloneIsNotADetection() {
         assertTrue(AttestationAnalysis.authRequirementContradiction(realAkitaExtension()))
     }
 
-    // --- DER fixture builders -----------------------------------------------
-
-    /*
-     * The actual inner DER of OID 1.3.6.1.4.1.11129.2.1.17 from Google's
-     * testdata/akita/sdk34/TEE_EC_NONE.pem (KeyMint, Pixel 8), wrapped in the
-     * OCTET STRING that getExtensionValue() adds so it mirrors real input.
-     * Exercises multi-byte attestationVersion (0x012C = 300), positional
-     * challenge extraction past it, software+hardware AuthorizationLists that
-     * both carry BF85xx tags, and the hardwareEnforced-scoped [704] parse.
-     */
     private fun realAkitaExtension(): ByteArray {
         val keyDescription = hex(
             "3082013E0202012C0A01010202012C0A010104096368616C6C656E67650400308183" +
@@ -510,10 +475,6 @@ class AttestationAnalysisTest {
         return tlv(0x04, keyDescription)
     }
 
-    /*
-     * Identifier octets for the AuthorizationList tags the active probe reads,
-     * written out by hand so the encoder can be tested against them.
-     */
     private fun hwTag(tagNo: Int): ByteArray = when (tagNo) {
         503 -> byteArrayOf(0xBF.toByte(), 0x83.toByte(), 0x77)
         504 -> byteArrayOf(0xBF.toByte(), 0x83.toByte(), 0x78)
@@ -521,11 +482,6 @@ class AttestationAnalysisTest {
         else -> throw IllegalArgumentException("no fixture for tag $tagNo")
     }
 
-    /*
-     * extensionValue whose hardwareEnforced AuthorizationList carries exactly
-     * the given tags, each wrapping a NULL (the shape both spoofers use for
-     * NO_AUTH_REQUIRED).
-     */
     private fun extensionWithHardwareTags(vararg tagNos: Int): ByteArray {
         var entries = ByteArray(0)
         for (t in tagNos) {
@@ -536,35 +492,27 @@ class AttestationAnalysisTest {
         return tlv(0x04, keyDescription)
     }
 
-    /* KeyDescription with five fields so index 4 is the challenge OCTET STRING. */
     private fun buildExtensionWithChallenge(challenge: ByteArray): ByteArray {
         val keyDescription = tlv(
             0x30,
-            tlv(0x02, byteArrayOf(0x03)) +           // [0] attestationVersion
-                tlv(0x0A, byteArrayOf(0x01)) +        // [1] attestationSecurityLevel
-                tlv(0x02, byteArrayOf(0x04)) +        // [2] keymasterVersion
-                tlv(0x0A, byteArrayOf(0x01)) +        // [3] keymasterSecurityLevel
-                tlv(0x04, challenge)                  // [4] attestationChallenge
+            tlv(0x02, byteArrayOf(0x03)) +
+                tlv(0x0A, byteArrayOf(0x01)) +
+                tlv(0x02, byteArrayOf(0x04)) +
+                tlv(0x0A, byteArrayOf(0x01)) +
+                tlv(0x04, challenge)
         )
         return tlv(0x04, keyDescription)
     }
 
-    /*
-     * extensionValue = OCTET STRING { KeyDescription }, where KeyDescription is
-     * SEQUENCE { INTEGER, SEQUENCE { [704] EXPLICIT { RootOfTrust } } } -- the
-     * trailing nested SEQUENCE is the hardwareEnforced AuthorizationList the
-     * parser scopes its [704] search to.
-     */
     private fun buildExtension(deviceLocked: Boolean, verifiedBootState: Int): ByteArray {
         val rotSeqContent =
-            tlv(0x04, byteArrayOf(0xAA.toByte(), 0xBB.toByte())) +          // verifiedBootKey
-                tlv(0x01, byteArrayOf(if (deviceLocked) 0xFF.toByte() else 0x00)) + // deviceLocked
-                tlv(0x0A, byteArrayOf(verifiedBootState.toByte())) +        // verifiedBootState
-                tlv(0x04, byteArrayOf(0xCC.toByte(), 0xDD.toByte()))        // verifiedBootHash
+            tlv(0x04, byteArrayOf(0xAA.toByte(), 0xBB.toByte())) +
+                tlv(0x01, byteArrayOf(if (deviceLocked) 0xFF.toByte() else 0x00)) +
+                tlv(0x0A, byteArrayOf(verifiedBootState.toByte())) +
+                tlv(0x04, byteArrayOf(0xCC.toByte(), 0xDD.toByte()))
         return extensionWithRootOfTrust(rotSeqContent)
     }
 
-    /* Wrap raw RootOfTrust SEQUENCE *content* into a full extension value. */
     private fun extensionWithRootOfTrust(rootOfTrustSeqContent: ByteArray): ByteArray {
         val rootOfTrustSeq = tlv(0x30, rootOfTrustSeqContent)
         val tagged704 = tlv(byteArrayOf(0xBF.toByte(), 0x85.toByte(), 0x40), rootOfTrustSeq)
@@ -582,7 +530,6 @@ class AttestationAnalysisTest {
     private fun tlv(tag: ByteArray, content: ByteArray): ByteArray =
         tag + derLength(content.size) + content
 
-    /* DER definite length: short form < 128, else minimal long form. */
     private fun derLength(n: Int): ByteArray {
         if (n < 0x80) return byteArrayOf(n.toByte())
         val bytes = ArrayList<Byte>()

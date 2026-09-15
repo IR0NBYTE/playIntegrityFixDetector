@@ -12,7 +12,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import io.github.ir0nbyte.pifdetector.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity() {
-
     private var binding: ActivityMainBinding? = null
     private val resultAdapter = ResultAdapter()
     private val runner = DetectionRunner()
@@ -26,9 +25,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (!runner.verifyFlagsInSync(DetectionResult.ALL_FLAGS_MASK)) {
-            // SSOT drift: native and Kotlin disagree on the flag set.
-            // Always log; surface as a toast in debug builds so it can't
-            // be silently shipped.
             Log.e(TAG, "Bitmask flag SSOT mismatch -- check DetectionResult.kt vs native-lib.cpp")
             if (BuildConfig.DEBUG) {
                 Toast.makeText(this,
@@ -50,11 +46,6 @@ class MainActivity : AppCompatActivity() {
         setupDetectionButton()
     }
 
-    /*
-     * Opt-in toggle for the online key-revocation check (1d). OFF by default so
-     * the app stays network-silent unless the user explicitly enables it; the
-     * preference is read at scan time and passed into DetectionRunner.
-     */
     private fun setupRevocationToggle() {
         val toggle = binding?.revocationSwitch ?: return
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -79,19 +70,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun runIntegrityCheck(detectBtn: Button) {
         runner.runCheck(this, isRevocationEnabled()) { bitmask ->
-            // DetectionRunner.shutdown() suppresses callbacks after destroy,
-            // so we don't need an isFinishing/isDestroyed guard here.
+
             detectBtn.isEnabled = true
             detectBtn.setText(R.string.button_run)
 
             val results = DetectionResult.fromBitmask(bitmask)
             val detectedCount = results.count { it.detected }
-            /*
-             * A privileged-only check that did not fire has not passed -- it was
-             * never observable. Excluding those from the total keeps the summary
-             * from claiming coverage the app does not have. One that DID fire
-             * still counts, since running privileged makes it real.
-             */
+
             val unobservableCount = results.count { it.privilegedOnly && !it.detected }
             resultAdapter.submitList(results)
             binding?.resultsRecyclerView?.visibility = View.VISIBLE
