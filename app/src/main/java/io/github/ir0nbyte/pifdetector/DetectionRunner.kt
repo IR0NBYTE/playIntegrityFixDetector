@@ -25,10 +25,14 @@ class DetectionRunner {
         val appContext = context.applicationContext
         executor.execute {
             val nativeMask = isIntegrityTampered(appContext)
+            // Read once per run so both probes see the same identity.
+            val presentation = DeviceIdentity.fromRuntime(appContext)
             val facts = deviceFacts()
-            val passive = attestationProbe.probe(nativeMask, onlineRefreshEnabled, appContext, facts)
+            val passive = attestationProbe.probe(
+                nativeMask, onlineRefreshEnabled, appContext, facts, presentation
+            )
 
-            val activeMask = activeAttestationProbe.probe(passive.mask != 0)
+            val activeMask = activeAttestationProbe.probe(passive.mask != 0, presentation)
             val report = DetectionReport(
                 bitmask = nativeMask or passive.mask or activeMask,
                 revocation = passive.revocation,

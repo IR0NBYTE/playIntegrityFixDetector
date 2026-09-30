@@ -32,6 +32,7 @@ class KeyAttestationProbe {
         onlineRefreshEnabled: Boolean,
         context: Context,
         facts: AttestationAnalysis.DeviceFacts,
+        presentation: DeviceIdentity.Presentation,
     ): ProbeOutcome {
         return try {
             val attested = generateAttestedChain() ?: return clean()
@@ -62,6 +63,18 @@ class KeyAttestationProbe {
 
             // Accumulate phase. Every check below runs regardless of the others.
             var mask = 0
+
+            // A software-level chain is legitimate on an emulator, a GSI or an
+            // AOSP build. It is not legitimate on something presenting as
+            // production hardware with a hardware-backed keystore.
+            // Anchoring is deliberately NOT part of this condition. A
+            // Google-anchored chain that also claims software level is
+            // self-contradictory on genuine hardware, and requiring
+            // !googleAnchored left exactly that combination in a dead zone where
+            // no check ran at all.
+            if (softwareBacked && DeviceIdentity.presentsAsPhysicalHardware(presentation)) {
+                mask = mask or DetectionResult.DETECTION_ATTEST_SOFTWARE
+            }
 
             // A KeyMint simulator keeps its own record consistent but does not
             // also control the device's properties.
