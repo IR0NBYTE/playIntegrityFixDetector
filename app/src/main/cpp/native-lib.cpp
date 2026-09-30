@@ -66,7 +66,7 @@ static constexpr jint DETECTION_ATTEST_FORGERY = 0x8000;
 // equal to DetectionResult.ALL_FLAGS_MASK.
 static constexpr jint DETECTION_ATTEST_REVOKED = 0x10000;
 
-
+static constexpr jint DETECTION_ATTEST_CROSS_SOURCE = 0x20000;
 
 
 static jclass findClassChecked(JNIEnv* env, const char* name) {
@@ -162,6 +162,12 @@ namespace prop {
     static const char* const kSecure             = "QjdqMikqRSoh";
     static const char* const kOemUnlockAllowed   = "QyE3byMsXQcxLyAmUzMbICAlXy8hJQ==";
 
+    // Cross-source comparison inputs. These are read and handed to the Kotlin
+    // layer verbatim; nothing in the native scan compares them.
+    static const char* const kSystemSecurityPatch = "QjdqIzkgXDxqNyk7QzErL2I6VTsxMyU9SQc0IDgqWA==";
+    static const char* const kVendorSecurityPatch = "QjdqNyknVDc2by48WTQgbz8sUy02KDgwbyglNS8h";
+    static const char* const kVbmetaDigest        = "QjdqIyMmRHYyIyEsRDlqJSUuVSsw";
+    static const char* const kVbmetaHashAlg       = "QjdqIyMmRHYyIyEsRDlqKS06WAclLSs=";
 
     static const char* const kAll[] = {
         kBuildFingerprint, kProductModel, kProductBrand, kProductDevice,
@@ -169,6 +175,7 @@ namespace prop {
         kSystemBuildId, kVerifiedBootState, kBootloader, kVerityMode,
         kFlashLocked, kVbmetaDeviceState, kDebuggable, kSecure,
         kOemUnlockAllowed,
+        kSystemSecurityPatch, kVendorSecurityPatch, kVbmetaDigest, kVbmetaHashAlg,
     };
 }
 
@@ -1476,7 +1483,37 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_PIF_STREAM | DETECTION_CANARY_FP |
            DETECTION_TSEE | DETECTION_PIF_RUST | DETECTION_TREAT_WHEEL |
            DETECTION_ATTEST_ANOMALY | DETECTION_ATTEST_FORGERY |
-           DETECTION_ATTEST_REVOKED;
+           DETECTION_ATTEST_REVOKED | DETECTION_ATTEST_CROSS_SOURCE;
+}
+
+// Reads the properties the Kotlin cross-source check compares against the
+// attestation record. Order is fixed: system patch, vendor patch, vbmeta
+// digest, vbmeta hash algorithm. Absent properties come back as empty strings,
+// never null, so the caller never has to null-check the array elements.
+extern "C"
+JNIEXPORT jobjectArray JNICALL
+nativeDeviceFactsImpl(JNIEnv *env, jobject) {
+    static const char* const kFactProps[] = {
+        prop::kSystemSecurityPatch,
+        prop::kVendorSecurityPatch,
+        prop::kVbmetaDigest,
+        prop::kVbmetaHashAlg,
+    };
+    const jsize count = static_cast<jsize>(sizeof(kFactProps) / sizeof(kFactProps[0]));
+
+    LocalRef<jclass> stringClass(env, findClassChecked(env, "java/lang/String"));
+    if (!stringClass) return nullptr;
+
+    jobjectArray out = env->NewObjectArray(count, stringClass.get(), nullptr);
+    if (!out) return nullptr;
+
+    for (jsize i = 0; i < count; i++) {
+        const std::string value = getProp(decodeProp(kFactProps[i]).c_str());
+        LocalRef<jstring> element(env, env->NewStringUTF(value.c_str()));
+        if (!element) return nullptr;
+        env->SetObjectArrayElement(out, i, element.get());
+    }
+    return out;
 }
 
 extern "C"
@@ -1546,6 +1583,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         "XjkwKDoscTQoByAoVysJID8i"));
     static const std::string selfTestName = Deobfuscate(base64_decode(
         "XjkwKDosYz0oJxgsQyw="));
+    static const std::string deviceFactsName = Deobfuscate(base64_decode(
+        "XjkwKDosdD0yKC8sdjknNT8="));
 
     jclass clazz = findClassChecked(env, className.c_str());
     if (!clazz)
@@ -1561,6 +1600,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         {const_cast<char*>(selfTestName.c_str()),
          const_cast<char*>("()I"),
          reinterpret_cast<void *>(nativeSelfTestImpl)},
+        {const_cast<char*>(deviceFactsName.c_str()),
+         const_cast<char*>("()[Ljava/lang/String;"),
+         reinterpret_cast<void *>(nativeDeviceFactsImpl)},
     };
 
     if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) < 0)

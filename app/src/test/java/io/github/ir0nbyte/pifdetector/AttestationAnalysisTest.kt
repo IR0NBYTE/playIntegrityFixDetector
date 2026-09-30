@@ -498,7 +498,7 @@ class AttestationAnalysisTest {
             entries += tlv(hwTag(t), tlv(0x05, ByteArray(0)))
         }
         val hardwareEnforced = tlv(0x30, entries)
-        val keyDescription = tlv(0x30, tlv(0x02, byteArrayOf(0x03)) + hardwareEnforced)
+        val keyDescription = keyDescriptionWith(hardwareEnforced)
         return tlv(0x04, keyDescription)
     }
 
@@ -527,9 +527,26 @@ class AttestationAnalysisTest {
         val rootOfTrustSeq = tlv(0x30, rootOfTrustSeqContent)
         val tagged704 = tlv(byteArrayOf(0xBF.toByte(), 0x85.toByte(), 0x40), rootOfTrustSeq)
         val hardwareEnforced = tlv(0x30, tagged704)
-        val keyDescription = tlv(0x30, tlv(0x02, byteArrayOf(0x03)) + hardwareEnforced)
+        val keyDescription = keyDescriptionWith(hardwareEnforced)
         return tlv(0x04, keyDescription)
     }
+
+    /**
+     * A KeyDescription with all eight members, matching what KeyMint emits.
+     * The parser addresses hardwareEnforced by index 7 and requires the exact
+     * child count, so a short synthetic record is not a valid fixture.
+     */
+    private fun keyDescriptionWith(hardwareEnforced: ByteArray): ByteArray = tlv(
+        0x30,
+        tlv(0x02, byteArrayOf(0x03)) +                 // attestationVersion
+            tlv(0x0A, byteArrayOf(0x01)) +             // attestationSecurityLevel
+            tlv(0x02, byteArrayOf(0x04)) +             // keymasterVersion
+            tlv(0x0A, byteArrayOf(0x01)) +             // keymasterSecurityLevel
+            tlv(0x04, byteArrayOf(0x01, 0x02)) +       // attestationChallenge
+            tlv(0x04, ByteArray(0)) +                  // uniqueId
+            tlv(0x30, ByteArray(0)) +                  // softwareEnforced
+            hardwareEnforced                           // hardwareEnforced
+    )
 
     private fun hex(s: String): ByteArray =
         ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }

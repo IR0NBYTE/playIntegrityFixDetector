@@ -131,12 +131,69 @@ object AttestationAnalysis {
 
     fun hasHardwareEnforcedTag(extensionValue: ByteArray, tagNo: Int): Boolean {
         return try {
-            val unwrapped = readSingleOctetStringContent(extensionValue) ?: return false
-            val hardwareEnforced = lastSequenceChildContent(unwrapped) ?: return false
-            findTaggedContent(hardwareEnforced, contextConstructedTag(tagNo)) != null
+            val hardwareEnforced = hardwareEnforcedList(extensionValue) ?: return false
+            findTopLevelTaggedContent(hardwareEnforced, contextConstructedTag(tagNo)) != null
         } catch (_: Throwable) {
             false
         }
+    }
+
+    /**
+     * The hardwareEnforced AuthorizationList, which is KeyDescription child 7.
+     *
+     * Addressed by index rather than "the last child", because an adversary who
+     * appends an extra element to the SEQUENCE would otherwise redirect every
+     * lookup into a list they fully control while a strict verifier still reads
+     * the real one.
+     */
+    private fun hardwareEnforcedList(extensionValue: ByteArray): ByteArray? {
+        val unwrapped = readSingleOctetStringContent(extensionValue) ?: return null
+        val r = Asn1Reader(unwrapped)
+        val seqTag = r.readTag()
+        if (seqTag.size != 1 || (seqTag[0].toInt() and 0xFF) != TAG_SEQUENCE) return null
+        val seqLen = r.readLength()
+        val inner = Asn1Reader(unwrapped, r.pos, r.pos + seqLen)
+
+        var index = 0
+        var found: ByteArray? = null
+        while (inner.hasMore()) {
+            inner.readTag()
+            val len = inner.readLength()
+            val start = inner.pos
+            inner.pos = start + len
+            if (index == HARDWARE_ENFORCED_INDEX) {
+                found = unwrapped.copyOfRange(start, start + len)
+            }
+            index++
+        }
+        // KeyDescription has exactly eight members. A different count is a
+        // hand-built record, not something a KeyMint implementation emits.
+        if (index != KEY_DESCRIPTION_CHILDREN) return null
+        return found
+    }
+
+    /**
+     * Scans only the immediate members of an authorization list.
+     *
+     * [findTaggedContent] recurses and returns the first depth-first match, so a
+     * decoy copy of a tag buried inside an earlier constructed member would
+     * shadow the real top-level entry. A duplicate at this level is itself
+     * evidence of a hand-built record, so it returns null rather than guessing.
+     */
+    private fun findTopLevelTaggedContent(data: ByteArray, target: ByteArray): ByteArray? {
+        val r = Asn1Reader(data)
+        var found: ByteArray? = null
+        while (r.hasMore()) {
+            val tag = r.readTag()
+            val len = r.readLength()
+            val start = r.pos
+            r.pos = start + len
+            if (tag.contentEquals(target)) {
+                if (found != null) return null
+                found = data.copyOfRange(start, start + len)
+            }
+        }
+        return found
     }
 
     fun authRequirementContradiction(extensionValue: ByteArray): Boolean {
@@ -145,6 +202,201 @@ object AttestationAnalysis {
         val hasAuthType = hasHardwareEnforcedTag(extensionValue, TAG_USER_AUTH_TYPE)
         val hasAuthTimeout = hasHardwareEnforcedTag(extensionValue, TAG_AUTH_TIMEOUT)
         return !hasAuthType && !hasAuthTimeout
+    }
+
+    const val TAG_OS_PATCH_LEVEL = 706
+    const val TAG_VENDOR_PATCH_LEVEL = 718
+    const val TAG_BOOT_PATCH_LEVEL = 719
+
+    /** Properties read from the device itself, for comparison against attestation. */
+    data class DeviceFacts(
+        val systemSecurityPatch: String?,
+        val vendorSecurityPatch: String?,
+        val vbmetaDigestHex: String?,
+        val vbmetaHashAlg: String?,
+    ) {
+        companion object {
+            val EMPTY = DeviceFacts(null, null, null, null)
+        }
+    }
+
+    data class CrossSourceVerdict(
+        val osPatchAhead: Boolean,
+        val vendorPatchAhead: Boolean,
+        val bootHashMismatch: Boolean,
+    ) {
+        /**
+         * Only the patch-level arms drive a verdict.
+         *
+         * The attested verifiedBootHash matching ro.boot.vbmeta.digest is an
+         * implementation detail of a given bootloader and KeyMint pair, not a
+         * CDD guarantee: a bootloader may export a digest over the top-level
+         * vbmeta while KeyMint attests one over the full chained set. It has so
+         * far only been confirmed equal on one device family, so it is computed
+         * and reported but does not flag on its own. Promote it once it is
+         * confirmed on non-Pixel hardware.
+         */
+        val anyMismatch: Boolean get() = osPatchAhead || vendorPatchAhead
+
+        companion object {
+            val NONE = CrossSourceVerdict(false, false, false)
+        }
+    }
+
+    /**
+     * Reads a hardware-enforced INTEGER tag from the authorization list. The
+     * EXPLICIT tag's content is a whole INTEGER TLV, so one TLV is read from it.
+     */
+    fun parseHardwareEnforcedInteger(extensionValue: ByteArray, tagNo: Int): Long? {
+        return try {
+            val hardwareEnforced = hardwareEnforcedList(extensionValue) ?: return null
+            val content = findTopLevelTaggedContent(hardwareEnforced, contextConstructedTag(tagNo))
+                ?: return null
+
+            val r = Asn1Reader(content)
+            val tag = r.readTag()
+            if (tag.size != 1 || (tag[0].toInt() and 0xFF) != TAG_INTEGER) return null
+            val len = r.readLength()
+            if (len < 1 || len > 8) return null
+            // A negative value is not a valid patch level; reject rather than wrap.
+            if ((content[r.pos].toInt() and 0x80) != 0) return null
+
+            var value = 0L
+            for (i in 0 until len) {
+                value = (value shl 8) or (content[r.pos + i].toLong() and 0xFF)
+            }
+            value
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * The fourth RootOfTrust field, present from KeyMint v3. Deliberately not a
+     * member of [RootOfTrust]: that is a data class, and a ByteArray member
+     * would make its generated equals reference-based.
+     */
+    fun parseVerifiedBootHash(extensionValue: ByteArray): ByteArray? {
+        return try {
+            val hardwareEnforced = hardwareEnforcedList(extensionValue) ?: return null
+            val rotContent = findTopLevelTaggedContent(hardwareEnforced, ROOT_OF_TRUST_TAG)
+                ?: return null
+
+            val seq = Asn1Reader(rotContent)
+            val seqTag = seq.readTag()
+            if (seqTag.size != 1 || (seqTag[0].toInt() and 0xFF) != TAG_SEQUENCE) return null
+            val seqLen = seq.readLength()
+            val r = Asn1Reader(rotContent, seq.pos, seq.pos + seqLen)
+
+            var index = 0
+            while (r.hasMore()) {
+                val tag = r.readTag()
+                val len = r.readLength()
+                val start = r.pos
+                r.pos = start + len
+                if (index == ROOT_OF_TRUST_VERIFIED_BOOT_HASH_INDEX) {
+                    val tagByte = if (tag.size == 1) tag[0].toInt() and 0xFF else -1
+                    return if (tagByte == TAG_OCTET_STRING) {
+                        rotContent.copyOfRange(start, start + len)
+                    } else {
+                        null
+                    }
+                }
+                index++
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Null means unknown, which never flags. */
+    fun normalizeAttestedPatchToYearMonth(raw: Long?): Int? {
+        if (raw == null) return null
+        val yearMonth = when (raw) {
+            in 200801L..209912L -> raw.toInt()
+            in 20080101L..20991231L -> (raw / 100).toInt()
+            else -> return null
+        }
+        val month = yearMonth % 100
+        if (month !in 1..12) return null
+        return yearMonth
+    }
+
+    /** Accepts 2024-12-05, 2024-12, 20241205 and 202412 identically. */
+    fun normalizePropertyPatchToYearMonth(value: String?): Int? {
+        if (value.isNullOrBlank()) return null
+        val digits = value.filter { it.isDigit() }
+        val raw = digits.toLongOrNull() ?: return null
+        if (digits.length != 6 && digits.length != 8) return null
+        return normalizeAttestedPatchToYearMonth(raw)
+    }
+
+    /**
+     * Only an attested level NEWER than the device's own property is evidence.
+     * The other direction is a legitimate lag and must never flag.
+     */
+    fun attestedPatchIsAheadOfProperty(attested: Int?, fromProperty: Int?): Boolean {
+        if (attested == null || fromProperty == null) return false
+        return attested > fromProperty
+    }
+
+    fun verifiedBootHashMismatch(
+        attestedHash: ByteArray?,
+        propertyDigestHex: String?,
+        propertyHashAlg: String?,
+    ): Boolean {
+        return try {
+            if (!"sha256".equals(propertyHashAlg?.trim(), ignoreCase = true)) return false
+            if (attestedHash == null || attestedHash.size != SHA256_BYTES) return false
+            if (attestedHash.all { it.toInt() == 0 }) return false
+
+            val hex = propertyDigestHex?.trim() ?: return false
+            if (hex.length != SHA256_BYTES * 2) return false
+            if (!hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return false
+
+            val decoded = ByteArray(SHA256_BYTES) { i ->
+                ((Character.digit(hex[i * 2], 16) shl 4) or
+                    Character.digit(hex[i * 2 + 1], 16)).toByte()
+            }
+            if (decoded.all { it.toInt() == 0 }) return false
+
+            !attestedHash.contentEquals(decoded)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * A KeyMint simulator keeps the attestation record internally consistent,
+     * but it does not control the device's own properties at the same time.
+     */
+    fun crossSourceMismatch(
+        extensionValue: ByteArray,
+        facts: DeviceFacts,
+    ): CrossSourceVerdict {
+        return try {
+            val osAhead = attestedPatchIsAheadOfProperty(
+                normalizeAttestedPatchToYearMonth(
+                    parseHardwareEnforcedInteger(extensionValue, TAG_OS_PATCH_LEVEL)
+                ),
+                normalizePropertyPatchToYearMonth(facts.systemSecurityPatch),
+            )
+            val vendorAhead = attestedPatchIsAheadOfProperty(
+                normalizeAttestedPatchToYearMonth(
+                    parseHardwareEnforcedInteger(extensionValue, TAG_VENDOR_PATCH_LEVEL)
+                ),
+                normalizePropertyPatchToYearMonth(facts.vendorSecurityPatch),
+            )
+            val hashMismatch = verifiedBootHashMismatch(
+                parseVerifiedBootHash(extensionValue),
+                facts.vbmetaDigestHex,
+                facts.vbmetaHashAlg,
+            )
+            CrossSourceVerdict(osAhead, vendorAhead, hashMismatch)
+        } catch (_: Throwable) {
+            CrossSourceVerdict.NONE
+        }
     }
 
     fun leafSignatureTracksRequestedDigest(sigAlgName: String?): Boolean {
@@ -227,10 +479,9 @@ object AttestationAnalysis {
 
     fun parseRootOfTrust(extensionValue: ByteArray): RootOfTrust? {
         return try {
-            val unwrapped = readSingleOctetStringContent(extensionValue) ?: return null
-
-            val hardwareEnforced = lastSequenceChildContent(unwrapped) ?: return null
-            val rotContent = findTaggedContent(hardwareEnforced, ROOT_OF_TRUST_TAG) ?: return null
+            val hardwareEnforced = hardwareEnforcedList(extensionValue) ?: return null
+            val rotContent = findTopLevelTaggedContent(hardwareEnforced, ROOT_OF_TRUST_TAG)
+                ?: return null
             parseRootOfTrustSequence(rotContent)
         } catch (_: Throwable) {
             null
@@ -239,13 +490,19 @@ object AttestationAnalysis {
 
     private val ROOT_OF_TRUST_TAG = byteArrayOf(0xBF.toByte(), 0x85.toByte(), 0x40.toByte())
 
-    /** Matches the snapshot and live-path serial floor of 8 characters. */
-    private const val MIN_SERIAL_KEY_LENGTH = 8
-
     private const val TAG_BOOLEAN = 0x01
+    private const val TAG_INTEGER = 0x02
     private const val TAG_OCTET_STRING = 0x04
     private const val TAG_ENUMERATED = 0x0A
     private const val TAG_SEQUENCE = 0x30
+
+    private const val ROOT_OF_TRUST_VERIFIED_BOOT_HASH_INDEX = 3
+    /** Matches the snapshot and live-path serial floor of 8 characters. */
+    private const val MIN_SERIAL_KEY_LENGTH = 8
+
+    private const val KEY_DESCRIPTION_CHILDREN = 8
+    private const val HARDWARE_ENFORCED_INDEX = 7
+    private const val SHA256_BYTES = 32
 
     private const val ATTESTATION_CHALLENGE_INDEX = 4
     private const val ATTESTATION_SECURITY_LEVEL_INDEX = 1
