@@ -25,7 +25,8 @@ class DetectionRunner {
         val appContext = context.applicationContext
         executor.execute {
             val nativeMask = isIntegrityTampered(appContext)
-            val passive = attestationProbe.probe(nativeMask, onlineRefreshEnabled, appContext)
+            val facts = deviceFacts()
+            val passive = attestationProbe.probe(nativeMask, onlineRefreshEnabled, appContext, facts)
 
             val activeMask = activeAttestationProbe.probe(passive.mask != 0)
             val report = DetectionReport(
@@ -49,6 +50,25 @@ class DetectionRunner {
 
     private external fun nativeSelfTest(): Int
 
+    private external fun nativeDeviceFacts(): Array<String>
+
+    /** Falls back to EMPTY on any failure, so a missing fact never flags. */
+    fun deviceFacts(): AttestationAnalysis.DeviceFacts {
+        return try {
+            val raw = nativeDeviceFacts()
+            if (raw.size < DEVICE_FACT_COUNT) return AttestationAnalysis.DeviceFacts.EMPTY
+            AttestationAnalysis.DeviceFacts(
+                systemSecurityPatch = raw[0].ifBlank { null },
+                vendorSecurityPatch = raw[1].ifBlank { null },
+                vbmetaDigestHex = raw[2].ifBlank { null },
+                vbmetaHashAlg = raw[3].ifBlank { null },
+            )
+        } catch (e: Throwable) {
+            Log.w(TAG, "device facts unavailable", e)
+            AttestationAnalysis.DeviceFacts.EMPTY
+        }
+    }
+
     fun malformedPropertyLiterals(): Int = try {
         nativeSelfTest()
     } catch (e: UnsatisfiedLinkError) {
@@ -67,6 +87,7 @@ class DetectionRunner {
 
     companion object {
         private const val TAG = "DetectionRunner"
+        private const val DEVICE_FACT_COUNT = 4
 
         val isAvailable: Boolean = try {
             System.loadLibrary("pifdetector")

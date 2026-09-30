@@ -31,6 +31,7 @@ class KeyAttestationProbe {
         nativeBitmask: Int,
         onlineRefreshEnabled: Boolean,
         context: Context,
+        facts: AttestationAnalysis.DeviceFacts,
     ): ProbeOutcome {
         return try {
             val attested = generateAttestedChain() ?: return clean()
@@ -61,6 +62,14 @@ class KeyAttestationProbe {
 
             // Accumulate phase. Every check below runs regardless of the others.
             var mask = 0
+
+            // A KeyMint simulator keeps its own record consistent but does not
+            // also control the device's properties.
+            if (hardwareBacked && googleAnchored &&
+                AttestationAnalysis.crossSourceMismatch(extValue, facts).anyMismatch
+            ) {
+                mask = mask or DetectionResult.DETECTION_ATTEST_CROSS_SOURCE
+            }
 
             // Revocation deliberately sets no detection bit.
             //
