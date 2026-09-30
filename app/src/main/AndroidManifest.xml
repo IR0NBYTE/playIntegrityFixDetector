@@ -12,6 +12,8 @@
         <package android:name="me.weishu.kernelsu" />
         <package android:name="me.bmax.apatch" />
         <package android:name="com.rifsxd.ksunext" />
+        <package android:name="com.sukisu.ultra" />
+        <package android:name="com.resukisu.resukisu" />
         <!-- Classic SuperUser apps -->
         <package android:name="com.koushikdutta.superuser" />
         <package android:name="com.noshufou.android.su" />
