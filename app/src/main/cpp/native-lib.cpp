@@ -19,6 +19,7 @@
 #include <random>
 #include <functional>
 #include <cstdlib>
+#include <cctype>
 #include <android/api-level.h>
 
 #ifdef IS_DEBUG_BUILD
@@ -41,6 +42,28 @@ public:
     ScopedFile(const ScopedFile&) = delete;
     ScopedFile& operator=(const ScopedFile&) = delete;
 };
+
+static constexpr jint DETECTION_DEBUGGER    = 0x001;
+static constexpr jint DETECTION_FRIDA       = 0x002;
+static constexpr jint DETECTION_ZYGISK      = 0x004;
+static constexpr jint DETECTION_PIF         = 0x008;
+static constexpr jint DETECTION_BOOTLOADER  = 0x010;
+static constexpr jint DETECTION_SIGNATURE   = 0x020;
+static constexpr jint DETECTION_TRICKYSTORE = 0x040;
+static constexpr jint DETECTION_PROP_SPOOF  = 0x080;
+static constexpr jint DETECTION_ROOT_HIDER  = 0x100;
+static constexpr jint DETECTION_PIF_STREAM  = 0x200;
+static constexpr jint DETECTION_CANARY_FP   = 0x400;
+static constexpr jint DETECTION_TSEE        = 0x800;
+static constexpr jint DETECTION_PIF_RUST    = 0x1000;
+static constexpr jint DETECTION_TREAT_WHEEL = 0x2000;
+
+static constexpr jint DETECTION_ATTEST_ANOMALY = 0x4000;
+
+static constexpr jint DETECTION_ATTEST_FORGERY = 0x8000;
+
+
+
 
 static jclass findClassChecked(JNIEnv* env, const char* name) {
     jclass c = env->FindClass(name);
@@ -134,6 +157,7 @@ namespace prop {
     static const char* const kDebuggable         = "QjdqJSkrRT8jIC4lVQ==";
     static const char* const kSecure             = "QjdqMikqRSoh";
     static const char* const kOemUnlockAllowed   = "QyE3byMsXQcxLyAmUzMbICAlXy8hJQ==";
+
 
     static const char* const kAll[] = {
         kBuildFingerprint, kProductModel, kProductBrand, kProductDevice,
@@ -507,24 +531,147 @@ static bool detectPropertyInconsistencies() {
     return false;
 }
 
-static bool detectMountNS() {
-    ScopedFile selfMounts(
-        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkXy0qNT8=")).c_str(), "r");
-    ScopedFile initMounts(
-        Deobfuscate(base64_decode("Hyg2Li9mAXcpLjknRCs=")).c_str(), "r");
+// Mount-table analysis.
+//
+// The older namespace diff compared /proc/self/mounts against /proc/1/mounts,
+// but /proc is mounted hidepid=invisible and the app is not in gid 3009, so the
+// init table is unreadable and that check always failed open. These rules read
+// only the caller's own table, which is always available.
+static constexpr jint MOUNT_RULE_NONE = 0;
 
-    if (!selfMounts.isOpen() || !initMounts.isOpen())
-        return false;
+static std::vector<std::string> splitMountFields(const std::string& line) {
+    std::vector<std::string> fields;
+    std::size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) i++;
+        std::size_t start = i;
+        while (i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) i++;
+        if (i > start) fields.emplace_back(line, start, i - start);
+    }
+    return fields;
+}
 
-    int selfCount = 0, initCount = 0;
-    char line[1024];
-    while (fgets(line, sizeof(line), selfMounts)) selfCount++;
-    while (fgets(line, sizeof(line), initMounts)) initCount++;
+static bool pathIsUnder(const std::string& path, const std::string& prefix) {
+    if (path.compare(0, prefix.size(), prefix) != 0) return false;
+    return path.size() == prefix.size() || path[prefix.size()] == '/';
+}
 
-    if (initCount > 0 && selfCount > 0 && (initCount - selfCount) > 5)
-        return true;
+// Returns the bits this one mountinfo line justifies. Anything it does not
+// fully understand returns 0, so a malformed table can never raise a finding.
+static jint classifyMountLine(const std::string& line,
+                              const std::string& dataDev,
+                              std::string* moduleNameOut) {
+    const std::vector<std::string> f = splitMountFields(line);
+    if (f.size() < 10) return MOUNT_RULE_NONE;
 
-    return false;
+    // The optional-field count varies (shared, master, propagate_from), so the
+    // separator must be scanned for rather than indexed at a fixed offset.
+    std::size_t sep = 0;
+    for (std::size_t i = 6; i < f.size(); i++) {
+        if (f[i] == "-") { sep = i; break; }
+    }
+    if (sep == 0 || sep + 2 >= f.size()) return MOUNT_RULE_NONE;
+
+    const std::string& mountRoot = f[3];
+    const std::string& mountPoint = f[4];
+    const std::string& devId = f[2];
+    const std::string& fsType = f[sep + 1];
+    const std::string& source = f[sep + 2];
+
+    const std::string tmpfsLit = Deobfuscate(base64_decode("RDU0Jz8="));
+
+    // M1a: a tmpfs shadowing a read-only system partition, mounted from a
+    // source other than "tmpfs". Every genuine tmpfs carries source "tmpfs";
+    // a systemless root solution names its own worker mount.
+    if (fsType == tmpfsLit && source != tmpfsLit) {
+        static const char* kSystemPartitions[] = {
+            "Hys9MjgsXQ==",          // /system
+            "Hys9MjgsXQchOTg=",      // /system_ext
+            "Hy4hLygmQg==",          // /vendor
+            "Hyg2Lig8Uyw=",          // /product
+            "HzcgLA==",              // /odm
+            "Hys9MjgsXQcgLSck",      // /system_dlkm
+            "Hy4hLygmQgcgLSck",      // /vendor_dlkm
+        };
+        for (const char* encoded : kSystemPartitions) {
+            if (pathIsUnder(mountPoint, Deobfuscate(base64_decode(encoded)))) {
+                return DETECTION_ROOT_HIDER;
+            }
+        }
+    }
+
+    // M2: a bind whose source lives under /adb on the userdata device. The
+    // module directory name leaks in the mount root.
+    if (!dataDev.empty() && devId == dataDev) {
+        const std::string adbRoot = Deobfuscate(base64_decode("HzkgI2M="));
+        if (mountRoot.compare(0, adbRoot.size(), adbRoot) == 0) {
+            const std::string modulesRoot = Deobfuscate(base64_decode("HzkgI2MkXzwxLSk6Hw=="));
+            if (moduleNameOut != nullptr &&
+                mountRoot.compare(0, modulesRoot.size(), modulesRoot) == 0) {
+                const std::size_t start = modulesRoot.size();
+                const std::size_t end = mountRoot.find('/', start);
+                *moduleNameOut = (end == std::string::npos)
+                    ? mountRoot.substr(start)
+                    : mountRoot.substr(start, end - start);
+            }
+            return DETECTION_ROOT_HIDER;
+        }
+    }
+
+    return MOUNT_RULE_NONE;
+}
+
+static jint detectMountArtifacts() {
+    ScopedFile mountinfo(
+        Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkXy0qNSUnVjc=")).c_str(), "r");
+    if (!mountinfo.isOpen()) return MOUNT_RULE_NONE;
+
+    std::vector<std::string> lines;
+    char buf[4096];
+    bool skipRemainder = false;
+    while (fgets(buf, sizeof(buf), mountinfo)) {
+        const bool complete = (std::strchr(buf, '\n') != nullptr);
+        if (skipRemainder) {
+            // Still draining an over-long record; discard it rather than
+            // parsing a fragment with shifted field positions.
+            skipRemainder = !complete;
+            continue;
+        }
+        if (!complete) { skipRemainder = true; continue; }
+        lines.emplace_back(buf);
+    }
+
+    const std::string dataMount = Deobfuscate(base64_decode("HzwlNS0="));
+    std::string dataDev;
+    for (const std::string& line : lines) {
+        const std::vector<std::string> f = splitMountFields(line);
+        if (f.size() >= 5 && f[4] == dataMount) { dataDev = f[2]; break; }
+    }
+
+    jint result = MOUNT_RULE_NONE;
+    std::vector<std::string> moduleNames;
+    for (const std::string& line : lines) {
+        std::string moduleName;
+        result |= classifyMountLine(line, dataDev, &moduleName);
+        if (!moduleName.empty()) moduleNames.push_back(moduleName);
+    }
+
+    static const char* kModuleNeedles[] = {
+        "SiEjKD8iby4hIjgmQg==",   // zygisk_vector
+        "SiEjKD8ibyssICEgWzc=",   // zygisk_shamiko
+        "SiEjKD8ibzYhOTg=",       // zygisk_next
+        "Qj0+OCsgQzM=",           // rezygisk
+    };
+    for (std::string name : moduleNames) {
+        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+        for (const char* encoded : kModuleNeedles) {
+            if (name.find(Deobfuscate(base64_decode(encoded))) != std::string::npos) {
+                result |= DETECTION_ZYGISK;
+            }
+        }
+    }
+
+    return result;
 }
 
 static bool detectOverlayFS() {
@@ -888,6 +1035,11 @@ static bool detectRootManagerApp(JNIEnv *env, jobject context) {
         Deobfuscate(base64_decode("XT1qIyEoSHYlMS09UzA=")),
         Deobfuscate(base64_decode("Uzcpbz4gVis8JWIiQy0qJDQ9")),
 
+        // KernelSU forks. All of these let the manager package name be changed
+        // at build time, so this probe is best-effort by construction.
+        Deobfuscate(base64_decode("Uzcpbz88WzE3NGI8XCw2IA==")),
+        Deobfuscate(base64_decode("Uzcpbz4sQy0vKD88HiohMjkiWSsx")),
+
         Deobfuscate(base64_decode("UzcpbycmRSssKCctRSwwIGI6RSghMzk6VSo=")),
         Deobfuscate(base64_decode("UzcpbyImQzAxJyM8HjkqJT4mWTxqMjk=")),
         Deobfuscate(base64_decode("VS1qIiQoWTYiKD4sHisxMSk7Qy0=")),
@@ -1206,25 +1358,6 @@ static bool verifyAPKSignature(JNIEnv *env, jobject context) {
 #endif
 }
 
-static constexpr jint DETECTION_DEBUGGER    = 0x001;
-static constexpr jint DETECTION_FRIDA       = 0x002;
-static constexpr jint DETECTION_ZYGISK      = 0x004;
-static constexpr jint DETECTION_PIF         = 0x008;
-static constexpr jint DETECTION_BOOTLOADER  = 0x010;
-static constexpr jint DETECTION_SIGNATURE   = 0x020;
-static constexpr jint DETECTION_TRICKYSTORE = 0x040;
-static constexpr jint DETECTION_PROP_SPOOF  = 0x080;
-static constexpr jint DETECTION_ROOT_HIDER  = 0x100;
-static constexpr jint DETECTION_PIF_STREAM  = 0x200;
-static constexpr jint DETECTION_CANARY_FP   = 0x400;
-static constexpr jint DETECTION_TSEE        = 0x800;
-static constexpr jint DETECTION_PIF_RUST    = 0x1000;
-static constexpr jint DETECTION_TREAT_WHEEL = 0x2000;
-
-static constexpr jint DETECTION_ATTEST_ANOMALY = 0x4000;
-
-static constexpr jint DETECTION_ATTEST_FORGERY = 0x8000;
-
 struct DetectionCheck {
     int id;
     std::function<jint(JNIEnv*, jobject)> check;
@@ -1258,7 +1391,8 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
                 detectLegacyRootArtifacts() ||
                 detectRootManagerApp(e, o))
                 r |= DETECTION_ZYGISK;
-            if (detectMountNS() || detectOverlayFS() || detectRWXMappings())
+            r |= detectMountArtifacts();
+            if (detectOverlayFS() || detectRWXMappings())
                 r |= DETECTION_ROOT_HIDER;
             return r;
         }},
