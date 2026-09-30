@@ -62,6 +62,10 @@ static constexpr jint DETECTION_ATTEST_ANOMALY = 0x4000;
 
 static constexpr jint DETECTION_ATTEST_FORGERY = 0x8000;
 
+// Set by the Kotlin layer only, declared here so nativeAllFlagsMask() stays
+// equal to DetectionResult.ALL_FLAGS_MASK.
+static constexpr jint DETECTION_ATTEST_REVOKED = 0x10000;
+
 
 
 
@@ -1471,7 +1475,8 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_TRICKYSTORE | DETECTION_PROP_SPOOF | DETECTION_ROOT_HIDER |
            DETECTION_PIF_STREAM | DETECTION_CANARY_FP |
            DETECTION_TSEE | DETECTION_PIF_RUST | DETECTION_TREAT_WHEEL |
-           DETECTION_ATTEST_ANOMALY | DETECTION_ATTEST_FORGERY;
+           DETECTION_ATTEST_ANOMALY | DETECTION_ATTEST_FORGERY |
+           DETECTION_ATTEST_REVOKED;
 }
 
 extern "C"

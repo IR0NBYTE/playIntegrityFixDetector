@@ -71,9 +71,16 @@ object AttestationAnalysis {
 
     fun normalizeSerial(serial: BigInteger): String = serial.abs().toString(16)
 
+    /**
+     * A serial is looked up in both encodings because the published list mixes
+     * them. Renderings shorter than the list's own minimum are dropped: a
+     * one-character key could otherwise match a genuine certificate.
+     */
     fun serialLookupKeys(serial: BigInteger): List<String> {
         val positive = serial.abs()
-        return listOf(positive.toString(16), positive.toString(10)).distinct()
+        return listOf(positive.toString(16), positive.toString(10))
+            .filter { it.length >= MIN_SERIAL_KEY_LENGTH }
+            .distinct()
     }
 
     fun chainSignaturesBroken(chain: List<X509Certificate>): Boolean =
@@ -231,6 +238,9 @@ object AttestationAnalysis {
     }
 
     private val ROOT_OF_TRUST_TAG = byteArrayOf(0xBF.toByte(), 0x85.toByte(), 0x40.toByte())
+
+    /** Matches the snapshot and live-path serial floor of 8 characters. */
+    private const val MIN_SERIAL_KEY_LENGTH = 8
 
     private const val TAG_BOOLEAN = 0x01
     private const val TAG_OCTET_STRING = 0x04

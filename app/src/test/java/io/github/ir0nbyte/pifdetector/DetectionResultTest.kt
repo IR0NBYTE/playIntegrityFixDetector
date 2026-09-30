@@ -8,8 +8,79 @@ class DetectionResultTest {
     @Test
     fun cleanBitmaskReturnsAllPass() {
         val results = DetectionResult.fromBitmask(0)
-        assertEquals(16, results.size)
+        assertEquals(17, results.size)
         assertTrue(results.none { it.detected })
+    }
+
+    /**
+     * The revocation list revokes attestation BATCH keys, which are shared
+     * across a whole production run. A stock, never-rooted handset from a batch
+     * whose keybox leaked carries the same serial a spoofer would, and 26 of the
+     * current entries are SOFTWARE_FLAW, meaning a defective implementation
+     * rather than spoofing. So a listed serial must never mark the device.
+     */
+    @Test
+    fun knownRevokedIsAWarningNotADetection() {
+        val status = RevocationStatus(RevocationOutcome.KNOWN_REVOKED, "2026-09-30", 1759, false)
+        val results = DetectionResult.fromBitmask(0, status)
+        val row = results.single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
+
+        assertTrue("a listed serial must not be a detection", !row.detected)
+        assertTrue("it must still be surfaced", row.warning)
+        assertEquals("a genuine device from a leaked batch stays clean", 0,
+            results.count { it.detected })
+    }
+
+    @Test
+    fun knownRevokedDetailStatesTheBatchKeyCaveat() {
+        val status = RevocationStatus(RevocationOutcome.KNOWN_REVOKED, "2026-09-30", 1759, false)
+        val row = DetectionResult.fromBitmask(0, status)
+            .single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
+        val detail = row.detail!!
+        assertTrue("must not assert spoofing", detail.contains("Not by itself evidence"))
+        assertTrue("must explain batch sharing", detail.contains("Batch keys are shared"))
+    }
+
+    @Test
+    fun onlyTheRevocationRowCanBeAWarning() {
+        val status = RevocationStatus(RevocationOutcome.KNOWN_REVOKED, "2026-09-30", 1759, false)
+        assertEquals(1, DetectionResult.fromBitmask(0, status).count { it.warning })
+    }
+
+    @Test
+    fun unverifiableRevocationIsInconclusiveNotDetected() {
+        val status = RevocationStatus(RevocationOutcome.UNVERIFIABLE, null, 0, true)
+        val results = DetectionResult.fromBitmask(0, status)
+        val row = results.single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
+        assertTrue(!row.detected)
+        assertTrue(row.inconclusive)
+        assertEquals(1, results.count { it.inconclusive })
+    }
+
+    @Test
+    fun verifiedRevocationCarriesSnapshotDate() {
+        val status = RevocationStatus(RevocationOutcome.VERIFIED, "2026-09-30", 1759, false)
+        val row = DetectionResult.fromBitmask(0, status)
+            .single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
+        assertTrue(!row.detected)
+        assertTrue(!row.inconclusive)
+        assertTrue(row.detail!!.contains("2026-09-30"))
+    }
+
+    @Test
+    fun fromBitmaskWithoutRevocationKeepsRowNeutral() {
+        val row = DetectionResult.fromBitmask(0)
+            .single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
+        assertTrue(!row.inconclusive)
+        assertEquals(null, row.detail)
+    }
+
+    @Test
+    fun notApplicableRevocationIsInconclusive() {
+        val row = DetectionResult.fromBitmask(0, RevocationStatus.NOT_APPLICABLE)
+            .single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
+        assertTrue(!row.detected)
+        assertTrue(row.inconclusive)
     }
 
     @Test

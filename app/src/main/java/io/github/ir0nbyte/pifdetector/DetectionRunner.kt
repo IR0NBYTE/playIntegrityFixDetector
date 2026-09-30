@@ -8,6 +8,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+data class DetectionReport(val bitmask: Int, val revocation: RevocationStatus)
+
 class DetectionRunner {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -15,16 +17,23 @@ class DetectionRunner {
     private val attestationProbe = KeyAttestationProbe()
     private val activeAttestationProbe = ActiveAttestationProbe()
 
-    fun runCheck(context: Context, revocationEnabled: Boolean, onResult: (Int) -> Unit) {
+    fun runCheck(
+        context: Context,
+        onlineRefreshEnabled: Boolean,
+        onResult: (DetectionReport) -> Unit,
+    ) {
         val appContext = context.applicationContext
         executor.execute {
             val nativeMask = isIntegrityTampered(appContext)
-            val passiveMask = attestationProbe.probe(nativeMask, revocationEnabled)
+            val passive = attestationProbe.probe(nativeMask, onlineRefreshEnabled, appContext)
 
-            val activeMask = activeAttestationProbe.probe(passiveMask != 0)
-            val bitmask = nativeMask or passiveMask or activeMask
+            val activeMask = activeAttestationProbe.probe(passive.mask != 0)
+            val report = DetectionReport(
+                bitmask = nativeMask or passive.mask or activeMask,
+                revocation = passive.revocation,
+            )
             mainHandler.post {
-                if (!cancelled.get()) onResult(bitmask)
+                if (!cancelled.get()) onResult(report)
             }
         }
     }

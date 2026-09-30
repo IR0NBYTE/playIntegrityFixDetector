@@ -44,19 +44,50 @@ class MainActivity : AppCompatActivity() {
 
         setupRevocationToggle()
         setupDetectionButton()
+        showPrivacyNoticeIfNeeded()
     }
 
     private fun setupRevocationToggle() {
         val toggle = binding?.revocationSwitch ?: return
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        toggle.isChecked = prefs.getBoolean(KEY_REVOCATION, false)
+        toggle.isChecked = prefs.getBoolean(KEY_ONLINE_REFRESH, true)
         toggle.setOnCheckedChangeListener { _, isChecked ->
-            prefs.edit().putBoolean(KEY_REVOCATION, isChecked).apply()
+            prefs.edit().putBoolean(KEY_ONLINE_REFRESH, isChecked).apply()
         }
     }
 
-    private fun isRevocationEnabled(): Boolean =
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_REVOCATION, false)
+    private fun isOnlineRefreshEnabled(): Boolean =
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_ONLINE_REFRESH, true)
+
+    /**
+     * The offline revocation check always runs. This notice covers only the
+     * optional online refresh, which is the sole outbound request the app makes
+     * during a check.
+     */
+    private fun showPrivacyNoticeIfNeeded() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_PRIVACY_NOTICE_SHOWN, false)) return
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.privacy_revocation_title)
+            .setMessage(R.string.privacy_revocation_body)
+            .setCancelable(false)
+            .setPositiveButton(R.string.privacy_revocation_keep_on) { _, _ ->
+                prefs.edit()
+                    .putBoolean(KEY_ONLINE_REFRESH, true)
+                    .putBoolean(KEY_PRIVACY_NOTICE_SHOWN, true)
+                    .apply()
+                binding?.revocationSwitch?.isChecked = true
+            }
+            .setNegativeButton(R.string.privacy_revocation_offline_only) { _, _ ->
+                prefs.edit()
+                    .putBoolean(KEY_ONLINE_REFRESH, false)
+                    .putBoolean(KEY_PRIVACY_NOTICE_SHOWN, true)
+                    .apply()
+                binding?.revocationSwitch?.isChecked = false
+            }
+            .show()
+    }
 
     private fun setupDetectionButton() {
         val detectBtn = binding?.button2 ?: return
@@ -69,38 +100,67 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runIntegrityCheck(detectBtn: Button) {
-        runner.runCheck(this, isRevocationEnabled()) { bitmask ->
+        runner.runCheck(this, isOnlineRefreshEnabled()) { report ->
 
             detectBtn.isEnabled = true
             detectBtn.setText(R.string.button_run)
 
-            val results = DetectionResult.fromBitmask(bitmask)
+            val results = DetectionResult.fromBitmask(report.bitmask, report.revocation)
             val detectedCount = results.count { it.detected }
 
-            val unobservableCount = results.count { it.privilegedOnly && !it.detected }
+            // Three distinct buckets. A privileged-only row is not observable at
+            // all; an inconclusive or warning row is observable but did not
+            // resolve to a pass. Collapsing them misreports both.
+            val privilegedCount = results.count { it.privilegedOnly && !it.detected }
+            val unresolvedCount =
+                results.count { (it.inconclusive || it.warning) && !it.detected }
+            val observableTotal = results.size - privilegedCount
+
             resultAdapter.submitList(results)
             binding?.resultsRecyclerView?.visibility = View.VISIBLE
 
-            updateStatusCard(detectedCount, results.size - unobservableCount, unobservableCount)
+            updateStatusCard(detectedCount, observableTotal, privilegedCount, unresolvedCount)
         }
     }
 
-    private fun updateStatusCard(detectedCount: Int, totalCount: Int, unobservableCount: Int) {
+    private fun updateStatusCard(
+        detectedCount: Int,
+        observableTotal: Int,
+        privilegedCount: Int,
+        unresolvedCount: Int,
+    ) {
         val b = binding ?: return
-        if (detectedCount == 0) renderClean(b, totalCount, unobservableCount)
-        else renderViolation(b, detectedCount, totalCount)
+        when {
+            detectedCount > 0 -> renderViolation(b, detectedCount, observableTotal)
+            unresolvedCount > 0 -> renderReview(b, unresolvedCount, observableTotal)
+            else -> renderClean(b, observableTotal, privilegedCount, unresolvedCount)
+        }
     }
 
-    private fun renderClean(b: ActivityMainBinding, total: Int, unobservable: Int) {
+    private fun renderClean(
+        b: ActivityMainBinding,
+        total: Int,
+        privileged: Int,
+        unresolved: Int,
+    ) {
         b.statusTitle.setText(R.string.status_pass_title)
-        b.statusSubtitle.text = if (unobservable > 0) {
-            getString(R.string.status_pass_subtitle_partial, total, unobservable)
+        b.statusSubtitle.text = if (privileged > 0 || unresolved > 0) {
+            getString(R.string.status_pass_subtitle_partial, total, privileged, unresolved)
         } else {
             getString(R.string.status_pass_subtitle, total)
         }
         b.statusIcon.setImageResource(R.drawable.ic_check)
         b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_pass))
         b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_clean))
+    }
+
+    /** Nothing was detected, but something observable did not resolve to a pass. */
+    private fun renderReview(b: ActivityMainBinding, unresolved: Int, total: Int) {
+        b.statusTitle.setText(R.string.status_review_title)
+        b.statusSubtitle.text = getString(R.string.status_review_subtitle, unresolved, total)
+        b.statusIcon.setImageResource(R.drawable.ic_info)
+        b.statusIcon.setColorFilter(ContextCompat.getColor(this, R.color.status_warn))
+        b.statusCard.setCardBackgroundColor(ContextCompat.getColor(this, R.color.card_review))
     }
 
     private fun renderViolation(b: ActivityMainBinding, detected: Int, total: Int) {
@@ -131,6 +191,10 @@ class MainActivity : AppCompatActivity() {
     private companion object {
         const val TAG = "MainActivity"
         const val PREFS_NAME = "pifd_settings"
-        const val KEY_REVOCATION = "revocation_check_enabled"
+
+        // Renamed from revocation_check_enabled so existing installs adopt the
+        // new default instead of inheriting a stale false.
+        const val KEY_ONLINE_REFRESH = "revocation_online_refresh_enabled"
+        const val KEY_PRIVACY_NOTICE_SHOWN = "privacy_notice_shown"
     }
 }

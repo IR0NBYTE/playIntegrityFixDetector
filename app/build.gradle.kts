@@ -88,6 +88,12 @@ android {
         viewBinding = true
         buildConfig = true
     }
+    androidResources {
+        // The revocation snapshot is a gzip payload. It must NOT use a .gz name:
+        // aapt2 treats .gz assets as a packaging format, decompresses them and
+        // strips the extension, so AssetManager.open would return plain text.
+        noCompress += "bin"
+    }
 }
 
 tasks.withType<Test>().configureEach {
@@ -106,6 +112,7 @@ dependencies {
     implementation(libs.recyclerview)
     implementation(libs.core.ktx)
     testImplementation(libs.junit)
+    testImplementation(libs.org.json)
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
 }

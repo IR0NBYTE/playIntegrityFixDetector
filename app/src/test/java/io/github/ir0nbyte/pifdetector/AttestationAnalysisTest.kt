@@ -243,15 +243,25 @@ class AttestationAnalysisTest {
         val keys = AttestationAnalysis.serialLookupKeys(BigInteger("6681152659205225093"))
         assertTrue(keys.contains("6681152659205225093"))
         assertTrue(keys.contains("5cb838f1fe157a85"))
+    }
 
-        assertEquals(1, AttestationAnalysis.serialLookupKeys(BigInteger.valueOf(7)).size)
+    /**
+     * A one-character rendering could match an unrelated entry if a malformed
+     * body ever reached the lookup, so renderings below the published list's own
+     * serial floor are not used as keys at all.
+     */
+    @Test
+    fun trivallyShortRenderingsAreNotUsedAsKeys() {
+        assertTrue(AttestationAnalysis.serialLookupKeys(BigInteger.valueOf(7)).isEmpty())
+        assertTrue(AttestationAnalysis.serialLookupKeys(BigInteger.valueOf(255)).isEmpty())
     }
 
     @Test
     fun negativeSerialsNormalizeToUnsigned() {
-        AttestationAnalysis.serialLookupKeys(BigInteger("-255")).forEach {
-            assertFalse(it.startsWith("-"))
-        }
+        val keys = AttestationAnalysis.serialLookupKeys(BigInteger("-6681152659205225093"))
+        assertTrue(keys.isNotEmpty())
+        keys.forEach { assertFalse(it.startsWith("-")) }
+        assertTrue(keys.contains("5cb838f1fe157a85"))
     }
 
     @Test
