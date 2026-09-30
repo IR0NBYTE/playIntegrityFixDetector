@@ -1,5 +1,6 @@
 package io.github.ir0nbyte.pifdetector
 
+import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Log
@@ -13,43 +14,70 @@ class KeyAttestationProbe {
 
     private class AttestedKey(val chain: List<X509Certificate>, val challenge: ByteArray)
 
-    fun probe(nativeBitmask: Int, revocationEnabled: Boolean): Int {
-        return try {
-            val attested = generateAttestedChain() ?: return 0
-            val chain = attested.chain
-            if (chain.isEmpty()) return 0
+    data class ProbeOutcome(val mask: Int, val revocation: RevocationStatus)
 
-            if (AttestationAnalysis.chainSignaturesBroken(chain)) {
-                return DetectionResult.DETECTION_ATTEST_ANOMALY
-            }
-            if (AttestationAnalysis.chainHasNonCaIssuer(chain)) {
-                return DetectionResult.DETECTION_ATTEST_ANOMALY
-            }
+    /**
+     * The probe runs in two parts.
+     *
+     * The trust gates come first and return immediately, because nothing below
+     * them may read fields out of a chain whose crypto or anchoring did not
+     * hold. Everything after them accumulates into one mask instead of
+     * returning, so a device that trips one finding still gets every other check
+     * evaluated. The previous version returned on the first finding, which meant
+     * revocation, sitting last, never ran on any device that tripped an earlier
+     * check.
+     */
+    fun probe(
+        nativeBitmask: Int,
+        onlineRefreshEnabled: Boolean,
+        context: Context,
+    ): ProbeOutcome {
+        return try {
+            val attested = generateAttestedChain() ?: return clean()
+            val chain = attested.chain
+            if (chain.isEmpty()) return clean()
+
+            // Trust gates. These stay hard early returns.
+            if (AttestationAnalysis.chainSignaturesBroken(chain)) return anomaly()
+            if (AttestationAnalysis.chainHasNonCaIssuer(chain)) return anomaly()
 
             val extValue = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID)
-                ?: return 0
+                ?: return clean()
 
             val securityLevel = AttestationAnalysis.parseAttestationSecurityLevel(extValue)
             val softwareBacked = securityLevel == AttestationAnalysis.SECURITY_LEVEL_SOFTWARE
-
             val hardwareBacked =
                 securityLevel == AttestationAnalysis.SECURITY_LEVEL_TRUSTED_ENVIRONMENT ||
                     securityLevel == AttestationAnalysis.SECURITY_LEVEL_STRONGBOX
 
             val googleAnchored =
                 AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
-            if (!softwareBacked && !googleAnchored) {
-                return DetectionResult.DETECTION_ATTEST_ANOMALY
-            }
+            if (!softwareBacked && !googleAnchored) return anomaly()
 
             val challenge = AttestationAnalysis.parseAttestationChallenge(extValue)
             if (AttestationAnalysis.challengeMismatch(challenge, attested.challenge)) {
-                return DetectionResult.DETECTION_ATTEST_ANOMALY
+                return anomaly()
             }
+
+            // Accumulate phase. Every check below runs regardless of the others.
+            var mask = 0
+
+            // Revocation deliberately sets no detection bit.
+            //
+            // The published list revokes attestation batch keys, and a batch key
+            // is shared by every handset in the production run it was
+            // provisioned into. A leaked keybox therefore carries the same
+            // serial on a spoofer's chain and on a stock, never-rooted phone
+            // from that batch, and 26 of the current entries are SOFTWARE_FLAW,
+            // which says the implementation is defective rather than that
+            // anyone is spoofing. Flagging on the serial alone would mark those
+            // genuine devices permanently. The outcome is reported on its own
+            // row instead, where the user can weigh it.
+            val revocation = evaluateRevocation(chain, googleAnchored, onlineRefreshEnabled, context)
 
             val rot = AttestationAnalysis.parseRootOfTrust(extValue)
             if (AttestationAnalysis.isBootContradiction(rot, deviceTampered(nativeBitmask))) {
-                return DetectionResult.DETECTION_ATTEST_ANOMALY
+                mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
             }
 
             val propertiesClaimLocked =
@@ -57,28 +85,45 @@ class KeyAttestationProbe {
             if (hardwareBacked && googleAnchored &&
                 AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked)
             ) {
-                return DetectionResult.DETECTION_ATTEST_ANOMALY
+                mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
             }
 
-            if (revocationEnabled && googleAnchored) {
-                val revoked = statusClient.fetchRevokedSerials()
-                if (revoked != null) {
-                    val serials =
-                        chain.flatMap { AttestationAnalysis.serialLookupKeys(it.serialNumber) }
-                    if (AttestationAnalysis.anyCertRevoked(serials, revoked)) {
-                        return DetectionResult.DETECTION_ATTEST_ANOMALY
-                    }
-                }
-            }
-
-            0
+            ProbeOutcome(mask, revocation)
         } catch (e: Throwable) {
             Log.w(TAG, "attestation probe failed; failing safe", e)
-            0
+            clean()
         } finally {
             deleteKeyQuietly()
         }
     }
+
+    private fun evaluateRevocation(
+        chain: List<X509Certificate>,
+        googleAnchored: Boolean,
+        onlineRefreshEnabled: Boolean,
+        context: Context,
+    ): RevocationStatus {
+        if (!googleAnchored) return RevocationStatus.NOT_APPLICABLE
+
+        val serials = RevocationChecker.serialKeysForChain(chain, AttestationRoots.pinnedRoots)
+        if (serials.isEmpty()) return RevocationStatus.NOT_APPLICABLE
+
+        // The offline snapshot is loaded first so that a slow or hostile network
+        // can never downgrade a snapshot-backed answer to UNVERIFIABLE.
+        val snapshot = RevocationSnapshotLoader.load(context)
+        val live = if (onlineRefreshEnabled) statusClient.fetchRevokedSerials() else null
+
+        return RevocationChecker.evaluate(serials, snapshot, live)
+    }
+
+    private fun clean() = ProbeOutcome(0, RevocationStatus.NOT_EVALUATED)
+
+    /**
+     * A trust gate failed. Revocation was not looked at, which is not the same
+     * as knowing the chain had no Google anchor, so the row must not claim it.
+     */
+    private fun anomaly() =
+        ProbeOutcome(DetectionResult.DETECTION_ATTEST_ANOMALY, RevocationStatus.NOT_EVALUATED)
 
     private fun deviceTampered(nativeBitmask: Int): Boolean {
         return (nativeBitmask and DetectionResult.DETECTION_ROOT_HIDER) != 0

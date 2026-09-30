@@ -25,6 +25,7 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
         private val iconView: ImageView = itemView.findViewById(R.id.statusIcon)
         private val nameView: TextView = itemView.findViewById(R.id.checkName)
         private val descView: TextView = itemView.findViewById(R.id.checkDescription)
+        private val detailView: TextView = itemView.findViewById(R.id.checkDetail)
         private val statusView: TextView = itemView.findViewById(R.id.checkStatus)
 
         fun bind(result: DetectionResult) {
@@ -35,6 +36,13 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
         private fun bindData(result: DetectionResult) {
             nameView.text = result.name
             descView.text = result.description
+            val detail = result.detail
+            if (detail.isNullOrEmpty()) {
+                detailView.visibility = View.GONE
+            } else {
+                detailView.visibility = View.VISIBLE
+                detailView.text = detail
+            }
         }
 
         private fun applyStatusStyle(result: DetectionResult) {
@@ -42,6 +50,10 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
             val (textRes, colorRes, iconRes) = when {
                 result.detected ->
                     Triple(R.string.result_status_detected, R.color.status_fail, R.drawable.ic_warning)
+                result.warning ->
+                    Triple(R.string.result_status_listed, R.color.status_warn, R.drawable.ic_warning)
+                result.inconclusive ->
+                    Triple(R.string.result_status_unverified, R.color.status_warn, R.drawable.ic_info)
                 result.privilegedOnly ->
                     Triple(R.string.result_status_unobservable, R.color.text_secondary, R.drawable.ic_info)
                 else ->

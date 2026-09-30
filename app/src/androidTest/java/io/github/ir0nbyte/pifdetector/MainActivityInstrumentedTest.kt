@@ -8,6 +8,8 @@ import androidx.test.espresso.matcher.ViewMatchers.withId
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.rules.ActivityScenarioRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import org.junit.BeforeClass
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -50,7 +52,23 @@ class MainActivityInstrumentedTest {
         throw AssertionError("view $viewId not displayed within ${timeoutMs}ms", last)
     }
 
-    private companion object {
-        const val POLL_INTERVAL_MS = 250L
+    companion object {
+        private const val POLL_INTERVAL_MS = 250L
+
+        /**
+         * The first-run privacy notice is modal and would sit over every view
+         * under test. Mark it as already shown so these tests exercise the main
+         * screen rather than the dialog; the dialog has its own coverage in
+         * PrivacyNoticeInstrumentedTest.
+         */
+        @BeforeClass
+        @JvmStatic
+        fun dismissFirstRunNotice() {
+            InstrumentationRegistry.getInstrumentation().targetContext
+                .getSharedPreferences("pifd_settings", android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("privacy_notice_shown", true)
+                .commit()
+        }
     }
 }

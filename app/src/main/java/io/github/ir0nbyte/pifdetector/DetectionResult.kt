@@ -6,7 +6,22 @@ data class DetectionResult(
     val flag: Int,
     val detected: Boolean,
 
-    val privilegedOnly: Boolean = false
+    val privilegedOnly: Boolean = false,
+
+    /**
+     * Observable in principle, but this run could not reach a verdict. Rendered
+     * as its own state and counted as neither a pass nor a detection.
+     */
+    val inconclusive: Boolean = false,
+
+    /**
+     * A real observation that is worth showing but is not by itself evidence
+     * about this device. Counted as neither a pass nor a detection.
+     */
+    val warning: Boolean = false,
+
+    /** Optional one line of context shown under the check description. */
+    val detail: String? = null,
 ) {
     companion object {
         const val DETECTION_DEBUGGER = 0x001
@@ -27,6 +42,12 @@ data class DetectionResult(
         const val DETECTION_ATTEST_ANOMALY = 0x4000
 
         const val DETECTION_ATTEST_FORGERY = 0x8000
+
+        /**
+         * Row identity only. Nothing sets this bit: see the note in
+         * KeyAttestationProbe on why a revoked serial is not a device verdict.
+         */
+        const val DETECTION_ATTEST_REVOKED = 0x10000
 
         private val PRIVILEGED_ONLY = setOf(
             DETECTION_PIF,
@@ -71,18 +92,69 @@ data class DetectionResult(
                  "Hardware key attestation chain invalid or contradicts device state"),
             Spec(DETECTION_ATTEST_FORGERY, "Attestation Forgery (active)",
                  "Provoked attestation chain contradicts itself or is keybox-signed"),
+            Spec(DETECTION_ATTEST_REVOKED, "Keybox Revocation",
+                 "Attestation serial checked against Google's published revocation list"),
         )
 
         val ALL_FLAGS_MASK: Int = SPECS.fold(0) { acc, s -> acc or s.flag }
 
-        fun fromBitmask(bitmask: Int): List<DetectionResult> = SPECS.map {
-            DetectionResult(
-                it.name,
-                it.description,
-                it.flag,
-                bitmask and it.flag != 0,
-                PRIVILEGED_ONLY.contains(it.flag)
+        fun fromBitmask(
+            bitmask: Int,
+            revocation: RevocationStatus? = null,
+        ): List<DetectionResult> = SPECS.map { spec ->
+            val base = DetectionResult(
+                spec.name,
+                spec.description,
+                spec.flag,
+                bitmask and spec.flag != 0,
+                PRIVILEGED_ONLY.contains(spec.flag)
             )
+            if (spec.flag == DETECTION_ATTEST_REVOKED && revocation != null) {
+                applyRevocation(base, revocation)
+            } else {
+                base
+            }
+        }
+
+        private fun applyRevocation(
+            row: DetectionResult,
+            status: RevocationStatus,
+        ): DetectionResult = when (status.outcome) {
+            RevocationOutcome.KNOWN_REVOKED -> row.copy(
+                warning = true,
+                detail = "A serial in this chain is on Google's published list. " +
+                    "Batch keys are shared across a production run, so this can also mean " +
+                    "the manufacturer's key was published. Not by itself evidence of spoofing."
+            )
+
+            RevocationOutcome.VERIFIED -> row.copy(
+                detail = verifiedDetail(status)
+            )
+
+            RevocationOutcome.UNVERIFIABLE -> row.copy(
+                inconclusive = true,
+                detail = "Could not be checked: no usable snapshot and no network. This is not a pass."
+            )
+
+            RevocationOutcome.NOT_APPLICABLE -> row.copy(
+                inconclusive = true,
+                detail = "No Google-anchored attestation chain to check"
+            )
+
+            RevocationOutcome.NOT_EVALUATED -> row.copy(
+                inconclusive = true,
+                detail = "Not evaluated: the chain failed an earlier trust gate"
+            )
+        }
+
+        private fun verifiedDetail(status: RevocationStatus): String {
+            val source = when {
+                status.snapshotDate != null && status.networkConsulted ->
+                    "snapshot ${status.snapshotDate} plus online refresh"
+                status.snapshotDate != null -> "offline snapshot ${status.snapshotDate}"
+                else -> "online list"
+            }
+            return "Not on the list ($source). Not known-bad; this is not proof the keybox is genuine."
         }
     }
 }

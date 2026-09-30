@@ -14,4 +14,5 @@
     <color name="background">#FFF5F5F5</color>
     <color name="card_clean">#FFE8F5E9</color>
     <color name="card_detected">#FFFFEBEE</color>
+    <color name="card_review">#FFFFF8E1</color>
 </resources>
