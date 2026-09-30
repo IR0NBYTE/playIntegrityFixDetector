@@ -12,9 +12,9 @@ import java.security.cert.X509Certificate
 class ActiveAttestationProbe {
     private class Attested(val chain: List<X509Certificate>, val challenge: ByteArray)
 
-    fun probe(passiveProbeFlagged: Boolean): Int {
+    fun probe(passiveProbeFlagged: Boolean, presentation: DeviceIdentity.Presentation): Int {
         return try {
-            attestKeyProvocation(passiveProbeFlagged).takeIf { it != 0 }
+            attestKeyProvocation(passiveProbeFlagged, presentation).takeIf { it != 0 }
                 ?: authRequiredProvocation()
         } catch (e: Throwable) {
             Log.w(TAG, "active attestation probe failed; failing safe", e)
@@ -22,7 +22,10 @@ class ActiveAttestationProbe {
         }
     }
 
-    private fun attestKeyProvocation(passiveProbeFlagged: Boolean): Int {
+    private fun attestKeyProvocation(
+        passiveProbeFlagged: Boolean,
+        presentation: DeviceIdentity.Presentation,
+    ): Int {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return 0
         val attested = generate(ALIAS_ATTEST_KEY) { builder ->
             builder.setDigests(KeyProperties.DIGEST_SHA256)
@@ -44,8 +47,18 @@ class ActiveAttestationProbe {
             return DetectionResult.DETECTION_ATTEST_FORGERY
         }
 
-        if (!passiveProbeFlagged && !anchorsToGoogle(chain, ext)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+        if (!passiveProbeFlagged) {
+            val softwareBacked =
+                AttestationAnalysis.parseAttestationSecurityLevel(ext) ==
+                    AttestationAnalysis.SECURITY_LEVEL_SOFTWARE
+            val anchored =
+                AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
+            if (!anchored) {
+                if (!softwareBacked) return DetectionResult.DETECTION_ATTEST_FORGERY
+                if (DeviceIdentity.presentsAsPhysicalHardware(presentation)) {
+                    return DetectionResult.DETECTION_ATTEST_SOFTWARE
+                }
+            }
         }
 
         return 0
@@ -59,14 +72,6 @@ class ActiveAttestationProbe {
             return DetectionResult.DETECTION_ATTEST_FORGERY
         }
         return null
-    }
-
-    private fun anchorsToGoogle(chain: List<X509Certificate>, ext: ByteArray): Boolean {
-        val softwareBacked =
-            AttestationAnalysis.parseAttestationSecurityLevel(ext) ==
-                AttestationAnalysis.SECURITY_LEVEL_SOFTWARE
-        return softwareBacked ||
-            AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
     }
 
     @Suppress("DEPRECATION")

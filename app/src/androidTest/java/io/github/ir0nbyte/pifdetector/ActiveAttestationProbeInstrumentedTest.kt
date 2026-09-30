@@ -17,22 +17,35 @@ import java.security.cert.X509Certificate
 
 @RunWith(AndroidJUnit4::class)
 class ActiveAttestationProbeInstrumentedTest {
+    private val presentation
+        get() = DeviceIdentity.fromRuntime(
+            InstrumentationRegistry.getInstrumentation().targetContext
+        )
+
     @Test
     fun probeNeverThrowsAndReturnsOnlyItsOwnFlag() {
+        Log.i(DIAG_TAG, "presentation=$presentation")
+        Log.i(
+            DIAG_TAG,
+            "presentsAsPhysicalHardware=" +
+                DeviceIdentity.presentsAsPhysicalHardware(presentation)
+        )
         for (passiveFlagged in listOf(false, true)) {
-            val result = ActiveAttestationProbe().probe(passiveFlagged)
+            val result = ActiveAttestationProbe().probe(passiveFlagged, presentation)
             Log.i(DIAG_TAG, "probe(passiveFlagged=$passiveFlagged) = 0x${result.toString(16)}")
             assertTrue(
-                "probe must return 0 or DETECTION_ATTEST_FORGERY, got 0x${result.toString(16)}",
-                result == 0 || result == DetectionResult.DETECTION_ATTEST_FORGERY
+                "probe must return 0, ATTEST_FORGERY or ATTEST_SOFTWARE, got 0x${result.toString(16)}",
+                result == 0 ||
+                    result == DetectionResult.DETECTION_ATTEST_FORGERY ||
+                    result == DetectionResult.DETECTION_ATTEST_SOFTWARE
             )
         }
     }
 
     @Test
     fun passiveFlaggedNeverIncreasesTheActiveVerdict() {
-        val loud = ActiveAttestationProbe().probe(passiveProbeFlagged = false)
-        val quiet = ActiveAttestationProbe().probe(passiveProbeFlagged = true)
+        val loud = ActiveAttestationProbe().probe(false, presentation)
+        val quiet = ActiveAttestationProbe().probe(true, presentation)
         Log.i(DIAG_TAG, "suppression: unsuppressed=0x${loud.toString(16)} suppressed=0x${quiet.toString(16)}")
         assertTrue(
             "suppressing anchoring must not add findings",

@@ -8,7 +8,7 @@ class DetectionResultTest {
     @Test
     fun cleanBitmaskReturnsAllPass() {
         val results = DetectionResult.fromBitmask(0)
-        assertEquals(18, results.size)
+        assertEquals(19, results.size)
         assertTrue(results.none { it.detected })
     }
 

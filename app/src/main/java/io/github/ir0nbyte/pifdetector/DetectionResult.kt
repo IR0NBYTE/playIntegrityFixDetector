@@ -51,6 +51,8 @@ data class DetectionResult(
 
         const val DETECTION_ATTEST_CROSS_SOURCE = 0x20000
 
+        const val DETECTION_ATTEST_SOFTWARE = 0x40000
+
         private val PRIVILEGED_ONLY = setOf(
             DETECTION_PIF,
             DETECTION_TRICKYSTORE,
@@ -98,6 +100,8 @@ data class DetectionResult(
                  "Attestation serial checked against Google's published revocation list"),
             Spec(DETECTION_ATTEST_CROSS_SOURCE, "Attestation Cross-Source",
                  "Attested patch level or verified boot hash disagrees with the device's own sources"),
+            Spec(DETECTION_ATTEST_SOFTWARE, "Software Attestation",
+                 "Software-level key attestation on a device presenting as production hardware"),
         )
 
         val ALL_FLAGS_MASK: Int = SPECS.fold(0) { acc, s -> acc or s.flag }
