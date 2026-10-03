@@ -26,9 +26,17 @@ object DeviceIdentity {
         val board: String,
         val hardware: String,
         val hardwareKeystoreDeclared: Boolean,
+        /**
+         * The version the device's own hardware_keystore feature declares, or 0
+         * when it declares none. A vendor prebuilt, hand-pinned per release.
+         */
+        val keystoreFeatureVersion: Int = 0,
+        val sdkInt: Int = 0,
+        /** True only on a released platform, not a preview or a codenamed build. */
+        val releaseBuild: Boolean = false,
     )
 
-    val UNKNOWN = Presentation("", "", "", "", "", "", "", "", "", "", false)
+    val UNKNOWN = Presentation("", "", "", "", "", "", "", "", "", "", false, 0, 0, false)
 
     // PackageManager.FEATURE_HARDWARE_KEYSTORE (API 31) and
     // FEATURE_STRONGBOX_KEYSTORE (API 28), written as literals because minSdk is 24.
@@ -68,9 +76,32 @@ object DeviceIdentity {
                 hardwareKeystoreDeclared =
                     pm.hasSystemFeature(FEATURE_HARDWARE_KEYSTORE) ||
                         pm.hasSystemFeature(FEATURE_STRONGBOX_KEYSTORE),
+                keystoreFeatureVersion = declaredFeatureVersion(pm, FEATURE_HARDWARE_KEYSTORE),
+                sdkInt = Build.VERSION.SDK_INT,
+                releaseBuild = Build.VERSION.CODENAME == "REL" &&
+                    Build.VERSION.PREVIEW_SDK_INT == 0,
             )
         } catch (_: Throwable) {
             UNKNOWN
+        }
+    }
+
+    /**
+     * The version a feature declares. getSystemAvailableFeatures carries the
+     * version; hasSystemFeature(name, version) is API 24 but only answers a
+     * threshold question, so the list is walked instead to read the value.
+     */
+    private fun declaredFeatureVersion(
+        pm: android.content.pm.PackageManager,
+        name: String,
+    ): Int {
+        return try {
+            pm.systemAvailableFeatures
+                .firstOrNull { it.name == name }
+                ?.version
+                ?: 0
+        } catch (_: Throwable) {
+            0
         }
     }
 

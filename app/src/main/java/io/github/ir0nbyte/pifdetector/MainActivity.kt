@@ -105,47 +105,59 @@ class MainActivity : AppCompatActivity() {
             detectBtn.isEnabled = true
             detectBtn.setText(R.string.button_run)
 
-            val results = DetectionResult.fromBitmask(report.bitmask, report.revocation)
+            val results = DetectionResult.fromBitmask(
+                report.bitmask, report.revocation, report.crossSource, report.validity,
+                report.versions, report.shape, report.moduleHash,
+            )
             val detectedCount = results.count { it.detected }
 
             // Three distinct buckets. A privileged-only row is not observable at
             // all; an inconclusive or warning row is observable but did not
             // resolve to a pass. Collapsing them misreports both.
-            val privilegedCount = results.count { it.privilegedOnly && !it.detected }
-            val unresolvedCount =
-                results.count { (it.inconclusive || it.warning) && !it.detected }
-            val observableTotal = results.size - privilegedCount
+            // A privileged-only row and a row that cannot apply to this
+            // device are both unobservable here. Only a row that could have
+            // resolved and did not belongs in the review bucket, or a clean
+            // stock phone reads amber for lacking a platform surface.
+            val unobservableCount = results.count {
+                (it.privilegedOnly || it.notApplicable) && !it.detected
+            }
+            val unresolvedCount = results.count {
+                (it.inconclusive || it.warning) && !it.notApplicable && !it.detected
+            }
+            val observableTotal = results.size - unobservableCount
 
             resultAdapter.submitList(results)
             binding?.resultsRecyclerView?.visibility = View.VISIBLE
 
-            updateStatusCard(detectedCount, observableTotal, privilegedCount, unresolvedCount)
+            updateStatusCard(
+                detectedCount, observableTotal, unobservableCount, unresolvedCount
+            )
         }
     }
 
     private fun updateStatusCard(
         detectedCount: Int,
         observableTotal: Int,
-        privilegedCount: Int,
+        unobservableCount: Int,
         unresolvedCount: Int,
     ) {
         val b = binding ?: return
         when {
             detectedCount > 0 -> renderViolation(b, detectedCount, observableTotal)
             unresolvedCount > 0 -> renderReview(b, unresolvedCount, observableTotal)
-            else -> renderClean(b, observableTotal, privilegedCount, unresolvedCount)
+            else -> renderClean(b, observableTotal, unobservableCount, unresolvedCount)
         }
     }
 
     private fun renderClean(
         b: ActivityMainBinding,
         total: Int,
-        privileged: Int,
+        unobservable: Int,
         unresolved: Int,
     ) {
         b.statusTitle.setText(R.string.status_pass_title)
-        b.statusSubtitle.text = if (privileged > 0 || unresolved > 0) {
-            getString(R.string.status_pass_subtitle_partial, total, privileged, unresolved)
+        b.statusSubtitle.text = if (unobservable > 0 || unresolved > 0) {
+            getString(R.string.status_pass_subtitle_partial, total, unobservable, unresolved)
         } else {
             getString(R.string.status_pass_subtitle, total)
         }

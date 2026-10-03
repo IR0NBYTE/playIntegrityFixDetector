@@ -70,6 +70,16 @@ static constexpr jint DETECTION_ATTEST_CROSS_SOURCE = 0x20000;
 
 static constexpr jint DETECTION_ATTEST_SOFTWARE = 0x40000;
 
+static constexpr jint DETECTION_ATTEST_VALIDITY = 0x80000;
+
+static constexpr jint DETECTION_ATTEST_VERSION = 0x100000;
+
+static constexpr jint DETECTION_ATTEST_SHAPE = 0x200000;
+
+// Row identity only. Nothing sets this bit: a module-hash mismatch is also what
+// a staged mainline update produces, so it cannot convict on its own.
+static constexpr jint DETECTION_ATTEST_MODULE_HASH = 0x400000;
+
 
 static jclass findClassChecked(JNIEnv* env, const char* name) {
     jclass c = env->FindClass(name);
@@ -1486,7 +1496,9 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_TSEE | DETECTION_PIF_RUST | DETECTION_TREAT_WHEEL |
            DETECTION_ATTEST_ANOMALY | DETECTION_ATTEST_FORGERY |
            DETECTION_ATTEST_REVOKED | DETECTION_ATTEST_CROSS_SOURCE |
-           DETECTION_ATTEST_SOFTWARE;
+           DETECTION_ATTEST_SOFTWARE | DETECTION_ATTEST_VALIDITY |
+           DETECTION_ATTEST_VERSION | DETECTION_ATTEST_SHAPE |
+           DETECTION_ATTEST_MODULE_HASH;
 }
 
 // Reads the properties the Kotlin cross-source check compares against the

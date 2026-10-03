@@ -20,6 +20,14 @@ data class DetectionResult(
      */
     val warning: Boolean = false,
 
+    /**
+     * The check cannot apply to this device at all, so it is not observable
+     * here. Counted with the privileged-only rows rather than as something
+     * needing review: a stock phone that simply lacks the platform surface a
+     * check needs has nothing for the user to look at.
+     */
+    val notApplicable: Boolean = false,
+
     /** Optional one line of context shown under the check description. */
     val detail: String? = null,
 ) {
@@ -52,6 +60,32 @@ data class DetectionResult(
         const val DETECTION_ATTEST_CROSS_SOURCE = 0x20000
 
         const val DETECTION_ATTEST_SOFTWARE = 0x40000
+
+        /**
+         * Only an inverted or zero-width issuer window sets this bit. An
+         * expired issuer is reported on the same row without setting it: see
+         * ValidityOutcome.
+         */
+        const val DETECTION_ATTEST_VALIDITY = 0x80000
+
+        /**
+         * Row identity only. Nothing sets this bit: see VersionBounds.Verdict
+         * for why neither version arm can convict.
+         */
+        const val DETECTION_ATTEST_VERSION = 0x100000
+
+        /**
+         * A duplicated, never-attested or misplaced authorization tag. Tag
+         * ORDER is reported without setting this: genuine retail devices emit
+         * out-of-order lists.
+         */
+        const val DETECTION_ATTEST_SHAPE = 0x200000
+
+        /**
+         * Row identity only. Nothing sets this bit: see ModuleHash on why a
+         * mismatch cannot convict.
+         */
+        const val DETECTION_ATTEST_MODULE_HASH = 0x400000
 
         private val PRIVILEGED_ONLY = setOf(
             DETECTION_PIF,
@@ -99,9 +133,17 @@ data class DetectionResult(
             Spec(DETECTION_ATTEST_REVOKED, "Keybox Revocation",
                  "Attestation serial checked against Google's published revocation list"),
             Spec(DETECTION_ATTEST_CROSS_SOURCE, "Attestation Cross-Source",
-                 "Attested patch level or verified boot hash disagrees with the device's own sources"),
+                 "Attested patch levels or verified boot hash disagree with the device's own sources, or are malformed"),
             Spec(DETECTION_ATTEST_SOFTWARE, "Software Attestation",
                  "Software-level key attestation on a device presenting as production hardware"),
+            Spec(DETECTION_ATTEST_VALIDITY, "Chain Validity Windows",
+                 "Issuer certificate validity windows, judged without trusting the device clock"),
+            Spec(DETECTION_ATTEST_VERSION, "Attestation Version Bounds",
+                 "Attested schema and KeyMint versions against what this platform can emit"),
+            Spec(DETECTION_ATTEST_SHAPE, "Authorization List Shape",
+                 "Duplicated, never-attested or misplaced tags in the attestation record"),
+            Spec(DETECTION_ATTEST_MODULE_HASH, "Module Hash Cross-Check",
+                 "Attested module hash against the hash the platform reports for its own modules"),
         )
 
         val ALL_FLAGS_MASK: Int = SPECS.fold(0) { acc, s -> acc or s.flag }
@@ -109,6 +151,11 @@ data class DetectionResult(
         fun fromBitmask(
             bitmask: Int,
             revocation: RevocationStatus? = null,
+            crossSource: AttestationAnalysis.CrossSourceVerdict? = null,
+            validity: ValidityStatus? = null,
+            versions: VersionBounds.Verdict? = null,
+            shape: RecordShape.Verdict? = null,
+            moduleHash: ModuleHash.Status? = null,
         ): List<DetectionResult> = SPECS.map { spec ->
             val base = DetectionResult(
                 spec.name,
@@ -117,11 +164,283 @@ data class DetectionResult(
                 bitmask and spec.flag != 0,
                 PRIVILEGED_ONLY.contains(spec.flag)
             )
-            if (spec.flag == DETECTION_ATTEST_REVOKED && revocation != null) {
-                applyRevocation(base, revocation)
-            } else {
-                base
+            when {
+                spec.flag == DETECTION_ATTEST_REVOKED && revocation != null ->
+                    applyRevocation(base, revocation)
+
+                spec.flag == DETECTION_ATTEST_CROSS_SOURCE && crossSource != null ->
+                    applyCrossSource(base, crossSource)
+
+                spec.flag == DETECTION_ATTEST_VALIDITY && validity != null ->
+                    applyValidity(base, validity)
+
+                spec.flag == DETECTION_ATTEST_VERSION && versions != null ->
+                    applyVersions(base, versions)
+
+                spec.flag == DETECTION_ATTEST_SHAPE && shape != null ->
+                    applyShape(base, shape)
+
+                spec.flag == DETECTION_ATTEST_MODULE_HASH && moduleHash != null ->
+                    applyModuleHash(base, moduleHash)
+
+                else -> base
             }
+        }
+
+        private fun applyModuleHash(
+            row: DetectionResult,
+            status: ModuleHash.Status,
+        ): DetectionResult {
+            val km = status.keyMintVersion
+            return when (status.outcome) {
+                ModuleHash.Outcome.MATCHED -> row.copy(
+                    detail = "Attested module hash matches the platform's"
+                )
+
+                ModuleHash.Outcome.MISMATCHED -> row.copy(
+                    warning = true,
+                    detail = "Attested module hash does not match the platform's. A staged " +
+                        "mainline update applied by a userspace reboot produces the same " +
+                        "difference, so this is not by itself evidence about this device."
+                )
+
+                // The tag is OPTIONAL and a known class of vendor KeyMint 4
+                // TAs never implemented it, so absence is permitted.
+                ModuleHash.Outcome.ABSENT -> row.copy(
+                    notApplicable = true,
+                    detail = "This KeyMint ${km ?: "?"} record carries no module hash. The tag " +
+                        "is optional, so its absence is permitted."
+                )
+
+                ModuleHash.Outcome.MALFORMED -> row.copy(
+                    inconclusive = true,
+                    detail = "The attested module hash is not a 32-byte digest, so it was not " +
+                        "compared."
+                )
+
+                ModuleHash.Outcome.UNREADABLE -> row.copy(
+                    inconclusive = true,
+                    detail = "The module hash could not be read, so nothing was compared."
+                )
+
+                ModuleHash.Outcome.NOT_APPLICABLE -> row.copy(
+                    notApplicable = true,
+                    detail = "Needs a KeyMint 4 record and a platform that reports its own " +
+                        "module set, which this device does not provide."
+                )
+            }
+        }
+
+        private fun applyShape(
+            row: DetectionResult,
+            v: RecordShape.Verdict,
+        ): DetectionResult {
+            if (!v.evaluated) {
+                return row.copy(
+                    notApplicable = true,
+                    detail = "No readable hardware-backed, Google-anchored record",
+                )
+            }
+            val reasons = buildList {
+                if (v.duplicateSchemaTag) add("a schema tag appears twice")
+                if (v.neverAttestedTagPresent) add("a tag the schema never attests is present")
+                if (v.hardwareOnlyTagInSoftwareList) {
+                    add("a hardware-enforced-only tag is in the software-enforced list")
+                }
+                if (v.softwareOnlyTagInHardwareList) {
+                    add("a software-enforced-only tag is in the hardware-enforced list")
+                }
+            }
+            val tags = if (v.offendingTags.isEmpty()) {
+                ""
+            } else {
+                " (tags ${v.offendingTags.joinToString(", ")})"
+            }
+            if (reasons.isNotEmpty()) {
+                return row.copy(detail = reasons.joinToString("; ") + tags)
+            }
+
+            // Reported, never findings.
+            val notes = buildList {
+                if (v.listOutOfOrder) {
+                    add("an authorization list is not in ascending tag order, which genuine " +
+                        "retail devices also emit")
+                }
+                if (v.unknownTagPresent) add("a vendor-private or newer tag is present")
+            }
+            // No badge: an out-of-order list is normal on retail devices, so
+            // raising one would move a clean run to Review Needed over
+            // behaviour that is not even unusual.
+            if (notes.isNotEmpty()) {
+                return row.copy(detail = notes.joinToString("; ") + " (reported, not a finding)")
+            }
+            return row.copy(detail = "Both authorization lists are well formed")
+        }
+
+        private fun applyVersions(
+            row: DetectionResult,
+            v: VersionBounds.Verdict,
+        ): DetectionResult {
+            if (!v.evaluated) {
+                return row.copy(
+                    notApplicable = true,
+                    detail = "Not evaluated: there was no readable record to bound",
+                )
+            }
+            val claimed = "schema ${v.attestationVersion ?: "?"}, KeyMint ${v.keymasterVersion ?: "?"}"
+            if (v.aheadOfPlatform) {
+                val b = v.platformBound
+                return row.copy(
+                    warning = true,
+                    detail = "Record claims $claimed, above the most this platform can emit " +
+                        "(schema ${b?.attestation}, KeyMint ${b?.keyMint}). A vendor update " +
+                        "that raises the secure implementation past the system image's own " +
+                        "release reads the same way, so this is not by itself evidence."
+                )
+            }
+            if (v.aheadOfDeclaredHal) {
+                return row.copy(
+                    warning = true,
+                    detail = "Record claims KeyMint ${v.keymasterVersion} while this device's " +
+                        "keystore feature declares ${v.declaredHalVersion}. That can also mean " +
+                        "the vendor's feature declaration is mis-pinned, so it is not by itself " +
+                        "evidence about this device."
+                )
+            }
+            if (v.platformBound == null) {
+                return row.copy(
+                    notApplicable = true,
+                    detail = "No bound known for this platform, so nothing was judged",
+                )
+            }
+            return row.copy(detail = "Record claims $claimed, within this platform's bound")
+        }
+
+        private fun applyValidity(
+            row: DetectionResult,
+            status: ValidityStatus,
+        ): DetectionResult {
+            val offender = status.offenderSubject?.let { " ($it)" } ?: ""
+            return when (status.outcome) {
+                ValidityOutcome.IMPOSSIBLE_WINDOW -> row.copy(
+                    detail = "An issuer certificate's validity window starts at or after it " +
+                        "ends$offender. No certificate authority emits that."
+                )
+
+                ValidityOutcome.EXPIRED_ISSUER -> row.copy(
+                    warning = true,
+                    detail = "An issuer certificate lapsed " +
+                        "${status.daysPastFloor ?: 0} days before the earliest time this " +
+                        "device can prove has passed$offender. Google documents expired " +
+                        "factory attestation keys as still trustworthy, and batch " +
+                        "certificates are shared across a production run, so this is not by " +
+                        "itself evidence about this device."
+                )
+
+                ValidityOutcome.RECENTLY_EXPIRED -> row.copy(
+                    inconclusive = true,
+                    detail = "An issuer certificate lapsed only recently$offender, which a " +
+                        "provisioned certificate lagging a rotation also does. Not called."
+                )
+
+                // A wrong device clock is a condition of the device, not an
+                // observation about the chain, and two of three genuine test
+                // handsets have one. It must not turn the card amber.
+                ValidityOutcome.CLOCK_BEHIND -> row.copy(
+                    notApplicable = true,
+                    detail = "The device clock is behind the earliest time this device can " +
+                        "prove has passed, so the windows cannot be judged."
+                )
+
+                ValidityOutcome.NO_REFERENCE -> row.copy(
+                    notApplicable = true,
+                    detail = "No clock-independent reference was available, so nothing was judged."
+                )
+
+                ValidityOutcome.NOT_APPLICABLE -> row.copy(
+                    notApplicable = true,
+                    detail = "No issuer windows to judge against a reference. An inverted " +
+                        "window would still have been reported."
+                )
+
+                ValidityOutcome.NOT_EVALUATED -> row.copy(
+                    notApplicable = true,
+                    detail = "Not evaluated: there was no chain to examine"
+                )
+
+                ValidityOutcome.VERIFIED -> row.copy(
+                    detail = "Issuer windows are consistent and none has lapsed"
+                )
+            }
+        }
+
+        private fun applyCrossSource(
+            row: DetectionResult,
+            v: AttestationAnalysis.CrossSourceVerdict,
+        ): DetectionResult {
+            if (!v.evaluated) {
+                return row.copy(
+                    notApplicable = true,
+                    detail = "No hardware-backed, Google-anchored chain to compare against",
+                )
+            }
+            return row.copy(detail = crossSourceDetail(v))
+        }
+
+        /**
+         * The reasons, or a readout when there is nothing to report. The
+         * report-only arms deliberately do not set `warning` either: on this
+         * row an observation that cannot convict belongs in the detail, and
+         * raising the badge would move the whole run to Review Needed.
+         */
+        private fun crossSourceDetail(
+            v: AttestationAnalysis.CrossSourceVerdict,
+        ): String? {
+            val reasons = buildList {
+                if (v.osPatchAhead) {
+                    add("attested OS patch level is newer than the device property")
+                }
+                if (v.osPatchDisagrees) {
+                    add("attested OS patch level does not equal the device property " +
+                        "on a locked, verified device")
+                }
+                if (v.malformedDayPrecisionPatchLevel) {
+                    add("a day-precision patch level is neither a valid date nor a month")
+                }
+                if (v.bootHashMismatch) {
+                    add("attested verified boot hash does not match the device's vbmeta digest")
+                }
+            }
+            if (reasons.isNotEmpty()) return reasons.joinToString("; ")
+
+            // Reported, never findings. The vendor arms need
+            // ro.vendor.build.security_patch, whose readability is a per-vendor
+            // sepolicy decision: measured empty on a Pixel 7a and a moto g04
+            // and readable on a Samsung SM-G780G. An arm that is live on some
+            // vendors and dead on others cannot carry a verdict.
+            val notes = buildList {
+                if (v.vendorPatchAhead) {
+                    add("attested vendor patch level is newer than the device property")
+                }
+                if (v.vendorPatchCopiedFromSystemProperty) {
+                    add("attested vendor patch level matches the system patch property, " +
+                        "not the vendor one")
+                }
+                if (v.monthPrecisionDayLevel) {
+                    add("a day-precision patch level carries only a month")
+                }
+                if (v.bootPatchLevelMissing) {
+                    add("boot patch level is absent although KeyMint 3 requires it")
+                }
+            }
+            if (notes.isNotEmpty()) return notes.joinToString("; ") + " (reported, not a finding)"
+            if (v.attestedBootHashUnusable) {
+                return "The attested verified boot hash carries no usable digest: it is all " +
+                    "zeroes, or not 32 bytes long. That is what an implementation emits when " +
+                    "it could not read the device's digest, so it is not evidence."
+            }
+            val boot = v.attestedBootPatchLevel
+            return if (boot != null) "Attested boot patch level $boot" else null
         }
 
         private fun applyRevocation(
@@ -145,7 +464,7 @@ data class DetectionResult(
             )
 
             RevocationOutcome.NOT_APPLICABLE -> row.copy(
-                inconclusive = true,
+                notApplicable = true,
                 detail = "No Google-anchored attestation chain to check"
             )
 

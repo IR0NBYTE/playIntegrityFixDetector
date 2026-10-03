@@ -50,11 +50,16 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
             val (textRes, colorRes, iconRes) = when {
                 result.detected ->
                     Triple(R.string.result_status_detected, R.color.status_fail, R.drawable.ic_warning)
+                // A generic badge: five rows now use the warning state and the
+                // revocation-specific wording was wrong on four of them. Each
+                // row's detail says what was observed.
                 result.warning ->
-                    Triple(R.string.result_status_listed, R.color.status_warn, R.drawable.ic_warning)
+                    Triple(R.string.result_status_reported, R.color.status_warn, R.drawable.ic_warning)
                 result.inconclusive ->
                     Triple(R.string.result_status_unverified, R.color.status_warn, R.drawable.ic_info)
-                result.privilegedOnly ->
+                // A check that cannot apply to this device is as unobservable
+                // here as a privileged-only one, and must not read as a pass.
+                result.privilegedOnly || result.notApplicable ->
                     Triple(R.string.result_status_unobservable, R.color.text_secondary, R.drawable.ic_info)
                 else ->
                     Triple(R.string.result_status_pass, R.color.status_pass, R.drawable.ic_check)

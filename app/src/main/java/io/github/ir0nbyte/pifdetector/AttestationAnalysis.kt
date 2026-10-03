@@ -146,7 +146,10 @@ object AttestationAnalysis {
      * lookup into a list they fully control while a strict verifier still reads
      * the real one.
      */
-    private fun hardwareEnforcedList(extensionValue: ByteArray): ByteArray? {
+    private fun hardwareEnforcedList(extensionValue: ByteArray): ByteArray? =
+        authorizationList(extensionValue, HARDWARE_ENFORCED_INDEX)
+
+    private fun authorizationList(extensionValue: ByteArray, listIndex: Int): ByteArray? {
         val unwrapped = readSingleOctetStringContent(extensionValue) ?: return null
         val r = Asn1Reader(unwrapped)
         val seqTag = r.readTag()
@@ -161,7 +164,7 @@ object AttestationAnalysis {
             val len = inner.readLength()
             val start = inner.pos
             inner.pos = start + len
-            if (index == HARDWARE_ENFORCED_INDEX) {
+            if (index == listIndex) {
                 found = unwrapped.copyOfRange(start, start + len)
             }
             index++
@@ -208,6 +211,9 @@ object AttestationAnalysis {
     const val TAG_VENDOR_PATCH_LEVEL = 718
     const val TAG_BOOT_PATCH_LEVEL = 719
 
+    /** moduleHash, KeyMint 4.0. AOSP and CTS place it in the software-enforced list. */
+    const val TAG_MODULE_HASH = 724
+
     /** Properties read from the device itself, for comparison against attestation. */
     data class DeviceFacts(
         val systemSecurityPatch: String?,
@@ -224,22 +230,60 @@ object AttestationAnalysis {
         val osPatchAhead: Boolean,
         val vendorPatchAhead: Boolean,
         val bootHashMismatch: Boolean,
+        val osPatchDisagrees: Boolean = false,
+        val vendorPatchCopiedFromSystemProperty: Boolean = false,
+        val malformedDayPrecisionPatchLevel: Boolean = false,
+        val bootPatchLevelMissing: Boolean = false,
+        val attestedBootHashUnusable: Boolean = false,
+        val monthPrecisionDayLevel: Boolean = false,
+        val attestedBootPatchLevel: Long? = null,
+        val attestedVendorPatchLevel: Long? = null,
+        /** False when there was no hardware-backed, Google-anchored chain to compare. */
+        val evaluated: Boolean = true,
     ) {
         /**
-         * Only the patch-level arms drive a verdict.
+         * Four arms drive the verdict: the OS patch level being newer than the
+         * property, the two levels disagreeing behind the strict gate, the boot
+         * hash differing when both sides are real digests, and a day-00 patch
+         * level. Five arms deliberately do not: the two vendor arms, the absent boot patch
+         * level, a month-precision day field, and an attested boot hash that
+         * carries no usable digest.
          *
-         * The attested verifiedBootHash matching ro.boot.vbmeta.digest is an
-         * implementation detail of a given bootloader and KeyMint pair, not a
-         * CDD guarantee: a bootloader may export a digest over the top-level
-         * vbmeta while KeyMint attests one over the full chained set. It has so
-         * far only been confirmed equal on one device family, so it is computed
-         * and reported but does not flag on its own. Promote it once it is
-         * confirmed on non-Pixel hardware.
+         * The two VENDOR arms cannot evaluate on a normal install:
+         * ro.vendor.build.security_patch is vendor_security_patch_level_prop,
+         * which system/sepolicy grants to vendor_init, keystore and shell only,
+         * while ro.build.version.security_patch is build_prop and readable by
+         * every domain. A finding must never depend on a value only a
+         * privileged process can read, so the vendor comparisons are computed
+         * for the readout and excluded here.
+         *
+         * bootPatchLevelMissing is excluded because no test target available to
+         * this project can validate it positively: VTS requires tag 719 by
+         * default, but --skip_boot_pl_check exists, the one genuine device has
+         * the tag, and both emulators are excluded at the gate.
+         *
+         * monthPrecisionDayLevel is excluded because an OEM TA that tracks the
+         * vendor or boot partition at month granularity is sloppy, not a
+         * spoofer. Only a value that is neither a valid YYYYMMDD nor a valid
+         * YYYYMM reaches malformedDayPrecisionPatchLevel.
+         *
+         * The boot-hash arm does drive the verdict. VTS verify_root_of_trust
+         * asserts the attested hash equals ro.boot.vbmeta.digest whenever AVB
+         * verification is enabled, and the arm only evaluates when the device's
+         * own digest is usable and the algorithm really is sha256.
          */
-        val anyMismatch: Boolean get() = osPatchAhead || vendorPatchAhead
+        val anyMismatch: Boolean get() =
+            osPatchAhead || osPatchDisagrees || bootHashMismatch ||
+                malformedDayPrecisionPatchLevel
 
         companion object {
             val NONE = CrossSourceVerdict(false, false, false)
+
+            /**
+             * No chain worth comparing. Not a pass: the row reads as not
+             * observable on this device, which keeps it out of the review count.
+             */
+            val NOT_EVALUATED = CrossSourceVerdict(false, false, false, evaluated = false)
         }
     }
 
@@ -247,6 +291,85 @@ object AttestationAnalysis {
      * Reads a hardware-enforced INTEGER tag from the authorization list. The
      * EXPLICIT tag's content is a whole INTEGER TLV, so one TLV is read from it.
      */
+    /**
+     * The tag numbers of an authorization list, in the order the record emits
+     * them. Null when the list cannot be read, or when any child is not a
+     * canonically encoded context-specific constructed tag, because a verdict
+     * about shape must not be drawn from bytes that did not parse cleanly.
+     */
+    fun authorizationListTags(extensionValue: ByteArray, listIndex: Int): List<Int>? {
+        return try {
+            val list = authorizationList(extensionValue, listIndex) ?: return null
+            val r = Asn1Reader(list)
+            val tags = ArrayList<Int>()
+            while (r.hasMore()) {
+                val tag = r.readTag()
+                val len = r.readLength()
+                r.pos += len
+                val n = decodeContextConstructedTag(tag) ?: return null
+                tags.add(n)
+            }
+            tags
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * An OCTET STRING tag from the software-enforced list. Goes through the
+     * same eight-member KeyDescription guard as the hardware-enforced path, so
+     * a record with a different member count yields nothing.
+     */
+    fun parseSoftwareEnforcedOctetString(extensionValue: ByteArray, tagNo: Int): ByteArray? {
+        return try {
+            val list = authorizationList(extensionValue, SOFTWARE_ENFORCED_INDEX) ?: return null
+            val content = findTopLevelTaggedContent(list, contextConstructedTag(tagNo))
+                ?: return null
+            val r = Asn1Reader(content)
+            val tag = r.readTag()
+            if (tag.size != 1 || (tag[0].toInt() and 0xFF) != TAG_OCTET_STRING) return null
+            val len = r.readLength()
+            if (r.pos + len > content.size) return null
+            content.copyOfRange(r.pos, r.pos + len)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun parseAttestedModuleHash(extensionValue: ByteArray): ByteArray? =
+        parseSoftwareEnforcedOctetString(extensionValue, TAG_MODULE_HASH)
+
+    fun hardwareEnforcedTags(extensionValue: ByteArray): List<Int>? =
+        authorizationListTags(extensionValue, HARDWARE_ENFORCED_INDEX)
+
+    fun softwareEnforcedTags(extensionValue: ByteArray): List<Int>? =
+        authorizationListTags(extensionValue, SOFTWARE_ENFORCED_INDEX)
+
+    /**
+     * The inverse of contextConstructedTag. Rejects a non-minimal encoding: a
+     * leading continuation byte of zero, or the high-tag-number form used for a
+     * number the low form can carry. Either is a hand-built encoding.
+     */
+    internal fun decodeContextConstructedTag(tag: ByteArray): Int? {
+        if (tag.isEmpty()) return null
+        val first = tag[0].toInt() and 0xFF
+        if (first and 0xE0 != 0xA0) return null
+        if (first and 0x1F != 0x1F) {
+            return if (tag.size == 1) first and 0x1F else null
+        }
+        if (tag.size < 2 || tag.size > 5) return null
+        if ((tag[1].toInt() and 0x7F) == 0) return null
+        var v = 0
+        for (i in 1 until tag.size) {
+            val b = tag[i].toInt() and 0xFF
+            v = (v shl 7) or (b and 0x7F)
+            val last = i == tag.size - 1
+            if (last != ((b and 0x80) == 0)) return null
+        }
+        if (v < 0x1F) return null
+        return v
+    }
+
     fun parseHardwareEnforcedInteger(extensionValue: ByteArray, tagNo: Int): Long? {
         return try {
             val hardwareEnforced = hardwareEnforcedList(extensionValue) ?: return null
@@ -341,30 +464,152 @@ object AttestationAnalysis {
         return attested > fromProperty
     }
 
+    /**
+     * Tags 718 and 719 are specified as YYYYMMDD. Null means the value is not a
+     * valid calendar date, which is itself a signal; the caller decides.
+     *
+     * normalizeAttestedPatchToYearMonth is deliberately NOT tightened to reject
+     * an 8-digit osPatchLevel: it accepts both forms today, no observed emitter
+     * produces an 8-digit tag 706, and changing it would ripple into the
+     * existing ahead-only arm and its tests.
+     */
+    fun normalizeAttestedPatchToYearMonthDay(raw: Long?): Int? {
+        if (raw == null) return null
+        if (raw < 20080101L || raw > 20991231L) return null
+        val v = raw.toInt()
+        val month = (v / 100) % 100
+        val day = v % 100
+        if (month !in 1..12) return null
+        if (day !in 1..31) return null
+        return v
+    }
+
+    /**
+     * Mirrors AOSP's own property regex, ^([0-9]{4})-([0-9]{2})-([0-9]{2})$,
+     * from keymaster_configuration.cpp. Anything the HAL would have parsed as 0
+     * must come back null here, or we would compare a value we invented against
+     * a value the HAL never had. Do not reuse the lenient year-month parser for
+     * the day-precision arms.
+     */
+    fun normalizePropertyPatchToYearMonthDay(value: String?): Int? {
+        if (value == null || value.length != 10) return null
+        if (value[4] != '-' || value[7] != '-') return null
+        for (i in intArrayOf(0, 1, 2, 3, 5, 6, 8, 9)) if (!value[i].isDigit()) return null
+        val raw = (value.substring(0, 4) + value.substring(5, 7) + value.substring(8, 10))
+            .toLongOrNull() ?: return null
+        return normalizeAttestedPatchToYearMonthDay(raw)
+    }
+
+    /**
+     * Narrow on purpose: an 8-digit value carrying a real year and a real month
+     * but a day of 00, and nothing else.
+     *
+     * That exact shape has a named emitter on the bypass side, where a
+     * month-granular config value is multiplied out to the long form, and
+     * AOSP's own GetPatchlevel cannot produce it because its regex requires a
+     * two-digit day drawn from a real date.
+     *
+     * Every other non-date shape is forgiven and reported instead: a bare
+     * YYYYMM, a zero-padded year like 20250000, and anything else unparseable.
+     * An OEM that tracks a partition at coarser than day granularity is
+     * non-conforming rather than dishonest, and no measurement was available to
+     * show which forms genuine vendors emit.
+     */
+    fun dayPrecisionPatchIsImpossible(raw: Long?): Boolean {
+        if (raw == null || raw <= 0L) return false
+        if (normalizeAttestedPatchToYearMonthDay(raw) != null) return false
+        if (raw !in 20080000L..20991299L) return false
+        val v = raw.toInt()
+        val month = (v / 100) % 100
+        val day = v % 100
+        return month in 1..12 && day == 0
+    }
+
+    /**
+     * A day-precision tag carrying something coarser than a day: a bare YYYYMM,
+     * or an 8-digit form that is not a date and is not the day-00 shape above.
+     * Reported, never a finding.
+     */
+    fun dayPrecisionPatchIsMonthOnly(raw: Long?): Boolean {
+        if (raw == null || raw <= 0L) return false
+        if (normalizeAttestedPatchToYearMonthDay(raw) != null) return false
+        return !dayPrecisionPatchIsImpossible(raw)
+    }
+
+    /**
+     * Equality is what VTS asserts, so either direction of inequality is a
+     * finding. Only safe behind a locked-and-verified gate: see the note on
+     * strictPatchEquality in KeyAttestationProbe.
+     */
+    fun patchLevelsDisagree(attested: Int?, fromProperty: Int?): Boolean {
+        if (attested == null || fromProperty == null) return false
+        return attested != fromProperty
+    }
+
+
+    private fun usablePropertyDigest(
+        propertyDigestHex: String?,
+        propertyHashAlg: String?,
+    ): ByteArray? {
+        if (!"sha256".equals(propertyHashAlg?.trim(), ignoreCase = true)) return null
+        val hex = propertyDigestHex?.trim() ?: return null
+        if (hex.length != SHA256_BYTES * 2) return null
+        if (!hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return null
+        val decoded = ByteArray(SHA256_BYTES) { i ->
+            ((Character.digit(hex[i * 2], 16) shl 4) or
+                Character.digit(hex[i * 2 + 1], 16)).toByte()
+        }
+        // An all-zero property means the DEVICE has no digest, which is no
+        // evidence about the record.
+        if (decoded.all { it.toInt() == 0 }) return null
+        return decoded
+    }
+
+    /**
+     * A finding only when BOTH sides are real 32-byte digests and they differ.
+     *
+     * An earlier revision treated an all-zero or odd-length attested hash as a
+     * contradiction, on the reasoning that ro.boot.vbmeta.digest is readable by
+     * every SELinux domain so a conforming implementation has no excuse. That
+     * overreached: all-zero is what AOSP emits when the implementation could
+     * not read the property for any reason, and an unexpected length is an
+     * encoding this code does not know. Neither is evidence about the device,
+     * and no measurement was available to show a genuine device cannot produce
+     * them. Both are reported through attestedBootHashUnusable and
+     * the row detail instead.
+     *
+     * The equality itself is sound: VTS verify_root_of_trust asserts it
+     * whenever AVB verification is enabled, and it holds exactly on all three
+     * measured devices across three vendors.
+     */
     fun verifiedBootHashMismatch(
         attestedHash: ByteArray?,
         propertyDigestHex: String?,
         propertyHashAlg: String?,
     ): Boolean {
         return try {
-            if (!"sha256".equals(propertyHashAlg?.trim(), ignoreCase = true)) return false
-            if (attestedHash == null || attestedHash.size != SHA256_BYTES) return false
+            val decoded = usablePropertyDigest(propertyDigestHex, propertyHashAlg) ?: return false
+            if (attestedHash == null) return false
+            if (attestedHash.size != SHA256_BYTES) return false
             if (attestedHash.all { it.toInt() == 0 }) return false
-
-            val hex = propertyDigestHex?.trim() ?: return false
-            if (hex.length != SHA256_BYTES * 2) return false
-            if (!hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return false
-
-            val decoded = ByteArray(SHA256_BYTES) { i ->
-                ((Character.digit(hex[i * 2], 16) shl 4) or
-                    Character.digit(hex[i * 2 + 1], 16)).toByte()
-            }
-            if (decoded.all { it.toInt() == 0 }) return false
-
             !attestedHash.contentEquals(decoded)
         } catch (_: Throwable) {
             false
         }
+    }
+
+    /**
+     * The attested hash is present but carries no usable digest: all zeroes, or
+     * not 32 bytes long. That is what an implementation emits when it could not
+     * read the device's own digest.
+     *
+     * Deliberately says nothing about the property side. An earlier name
+     * claimed both sources were absent, which the body never checked and which
+     * is false whenever the device's own digest is perfectly readable.
+     */
+    fun attestedBootHashUnusable(attestedHash: ByteArray?): Boolean {
+        if (attestedHash == null) return false
+        return attestedHash.size != SHA256_BYTES || attestedHash.all { it.toInt() == 0 }
     }
 
     /**
@@ -374,26 +619,64 @@ object AttestationAnalysis {
     fun crossSourceMismatch(
         extensionValue: ByteArray,
         facts: DeviceFacts,
+        strictPatchEquality: Boolean = false,
     ): CrossSourceVerdict {
         return try {
-            val osAhead = attestedPatchIsAheadOfProperty(
-                normalizeAttestedPatchToYearMonth(
-                    parseHardwareEnforcedInteger(extensionValue, TAG_OS_PATCH_LEVEL)
+            val osRaw = parseHardwareEnforcedInteger(extensionValue, TAG_OS_PATCH_LEVEL)
+            val vendorRaw = parseHardwareEnforcedInteger(extensionValue, TAG_VENDOR_PATCH_LEVEL)
+            val bootRaw = parseHardwareEnforcedInteger(extensionValue, TAG_BOOT_PATCH_LEVEL)
+
+            val osYm = normalizeAttestedPatchToYearMonth(osRaw)
+            val sysPropYm = normalizePropertyPatchToYearMonth(facts.systemSecurityPatch)
+            val venPropYm = normalizePropertyPatchToYearMonth(facts.vendorSecurityPatch)
+            val sysPropYmd = normalizePropertyPatchToYearMonthDay(facts.systemSecurityPatch)
+            val venPropYmd = normalizePropertyPatchToYearMonthDay(facts.vendorSecurityPatch)
+            val vendorYmd = normalizeAttestedPatchToYearMonthDay(vendorRaw)
+            val attVer = parseAttestationVersion(extensionValue)
+            val attHash = parseVerifiedBootHash(extensionValue)
+
+            // The older direction additionally requires Keymaster 4.0 or later.
+            // On Keymaster 2 and 3 the TA receives os_patchlevel from the
+            // bootloader via SetBootParams rather than from the HAL's
+            // Configure() call, so a boot image left at an older level than the
+            // system partition makes a genuine, locked, green device read as
+            // behind. Those devices are inside minSdk 24 and anchor to the same
+            // pinned root, so strictPatchEquality alone does not exclude them.
+            val configureSourcedPatchLevel = attVer != null && attVer >= ATTESTATION_VERSION_KEYMASTER_4
+
+            CrossSourceVerdict(
+                // Ungated on purpose. CTS forbids an attested level NEWER than
+                // the property in every configuration, including the GSI
+                // carve-out, which relaxes only the other direction.
+                osPatchAhead = attestedPatchIsAheadOfProperty(osYm, sysPropYm),
+                vendorPatchAhead = attestedPatchIsAheadOfProperty(
+                    normalizeAttestedPatchToYearMonth(vendorRaw), venPropYm
                 ),
-                normalizePropertyPatchToYearMonth(facts.systemSecurityPatch),
-            )
-            val vendorAhead = attestedPatchIsAheadOfProperty(
-                normalizeAttestedPatchToYearMonth(
-                    parseHardwareEnforcedInteger(extensionValue, TAG_VENDOR_PATCH_LEVEL)
+                // Gated like the OS equality arm. The VTS assertion behind this
+                // comparison holds where AVB verification is enabled, so a
+                // device whose own record says it is not verified is not a
+                // device this arm can speak about.
+                bootHashMismatch = strictPatchEquality && verifiedBootHashMismatch(
+                    attHash, facts.vbmetaDigestHex, facts.vbmetaHashAlg
                 ),
-                normalizePropertyPatchToYearMonth(facts.vendorSecurityPatch),
+                osPatchDisagrees = strictPatchEquality && configureSourcedPatchLevel &&
+                    patchLevelsDisagree(osYm, sysPropYm),
+                vendorPatchCopiedFromSystemProperty =
+                    sysPropYmd != null && venPropYmd != null && sysPropYmd != venPropYmd &&
+                        vendorYmd != null && vendorYmd == sysPropYmd,
+                malformedDayPrecisionPatchLevel =
+                    dayPrecisionPatchIsImpossible(vendorRaw) ||
+                        dayPrecisionPatchIsImpossible(bootRaw),
+                monthPrecisionDayLevel =
+                    dayPrecisionPatchIsMonthOnly(vendorRaw) ||
+                        dayPrecisionPatchIsMonthOnly(bootRaw),
+                bootPatchLevelMissing =
+                    attVer != null && attVer >= ATTESTATION_VERSION_KEYMINT_3 &&
+                        vendorRaw != null && bootRaw == null,
+                attestedBootHashUnusable = attestedBootHashUnusable(attHash),
+                attestedBootPatchLevel = bootRaw,
+                attestedVendorPatchLevel = vendorRaw,
             )
-            val hashMismatch = verifiedBootHashMismatch(
-                parseVerifiedBootHash(extensionValue),
-                facts.vbmetaDigestHex,
-                facts.vbmetaHashAlg,
-            )
-            CrossSourceVerdict(osAhead, vendorAhead, hashMismatch)
         } catch (_: Throwable) {
             CrossSourceVerdict.NONE
         }
@@ -417,7 +700,15 @@ object AttestationAnalysis {
         }
     }
 
-    fun parseAttestationChallenge(extensionValue: ByteArray): ByteArray? {
+    /**
+     * The nth immediate child of KeyDescription, as (singleByteTag, content).
+     *
+     * Deliberately does NOT enforce the member count. hardwareEnforcedList does,
+     * because addressing the last child is what a crafted record can shift; the
+     * two parsers below address a fixed low index, where an appended member
+     * cannot move the field they want.
+     */
+    private fun keyDescriptionChild(extensionValue: ByteArray, index: Int): Pair<Int, ByteArray>? {
         return try {
             val unwrapped = readSingleOctetStringContent(extensionValue) ?: return null
             val r = Asn1Reader(unwrapped)
@@ -425,20 +716,17 @@ object AttestationAnalysis {
             if (seqTag.size != 1 || (seqTag[0].toInt() and 0xFF) != TAG_SEQUENCE) return null
             val seqLen = r.readLength()
             val inner = Asn1Reader(unwrapped, r.pos, r.pos + seqLen)
-            var index = 0
+            var i = 0
             while (inner.hasMore()) {
                 val tag = inner.readTag()
                 val len = inner.readLength()
                 val start = inner.pos
                 inner.pos = start + len
-                if (index == ATTESTATION_CHALLENGE_INDEX) {
-                    return if (tag.size == 1 && (tag[0].toInt() and 0xFF) == TAG_OCTET_STRING) {
-                        unwrapped.copyOfRange(start, start + len)
-                    } else {
-                        null
-                    }
+                if (i == index) {
+                    val tagByte = if (tag.size == 1) tag[0].toInt() and 0xFF else -1
+                    return tagByte to unwrapped.copyOfRange(start, start + len)
                 }
-                index++
+                i++
             }
             null
         } catch (_: Throwable) {
@@ -446,35 +734,40 @@ object AttestationAnalysis {
         }
     }
 
+    /**
+     * KeyDescription.keymasterVersion, child index 2. This is the TA's own
+     * version, distinct from attestationVersion, which versions the record
+     * schema. Schema v1 has seven members and still carries this at index 2, so
+     * the fixed low index resolves on every generation.
+     */
+    fun parseKeymasterVersion(extensionValue: ByteArray): Int? =
+        parseKeyDescriptionInteger(extensionValue, KEYMASTER_VERSION_INDEX)
+
+    /** KeyDescription.attestationVersion. 1..4 are Keymaster, 100 and up are KeyMint. */
+    fun parseAttestationVersion(extensionValue: ByteArray): Int? =
+        parseKeyDescriptionInteger(extensionValue, ATTESTATION_VERSION_INDEX)
+
+    private fun parseKeyDescriptionInteger(extensionValue: ByteArray, index: Int): Int? {
+        val (tagByte, content) = keyDescriptionChild(extensionValue, index) ?: return null
+        if (tagByte != TAG_INTEGER) return null
+        if (content.isEmpty() || content.size > 4) return null
+        if ((content[0].toInt() and 0x80) != 0) return null
+        var v = 0
+        for (b in content) v = (v shl 8) or (b.toInt() and 0xFF)
+        return v
+    }
+
+    fun parseAttestationChallenge(extensionValue: ByteArray): ByteArray? {
+        val (tagByte, content) =
+            keyDescriptionChild(extensionValue, ATTESTATION_CHALLENGE_INDEX) ?: return null
+        return if (tagByte == TAG_OCTET_STRING) content else null
+    }
+
     fun parseAttestationSecurityLevel(extensionValue: ByteArray): Int? {
-        return try {
-            val unwrapped = readSingleOctetStringContent(extensionValue) ?: return null
-            val r = Asn1Reader(unwrapped)
-            val seqTag = r.readTag()
-            if (seqTag.size != 1 || (seqTag[0].toInt() and 0xFF) != TAG_SEQUENCE) return null
-            val seqLen = r.readLength()
-            val inner = Asn1Reader(unwrapped, r.pos, r.pos + seqLen)
-            var index = 0
-            while (inner.hasMore()) {
-                val tag = inner.readTag()
-                val len = inner.readLength()
-                val start = inner.pos
-                inner.pos = start + len
-                if (index == ATTESTATION_SECURITY_LEVEL_INDEX) {
-                    return if (tag.size == 1 &&
-                        (tag[0].toInt() and 0xFF) == TAG_ENUMERATED && len >= 1
-                    ) {
-                        unwrapped[start].toInt() and 0xFF
-                    } else {
-                        null
-                    }
-                }
-                index++
-            }
-            null
-        } catch (_: Throwable) {
-            null
-        }
+        val (tagByte, content) =
+            keyDescriptionChild(extensionValue, ATTESTATION_SECURITY_LEVEL_INDEX) ?: return null
+        if (tagByte != TAG_ENUMERATED || content.isEmpty()) return null
+        return content[0].toInt() and 0xFF
     }
 
     fun parseRootOfTrust(extensionValue: ByteArray): RootOfTrust? {
@@ -502,10 +795,23 @@ object AttestationAnalysis {
 
     private const val KEY_DESCRIPTION_CHILDREN = 8
     private const val HARDWARE_ENFORCED_INDEX = 7
+    private const val SOFTWARE_ENFORCED_INDEX = 6
     private const val SHA256_BYTES = 32
 
     private const val ATTESTATION_CHALLENGE_INDEX = 4
     private const val ATTESTATION_SECURITY_LEVEL_INDEX = 1
+    private const val ATTESTATION_VERSION_INDEX = 0
+    private const val KEYMASTER_VERSION_INDEX = 2
+
+    /** KeyMint 3.0, the first release whose VTS requires a boot patch level. */
+    const val ATTESTATION_VERSION_KEYMINT_3 = 300
+
+    /**
+     * Keymaster 4.0, the generation from which the HAL's Configure() call feeds
+     * the TA's patch level from the system property. 1 and 2 are Keymaster 2.0
+     * and 3.0, 3 is 4.0, 4 is 4.1, and 100 upward are KeyMint.
+     */
+    const val ATTESTATION_VERSION_KEYMASTER_4 = 3
 
     const val SECURITY_LEVEL_SOFTWARE = 0
     const val SECURITY_LEVEL_TRUSTED_ENVIRONMENT = 1

@@ -8,7 +8,7 @@ class DetectionResultTest {
     @Test
     fun cleanBitmaskReturnsAllPass() {
         val results = DetectionResult.fromBitmask(0)
-        assertEquals(19, results.size)
+        assertEquals(23, results.size)
         assertTrue(results.none { it.detected })
     }
 
@@ -76,11 +76,12 @@ class DetectionResultTest {
     }
 
     @Test
-    fun notApplicableRevocationIsInconclusive() {
+    fun notApplicableRevocationIsUnobservableNotUnresolved() {
         val row = DetectionResult.fromBitmask(0, RevocationStatus.NOT_APPLICABLE)
             .single { it.flag == DetectionResult.DETECTION_ATTEST_REVOKED }
         assertTrue(!row.detected)
-        assertTrue(row.inconclusive)
+        assertTrue(row.notApplicable)
+        assertTrue(!row.inconclusive)
     }
 
     @Test
