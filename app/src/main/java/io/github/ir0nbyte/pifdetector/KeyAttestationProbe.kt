@@ -14,7 +14,16 @@ class KeyAttestationProbe {
 
     private class AttestedKey(val chain: List<X509Certificate>, val challenge: ByteArray)
 
-    data class ProbeOutcome(val mask: Int, val revocation: RevocationStatus)
+    data class ProbeOutcome(
+        val mask: Int,
+        val revocation: RevocationStatus,
+        val crossSource: AttestationAnalysis.CrossSourceVerdict =
+            AttestationAnalysis.CrossSourceVerdict.NOT_EVALUATED,
+        val validity: ValidityStatus = ValidityStatus.NOT_EVALUATED,
+        val versions: VersionBounds.Verdict = VersionBounds.Verdict.NOT_EVALUATED,
+        val shape: RecordShape.Verdict = RecordShape.Verdict.NOT_EVALUATED,
+        val moduleHash: ModuleHash.Status = ModuleHash.Status.NOT_APPLICABLE,
+    )
 
     /**
      * The probe runs in two parts.
@@ -61,6 +70,8 @@ class KeyAttestationProbe {
                 return anomaly()
             }
 
+            val rot = AttestationAnalysis.parseRootOfTrust(extValue)
+
             // Accumulate phase. Every check below runs regardless of the others.
             var mask = 0
 
@@ -78,10 +89,29 @@ class KeyAttestationProbe {
 
             // A KeyMint simulator keeps its own record consistent but does not
             // also control the device's properties.
-            if (hardwareBacked && googleAnchored &&
-                AttestationAnalysis.crossSourceMismatch(extValue, facts).anyMismatch
-            ) {
-                mask = mask or DetectionResult.DETECTION_ATTEST_CROSS_SOURCE
+            //
+            // strictPatchEquality turns on the arms where ANY disagreement is a
+            // finding rather than only an attested level that is newer. The
+            // locked-and-Verified terms are what exclude the GSI class: CTS
+            // relaxes os-patch-level equality on a GSI image (b/168663786,
+            // KeyAttestationTest.checkSystemPatchLevel) because a newer system
+            // image over an older OEM vbmeta legitimately reads as older, and a
+            // GSI requires an unlocked bootloader.
+            val strictPatchEquality = rot != null &&
+                rot.deviceLocked &&
+                rot.verifiedBootState == AttestationAnalysis.VERIFIED_BOOT_STATE_VERIFIED &&
+                DeviceIdentity.presentsAsPhysicalHardware(presentation)
+
+            // A closed gate is reported as not evaluated, never as a pass: there
+            // was no hardware-backed, Google-anchored chain to compare against.
+            var crossSource = AttestationAnalysis.CrossSourceVerdict.NOT_EVALUATED
+            if (hardwareBacked && googleAnchored) {
+                val verdict =
+                    AttestationAnalysis.crossSourceMismatch(extValue, facts, strictPatchEquality)
+                crossSource = verdict
+                if (verdict.anyMismatch) {
+                    mask = mask or DetectionResult.DETECTION_ATTEST_CROSS_SOURCE
+                }
             }
 
             // Revocation deliberately sets no detection bit.
@@ -97,7 +127,79 @@ class KeyAttestationProbe {
             // row instead, where the user can weigh it.
             val revocation = evaluateRevocation(chain, googleAnchored, onlineRefreshEnabled, context)
 
-            val rot = AttestationAnalysis.parseRootOfTrust(extValue)
+            // Judged without trusting the device clock. Only an inverted window
+            // sets a bit; an expired issuer is reported with the shared-batch
+            // caveat, on the same reasoning that keeps revocation off the
+            // verdict.
+            val validity = ChainValidity.evaluate(
+                chain = chain,
+                pinnedRoots = AttestationRoots.pinnedRoots,
+                anchored = googleAnchored,
+                hardwareBacked = hardwareBacked,
+                attestedPatchYearMonths = listOf(
+                    AttestationAnalysis.normalizeAttestedPatchToYearMonth(
+                        AttestationAnalysis.parseHardwareEnforcedInteger(
+                            extValue, AttestationAnalysis.TAG_OS_PATCH_LEVEL
+                        )
+                    ),
+                    AttestationAnalysis.normalizeAttestedPatchToYearMonth(
+                        AttestationAnalysis.parseHardwareEnforcedInteger(
+                            extValue, AttestationAnalysis.TAG_BOOT_PATCH_LEVEL
+                        )
+                    ),
+                ),
+                systemPatchYearMonth = AttestationAnalysis.normalizePropertyPatchToYearMonth(
+                    facts.systemSecurityPatch
+                ),
+                nowMillis = System.currentTimeMillis(),
+            )
+            if (validity.isFinding) {
+                mask = mask or DetectionResult.DETECTION_ATTEST_VALIDITY
+            }
+
+            // A reimplementation has to choose a version number. The platform
+            // arm catches a choice the running release cannot produce; the
+            // declared-HAL arm is reported only, because a vendor feature file
+            // left behind by a mid-life TA upgrade reads the same way.
+            val versions = VersionBounds.evaluate(
+                attestationVersion = AttestationAnalysis.parseAttestationVersion(extValue),
+                keymasterVersion = AttestationAnalysis.parseKeymasterVersion(extValue),
+                securityLevel = securityLevel,
+                declaredKeystoreFeatureVersion = presentation.keystoreFeatureVersion,
+                sdkInt = presentation.sdkInt,
+                releaseBuild = presentation.releaseBuild,
+                presentsAsPhysicalHardware =
+                    DeviceIdentity.presentsAsPhysicalHardware(presentation),
+            )
+            if (versions.isFinding) {
+                mask = mask or DetectionResult.DETECTION_ATTEST_VERSION
+            }
+
+            // Shapes a one-field-per-tag encoder cannot produce. Tag order is
+            // carried for the readout but never flagged: measured retail
+            // devices emit descending lists.
+            val shape = RecordShape.evaluate(
+                hardwareTags = AttestationAnalysis.hardwareEnforcedTags(extValue),
+                softwareTags = AttestationAnalysis.softwareEnforcedTags(extValue),
+                attestationVersion = AttestationAnalysis.parseAttestationVersion(extValue),
+                hardwareBacked = hardwareBacked,
+                anchored = googleAnchored,
+                haveTrustAnchors = AttestationRoots.pinnedRoots.isNotEmpty(),
+            )
+            if (shape.isFinding) {
+                mask = mask or DetectionResult.DETECTION_ATTEST_SHAPE
+            }
+
+            // Corroboration only, never a finding: a staged mainline update
+            // produces the same mismatch a wrong derivation does.
+            val moduleHash = ModuleHash.evaluate(
+                attestedModuleHash = AttestationAnalysis.parseAttestedModuleHash(extValue),
+                platformModuleInfo = PlatformModuleInfo.read(context),
+                keyMintVersion = AttestationAnalysis.parseKeymasterVersion(extValue),
+                hardwareBacked = hardwareBacked,
+                anchored = googleAnchored,
+            )
+
             if (AttestationAnalysis.isBootContradiction(rot, deviceTampered(nativeBitmask))) {
                 mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
             }
@@ -110,7 +212,9 @@ class KeyAttestationProbe {
                 mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
             }
 
-            ProbeOutcome(mask, revocation)
+            ProbeOutcome(
+                mask, revocation, crossSource, validity, versions, shape, moduleHash
+            )
         } catch (e: Throwable) {
             Log.w(TAG, "attestation probe failed; failing safe", e)
             clean()

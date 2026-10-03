@@ -132,14 +132,76 @@ class AttestationCrossSourceTest {
         assertFalse(AttestationAnalysis.verifiedBootHashMismatch(hash, other, null))
     }
 
+    /**
+     * An all-zero attested hash is what AOSP emits when it could not read
+     * ro.boot.vbmeta.digest, for any reason. Treating it as a contradiction
+     * overreached: no measurement shows a genuine device cannot produce it, so
+     * it is reported and never called.
+     */
     @Test
-    fun allZeroValuesAreSkipped() {
-        val zeros = ByteArray(32)
+    fun allZeroAttestedHashIsReportedNotCalled() {
         assertFalse(
-            AttestationAnalysis.verifiedBootHashMismatch(zeros, realBootHashHex, "sha256")
+            AttestationAnalysis.verifiedBootHashMismatch(
+                ByteArray(32), realBootHashHex, "sha256"
+            )
         )
+        assertTrue(
+            AttestationAnalysis.attestedBootHashUnusable(ByteArray(32))
+        )
+    }
+
+    /** An all-zero property means the DEVICE has no digest, which is no evidence. */
+    @Test
+    fun allZeroPropertyDigestIsSkipped() {
         val hash = AttestationAnalysis.parseVerifiedBootHash(realAkitaExtension())
         assertFalse(AttestationAnalysis.verifiedBootHashMismatch(hash, "0".repeat(64), "sha256"))
+    }
+
+    @Test
+    fun anAttestedHashCarryingNoDigestIsReportedNotCalled() {
+        // All zeroes on both sides.
+        assertFalse(
+            AttestationAnalysis.verifiedBootHashMismatch(
+                ByteArray(32), "0".repeat(64), "sha256"
+            )
+        )
+        // All zeroes against a perfectly good device digest. Still not called:
+        // zeroes are what an implementation emits when it could not read the
+        // device's own digest.
+        assertFalse(
+            AttestationAnalysis.verifiedBootHashMismatch(
+                ByteArray(32), realBootHashHex, "sha256"
+            )
+        )
+        assertTrue(AttestationAnalysis.attestedBootHashUnusable(ByteArray(32)))
+        assertTrue(AttestationAnalysis.attestedBootHashUnusable(ByteArray(20)))
+        assertFalse(AttestationAnalysis.attestedBootHashUnusable(null))
+
+        val real = AttestationAnalysis.parseVerifiedBootHash(realAkitaExtension())
+        assertFalse(AttestationAnalysis.attestedBootHashUnusable(real))
+    }
+
+    /**
+     * CTS asserts 32 bytes, but an unexpected length is an encoding this code
+     * does not know rather than a contradiction, so it is reported.
+     */
+    @Test
+    fun wrongLengthAttestedHashIsReportedNotCalled() {
+        assertFalse(
+            AttestationAnalysis.verifiedBootHashMismatch(
+                ByteArray(20), realBootHashHex, "sha256"
+            )
+        )
+        assertTrue(
+            AttestationAnalysis.attestedBootHashUnusable(ByteArray(20))
+        )
+    }
+
+    @Test
+    fun absentAttestedHashIsNoEvidence() {
+        assertFalse(
+            AttestationAnalysis.verifiedBootHashMismatch(null, realBootHashHex, "sha256")
+        )
     }
 
     @Test
@@ -178,14 +240,26 @@ class AttestationCrossSourceTest {
 
     @Test
     fun bootHashDisagreementIsAMismatch() {
-        val facts = AttestationAnalysis.DeviceFacts(
-            systemSecurityPatch = "2024-08-05",
-            vendorSecurityPatch = "2024-08-05",
-            vbmetaDigestHex = "4a63b2f043ffe307a73af9575090f0863777a8498fc3cddf60b7e99a17303ed6",
-            vbmetaHashAlg = "sha256",
+        val hash = AttestationAnalysis.parseVerifiedBootHash(realAkitaExtension())
+        val other = "4a63b2f043ffe307a73af9575090f0863777a8498fc3cddf60b7e99a17303ed6"
+        // The pure comparison still reports the disagreement.
+        assertTrue(AttestationAnalysis.verifiedBootHashMismatch(hash, other, "sha256"))
+        // The verdict only carries it on a device whose own record says it is
+        // locked and verified, which is where the VTS assertion applies.
+        assertFalse(
+            AttestationAnalysis.crossSourceMismatch(
+                realAkitaExtension(),
+                AttestationAnalysis.DeviceFacts("2024-08-05", null, other, "sha256"),
+                strictPatchEquality = false,
+            ).bootHashMismatch
         )
-        val verdict = AttestationAnalysis.crossSourceMismatch(realAkitaExtension(), facts)
-        assertTrue(verdict.bootHashMismatch)
+        assertTrue(
+            AttestationAnalysis.crossSourceMismatch(
+                realAkitaExtension(),
+                AttestationAnalysis.DeviceFacts("2024-08-05", null, other, "sha256"),
+                strictPatchEquality = true,
+            ).bootHashMismatch
+        )
     }
 
     /** No facts at all must never flag. */
@@ -262,10 +336,13 @@ class AttestationCrossSourceTest {
         assertNull(AttestationAnalysis.parseVerifiedBootHash(ext))
     }
 
-    private fun extensionWithHardwareEnforced(entries: ByteArray): ByteArray {
+    private fun extensionWithHardwareEnforced(
+        entries: ByteArray,
+        attestationVersion: ByteArray = byteArrayOf(0x03),
+    ): ByteArray {
         val keyDescription = tlv(
             0x30,
-            tlv(0x02, byteArrayOf(0x03)) + tlv(0x0A, byteArrayOf(0x01)) +
+            tlv(0x02, attestationVersion) + tlv(0x0A, byteArrayOf(0x01)) +
                 tlv(0x02, byteArrayOf(0x04)) + tlv(0x0A, byteArrayOf(0x01)) +
                 tlv(0x04, byteArrayOf(0x01, 0x02)) + tlv(0x04, ByteArray(0)) +
                 tlv(0x30, ByteArray(0)) + tlv(0x30, entries)

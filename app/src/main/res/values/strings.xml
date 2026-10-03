@@ -20,7 +20,7 @@
     <string name="result_status_pass">PASS</string>
     <string name="result_status_unobservable">NOT OBSERVABLE</string>
     <string name="result_status_unverified">UNVERIFIED</string>
-    <string name="result_status_listed">LISTED</string>
+    <string name="result_status_reported">REPORTED</string>
 
     <string name="status_pass_subtitle_partial">All %1$d observable checks passed (%2$d not observable, %3$d unresolved)</string>
     <string name="status_review_title">Review Needed</string>

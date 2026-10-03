@@ -8,7 +8,15 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
-data class DetectionReport(val bitmask: Int, val revocation: RevocationStatus)
+data class DetectionReport(
+    val bitmask: Int,
+    val revocation: RevocationStatus,
+    val crossSource: AttestationAnalysis.CrossSourceVerdict? = null,
+    val validity: ValidityStatus? = null,
+    val versions: VersionBounds.Verdict? = null,
+    val shape: RecordShape.Verdict? = null,
+    val moduleHash: ModuleHash.Status? = null,
+)
 
 class DetectionRunner {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -36,6 +44,11 @@ class DetectionRunner {
             val report = DetectionReport(
                 bitmask = nativeMask or passive.mask or activeMask,
                 revocation = passive.revocation,
+                crossSource = passive.crossSource,
+                validity = passive.validity,
+                versions = passive.versions,
+                shape = passive.shape,
+                moduleHash = passive.moduleHash,
             )
             mainHandler.post {
                 if (!cancelled.get()) onResult(report)
