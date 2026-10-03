@@ -154,14 +154,21 @@ a stock AVD and against TrickyStoreOSS v3.1.0.
 | D1 revocation | Landed, informational | Found and fixed a worse defect than this plan described: the probe returned on the first finding with revocation last, so on any device tripping an earlier check it never ran at all. Restructured into trust gates plus an accumulate phase. Both rows now populate in one run, and airplane mode answers from the bundled snapshot. Review then established that the outcome must NOT set a detection bit: batch keys are shared across a production run, so a stock handset from a leaked batch carries the same serial a spoofer does, and 26 entries are SOFTWARE_FLAW rather than compromise. It is reported on its own amber row instead |
 | D2 cross-source | Landed, arms (a) and (b) | Patch level and verified boot hash compare cleanly. Silent on genuine hardware where all three sources agree |
 | D2 (c) VINTF spike | Not implemented | /vendor/etc/vintf/manifest.xml is labelled vendor_configs_file. Reading it under run-as proves nothing, because runas_app is a different SELinux domain from untrusted_app |
-| D3 timing | Rejected | Measured genuine median ratios of 4.04 to 6.10 on this device, so the statistic works. But an unpadded forgery is already caught cryptographically by anchoring, RootOfTrust and revocation, so timing adds no coverage against that adversary while carrying real false-positive risk on unmeasured SoCs. Not shipped |
+| D3 timing | Rejected, for a corrected reason | The original reason given here was wrong: it said an unpadded forgery is already caught cryptographically, which is false against an in-process KeyMint TA signing with a real keybox, since nothing cryptographic catches that. The conclusion survives on stronger grounds. Re-derived from the 240-pair corpus on this device, every candidate statistic has a genuine observation inside the region a forgery would occupy: the per-pair ratio bottoms out at 1.321 against a reported post-fix adversary ratio of 1.055, the skew of the log distribution flips sign between two runs minutes apart, and one genuine run's lag-1 autocorrelation was -0.017, indistinguishable from a synthetic draw. The adversary also moved from padding a mean to a log-normal generator, which reproduces mean, variance and skew by construction. A threshold set from one device would flag genuine hardware, which this project treats as a bug. Not shipped |
 | D4 software attestation | Landed | A stock AVD declares hardware_keystore and has a fully production-looking identity, so without the virtual-device guard this check would flag every emulator. With it, the emulator probe returns 0x0 |
 | D5 package visibility | Held | The planned baseline-of-visible-packages framing is not implementable: a genuine Pixel app sees 124 of 354 packages and com.android.packageinstaller does not exist on the device. Only the self-contradiction form (listed as visible, then denied on lookup) is viable, and it needs its own spec |
 | D6 part 1 artifact table | Partly | Added only the two root-manager packages that could be justified. The module-path additions were rejected: they feed privileged-only flags that cannot fire unprivileged |
 | D6 part 2 honesty | Landed | detectMountNS replaced by an in-process mountinfo probe that fires on this device today. Three README overclaims corrected, including a SELinux check the README described that never existed in the engine |
 
-Measured effect: observable checks went from 11 to 14, and the detector reports 3
-of 14 on the rooted test device, all three correct.
+Measured effect of 2.8: observable checks went from 11 to 14, and the detector
+reported 3 of 14 on the rooted test device, all three correct.
+
+Measured effect of 2.9, across three vendors: the row count went from 19 to 23.
+On the rooted Pixel 7a the card reads 3 of 17 observable, the same three
+findings. On a stock Samsung SM-G780G it reads all 17 observable passed with 6
+not observable, and on a stock emulator all 13 observable passed with 10 not
+observable. None of the four rows 2.9 adds fires on any genuine device
+measured, which is the result those rows were built to produce.
 
 ## Sequencing
 
@@ -171,8 +178,8 @@ of 14 on the rooted test device, all three correct.
    satisfy together with a changed-attestation-only module.
 3. D4 and D5 alongside D2: small, corroborating, and they address the
    false-negative surface the emulator reports exposed.
-4. D3 after the corpus exists. It is the strongest behavioural signal but needs
-   calibration data before it can ship without false positives.
+4. D3 only if a multi-device corpus ever exists. The single-device corpus is
+   now known to be insufficient, not merely incomplete: see the table above.
 5. D6 continuously, one verified entry at a time.
 
 ## Verification
