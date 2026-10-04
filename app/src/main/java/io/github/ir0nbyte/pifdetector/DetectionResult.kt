@@ -18,6 +18,12 @@ data class DetectionResult(
 
     /** Optional one line of context shown under the check description. */
     val detail: String? = null,
+
+    /**
+     * Which sub-probes set this row's bit, in the engine's words. Empty for a
+     * row whose check is not wired for reasons, which simply renders as before.
+     */
+    val reasons: List<String> = emptyList(),
 ) {
     /*
      * The old boolean surface, now derived from the single state. Callers and
@@ -155,7 +161,10 @@ data class DetectionResult(
             versions: VersionBounds.Verdict? = null,
             shape: RecordShape.Verdict? = null,
             moduleHash: ModuleHash.Status? = null,
-        ): List<DetectionResult> = SPECS.map { spec ->
+            reasonCodes: List<Int> = emptyList(),
+        ): List<DetectionResult> {
+            val reasonsByFlag = ReasonCodes.describe(reasonCodes)
+            return SPECS.map { spec ->
             val detected = bitmask and spec.flag != 0
             val privileged = PRIVILEGED_ONLY.contains(spec.flag)
             val base = DetectionResult(
@@ -189,6 +198,10 @@ data class DetectionResult(
                     applyModuleHash(base, moduleHash)
 
                 else -> base
+            }.let { row ->
+                val texts = reasonsByFlag[spec.flag].orEmpty()
+                if (texts.isEmpty()) row else row.copy(reasons = texts)
+            }
             }
         }
 

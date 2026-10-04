@@ -210,6 +210,66 @@ static void readProp(const char* encoded, char* out) {
     __system_property_get(decodeProp(encoded).c_str(), out);
 }
 
+namespace reason {
+    /*
+     * Why a bit was set, so a detection can be explained without attaching a
+     * debugger to a user's phone. The value is grouped by the flag it belongs
+     * to, family * 100 + member, which lets the Kotlin side route a code to its
+     * row without a second lookup table.
+     *
+     * Codes are append-only. A shipped report carries raw integers, so reusing
+     * a number would silently relabel every report already filed against it.
+     */
+    constexpr jint kTracerPidSet          = 101;
+    constexpr jint kApplicationDebuggable = 102;
+
+    constexpr jint kFridaPort27042        = 201;
+    constexpr jint kFridaPort27043        = 202;
+    constexpr jint kFridaProcfsSocket     = 203;
+    constexpr jint kFridaThreadName       = 204;
+    constexpr jint kFridaLibraryMapped    = 205;
+    constexpr jint kFridaParentCmdline    = 206;
+
+    constexpr jint kZygiskLibraryMapped   = 301;
+    constexpr jint kZygiskEnvironment     = 302;
+    constexpr jint kZygiskProperty        = 303;
+    constexpr jint kRootModuleDirectory   = 304;
+    constexpr jint kSuBinaryPresent       = 305;
+    constexpr jint kBusyBoxPresent        = 306;
+    constexpr jint kLegacyRootArtifact    = 307;
+    constexpr jint kRootManagerInstalled  = 308;
+
+    constexpr jint kMountTmpfsShadow      = 901;
+    constexpr jint kMountAdbBind          = 902;
+    constexpr jint kOverlayOnSystem       = 903;
+    constexpr jint kExcessRwxMappings     = 904;
+
+    constexpr jint kBootStateNotGreen     = 501;
+    constexpr jint kBootloaderUnlocked    = 502;
+    constexpr jint kVerityDisabled        = 503;
+    constexpr jint kFlashNotLocked        = 504;
+    constexpr jint kVbmetaNotLocked       = 505;
+    constexpr jint kRoDebuggable          = 506;
+    constexpr jint kRoSecureOff           = 507;
+    constexpr jint kOemUnlockAllowed      = 508;
+
+    constexpr jint kBrandMismatch         = 801;
+    constexpr jint kBuildIdentityMismatch = 802;
+    constexpr jint kFlavorMismatch        = 803;
+    constexpr jint kPropertyReadSlow      = 804;
+    constexpr jint kBoardSocMismatch      = 805;
+
+    /*
+     * Collected for the duration of one engine run. The engine is entered from
+     * a single worker thread and the sink is cleared on entry, so a thread_local
+     * needs no lock and cannot bleed between runs.
+     */
+    thread_local std::vector<jint> g_sink;
+
+    inline void note(jint code) { g_sink.push_back(code); }
+    inline void begin() { g_sink.clear(); }
+}
+
 __attribute__((always_inline))
 static inline int isTraced() {
     ScopedFile f(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2M6RDkwND8=")).c_str(), "r");
@@ -1099,7 +1159,10 @@ static bool detectRootManagerApp(JNIEnv *env, jobject context) {
             env->ExceptionClear();
             continue;
         }
-        if (info) return true;
+        if (info) {
+            reason::note(reason::kRootManagerInstalled);
+            return true;
+        }
     }
 
     return false;
@@ -1118,7 +1181,10 @@ static bool detectSuBinary() {
         Deobfuscate(base64_decode("HzwlNS1mXDcnICBmRDU0bj88")),
     };
     for (const auto& p : paths) {
-        if (access(p.c_str(), F_OK) == 0) return true;
+        if (access(p.c_str(), F_OK) == 0) {
+            reason::note(reason::kSuBinaryPresent);
+            return true;
+        }
     }
     return false;
 }
@@ -1134,7 +1200,10 @@ static bool detectBusyBox() {
         Deobfuscate(base64_decode("HzwlNS1mXDcnICBmSDotL2MrRSs9IyMx")),
     };
     for (const auto& p : paths) {
-        if (access(p.c_str(), F_OK) == 0) return true;
+        if (access(p.c_str(), F_OK) == 0) {
+            reason::note(reason::kBusyBoxPresent);
+            return true;
+        }
     }
     return false;
 }
@@ -1153,7 +1222,10 @@ static bool detectLegacyRootArtifacts() {
         Deobfuscate(base64_decode("Hys9MjgsXXc8IyUnHysxbyg=")),
     };
     for (const auto& p : paths) {
-        if (access(p.c_str(), F_OK) == 0) return true;
+        if (access(p.c_str(), F_OK) == 0) {
+            reason::note(reason::kLegacyRootArtifact);
+            return true;
+        }
     }
     return false;
 }
@@ -1171,29 +1243,59 @@ static inline bool isBootloaderUnlocked() {
     std::string veritymode         = getProp(decodeProp(prop::kVerityMode).c_str());
     std::string flash_locked       = getProp(decodeProp(prop::kFlashLocked).c_str());
 
-    if (bootloader.find("unlock") != std::string::npos ||
-        (!verified_boot_state.empty() && verified_boot_state != "green") ||
-        veritymode == "disabled" ||
-        flash_locked == "0")
-        return true;
+    /*
+     * Each arm notes which property it was, because "bootloader unlocked" on
+     * its own does not tell the user whether the device is genuinely unlocked
+     * or whether one property was rewritten. Every arm is recorded, not just
+     * the first, so a report shows the whole picture.
+     */
+    bool unlocked = false;
+    if (bootloader.find("unlock") != std::string::npos) {
+        reason::note(reason::kBootloaderUnlocked);
+        unlocked = true;
+    }
+    if (!verified_boot_state.empty() && verified_boot_state != "green") {
+        reason::note(reason::kBootStateNotGreen);
+        unlocked = true;
+    }
+    if (veritymode == "disabled") {
+        reason::note(reason::kVerityDisabled);
+        unlocked = true;
+    }
+    if (flash_locked == "0") {
+        reason::note(reason::kFlashNotLocked);
+        unlocked = true;
+    }
 
     std::string vbmeta_state = getProp(
         decodeProp(prop::kVbmetaDeviceState).c_str());
-    if (!vbmeta_state.empty() && vbmeta_state != "locked") return true;
+    if (!vbmeta_state.empty() && vbmeta_state != "locked") {
+        reason::note(reason::kVbmetaNotLocked);
+        unlocked = true;
+    }
 
     std::string debuggable = getProp(
         decodeProp(prop::kDebuggable).c_str());
-    if (debuggable == "1") return true;
+    if (debuggable == "1") {
+        reason::note(reason::kRoDebuggable);
+        unlocked = true;
+    }
 
     std::string secure = getProp(
         decodeProp(prop::kSecure).c_str());
-    if (!secure.empty() && secure != "1") return true;
+    if (!secure.empty() && secure != "1") {
+        reason::note(reason::kRoSecureOff);
+        unlocked = true;
+    }
 
     std::string oem_unlock = getProp(
         decodeProp(prop::kOemUnlockAllowed).c_str());
-    if (oem_unlock == "1") return true;
+    if (oem_unlock == "1") {
+        reason::note(reason::kOemUnlockAllowed);
+        unlocked = true;
+    }
 
-    return false;
+    return unlocked;
 }
 
 static bool isAppDebuggable(JNIEnv *env, jobject context) {
@@ -1387,22 +1489,29 @@ struct DetectionCheck {
 };
 
 extern "C"
-JNIEXPORT jint JNICALL
+JNIEXPORT jintArray JNICALL
 f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
+    reason::begin();
     jint result = 0;
 
-    if (isTraced() == 1)
+    if (isTraced() == 1) {
         result |= DETECTION_DEBUGGER;
+        reason::note(reason::kTracerPidSet);
+    }
 
     if (detectFridaPort() || detectFridaThreads())
         result |= DETECTION_FRIDA;
 
-    if (detectSuspiciousParent() == 1)
+    if (detectSuspiciousParent() == 1) {
         result |= DETECTION_FRIDA;
+        reason::note(reason::kFridaParentCmdline);
+    }
 
 #ifndef IS_DEBUG_BUILD
-    if (isAppDebuggable(env, obj))
+    if (isAppDebuggable(env, obj)) {
         result |= DETECTION_DEBUGGER;
+        reason::note(reason::kApplicationDebuggable);
+    }
 #endif
 
     std::vector<DetectionCheck> checks = {
@@ -1483,7 +1592,21 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
     }
 
     LOGD("isIntegrityTampered final mask = 0x%x", result);
-    return result;
+
+    /*
+     * Element 0 is the bitmask, which stays the single source of truth for
+     * which bits were set. Everything after it is a reason code explaining one
+     * of them. Reasons are advisory: a bit with no reason still reads as set.
+     */
+    const jsize count = static_cast<jsize>(reason::g_sink.size()) + 1;
+    jintArray out = env->NewIntArray(count);
+    if (!out) return nullptr;
+    env->SetIntArrayRegion(out, 0, 1, &result);
+    if (!reason::g_sink.empty()) {
+        env->SetIntArrayRegion(out, 1, count - 1, reason::g_sink.data());
+    }
+    reason::g_sink.clear();
+    return out;
 }
 
 extern "C"
@@ -1607,7 +1730,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
 
     static const JNINativeMethod methods[] = {
         {const_cast<char*>(methodName.c_str()),
-         const_cast<char*>("(Landroid/content/Context;)I"),
+         const_cast<char*>("(Landroid/content/Context;)[I"),
          reinterpret_cast<void *>(f5d6d8a0228d2e7b607f28fefe95c77)},
         {const_cast<char*>(maskMethodName.c_str()),
          const_cast<char*>("()I"),

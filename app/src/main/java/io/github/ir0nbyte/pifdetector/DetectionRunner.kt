@@ -16,6 +16,13 @@ data class DetectionReport(
     val versions: VersionBounds.Verdict? = null,
     val shape: RecordShape.Verdict? = null,
     val moduleHash: ModuleHash.Status? = null,
+
+    /**
+     * Reason codes from the native engine, naming which sub-probe set a bit.
+     * Advisory: a bit with no reason is still set, so an unwired check simply
+     * reports nothing extra.
+     */
+    val reasons: List<Int> = emptyList(),
 )
 
 class DetectionRunner {
@@ -32,7 +39,11 @@ class DetectionRunner {
     ) {
         val appContext = context.applicationContext
         executor.execute {
-            val nativeMask = isIntegrityTampered(appContext)
+            // A null or empty array means the engine could not report. Treat
+            // it as a clean mask with no reasons rather than guessing.
+            val engine = isIntegrityTampered(appContext) ?: IntArray(1)
+            val nativeMask = engine.firstOrNull() ?: 0
+            val reasons = if (engine.size > 1) engine.drop(1) else emptyList()
             // Read once per run so both probes see the same identity.
             val presentation = DeviceIdentity.fromRuntime(appContext)
             val facts = deviceFacts()
@@ -49,6 +60,7 @@ class DetectionRunner {
                 versions = passive.versions,
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
+                reasons = reasons,
             )
             mainHandler.post {
                 if (!cancelled.get()) onResult(report)
@@ -61,7 +73,12 @@ class DetectionRunner {
         executor.shutdownNow()
     }
 
-    private external fun isIntegrityTampered(context: Context): Int
+    /**
+     * Element 0 is the bitmask; everything after it is a reason code naming the
+     * sub-probe that set one of the bits. Returning both from one call keeps
+     * the reasons tied to the run that produced them.
+     */
+    private external fun isIntegrityTampered(context: Context): IntArray?
 
     private external fun nativeAllFlagsMask(): Int
 

@@ -36,12 +36,19 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
         private fun bindData(result: DetectionResult) {
             nameView.text = result.name
             descView.text = result.description
-            val detail = result.detail
-            if (detail.isNullOrEmpty()) {
+
+            // The reasons say which sub-probe actually spoke. Without them a
+            // detection is a lit row and the only way to learn what fired was
+            // to attach a debugger to the device showing it.
+            val lines = buildList {
+                result.detail?.takeIf { it.isNotEmpty() }?.let { add(it) }
+                result.reasons.forEach { add("\u2022 $it") }
+            }
+            if (lines.isEmpty()) {
                 detailView.visibility = View.GONE
             } else {
                 detailView.visibility = View.VISIBLE
-                detailView.text = detail
+                detailView.text = lines.joinToString("\n")
             }
         }
 
