@@ -109,21 +109,13 @@ class MainActivity : AppCompatActivity() {
                 report.bitmask, report.revocation, report.crossSource, report.validity,
                 report.versions, report.shape, report.moduleHash,
             )
-            val detectedCount = results.count { it.detected }
-
-            // Three distinct buckets. A privileged-only row is not observable at
-            // all; an inconclusive or warning row is observable but did not
-            // resolve to a pass. Collapsing them misreports both.
-            // A privileged-only row and a row that cannot apply to this
-            // device are both unobservable here. Only a row that could have
-            // resolved and did not belongs in the review bucket, or a clean
-            // stock phone reads amber for lacking a platform surface.
-            val unobservableCount = results.count {
-                (it.privilegedOnly || it.notApplicable) && !it.detected
-            }
-            val unresolvedCount = results.count {
-                (it.inconclusive || it.warning) && !it.notApplicable && !it.detected
-            }
+            // One state per row, so these three buckets cannot overlap and no
+            // caller has to re-derive a precedence order. They previously did,
+            // and the list and the summary card ordered two of the states
+            // differently.
+            val detectedCount = results.count { it.state.isFinding }
+            val unobservableCount = results.count { !it.state.isObservable }
+            val unresolvedCount = results.count { it.state.needsReview }
             val observableTotal = results.size - unobservableCount
 
             resultAdapter.submitList(results)

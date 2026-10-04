@@ -4,33 +4,32 @@ data class DetectionResult(
     val name: String,
     val description: String,
     val flag: Int,
-    val detected: Boolean,
 
+    /** What this check concluded. See [CheckState]. */
+    val state: CheckState,
+
+    /**
+     * Row metadata, not an outcome: this check can only ever fire when the app
+     * runs privileged. Kept alongside the state so a row that cannot be seen
+     * because of the sandbox can be told apart from one that cannot apply to
+     * this hardware, which matters in the exported report.
+     */
     val privilegedOnly: Boolean = false,
-
-    /**
-     * Observable in principle, but this run could not reach a verdict. Rendered
-     * as its own state and counted as neither a pass nor a detection.
-     */
-    val inconclusive: Boolean = false,
-
-    /**
-     * A real observation that is worth showing but is not by itself evidence
-     * about this device. Counted as neither a pass nor a detection.
-     */
-    val warning: Boolean = false,
-
-    /**
-     * The check cannot apply to this device at all, so it is not observable
-     * here. Counted with the privileged-only rows rather than as something
-     * needing review: a stock phone that simply lacks the platform surface a
-     * check needs has nothing for the user to look at.
-     */
-    val notApplicable: Boolean = false,
 
     /** Optional one line of context shown under the check description. */
     val detail: String? = null,
 ) {
+    /*
+     * The old boolean surface, now derived from the single state. Callers and
+     * tests that predate CheckState keep working unchanged, and no caller can
+     * put the row into a combination that does not mean anything.
+     */
+    val detected: Boolean get() = state == CheckState.DETECTED
+    val warning: Boolean get() = state == CheckState.INFORMATIONAL
+    val inconclusive: Boolean
+        get() = state == CheckState.UNVERIFIABLE || state == CheckState.SKIPPED
+    val notApplicable: Boolean
+        get() = state == CheckState.NOT_OBSERVABLE && !privilegedOnly
     companion object {
         const val DETECTION_DEBUGGER = 0x001
         const val DETECTION_FRIDA = 0x002
@@ -157,12 +156,18 @@ data class DetectionResult(
             shape: RecordShape.Verdict? = null,
             moduleHash: ModuleHash.Status? = null,
         ): List<DetectionResult> = SPECS.map { spec ->
+            val detected = bitmask and spec.flag != 0
+            val privileged = PRIVILEGED_ONLY.contains(spec.flag)
             val base = DetectionResult(
                 spec.name,
                 spec.description,
                 spec.flag,
-                bitmask and spec.flag != 0,
-                PRIVILEGED_ONLY.contains(spec.flag)
+                when {
+                    detected -> CheckState.DETECTED
+                    privileged -> CheckState.NOT_OBSERVABLE
+                    else -> CheckState.CLEAN
+                },
+                privileged,
             )
             when {
                 spec.flag == DETECTION_ATTEST_REVOKED && revocation != null ->
@@ -198,7 +203,7 @@ data class DetectionResult(
                 )
 
                 ModuleHash.Outcome.MISMATCHED -> row.copy(
-                    warning = true,
+                    state = CheckState.INFORMATIONAL,
                     detail = "Attested module hash does not match the platform's. A staged " +
                         "mainline update applied by a userspace reboot produces the same " +
                         "difference, so this is not by itself evidence about this device."
@@ -207,24 +212,24 @@ data class DetectionResult(
                 // The tag is OPTIONAL and a known class of vendor KeyMint 4
                 // TAs never implemented it, so absence is permitted.
                 ModuleHash.Outcome.ABSENT -> row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "This KeyMint ${km ?: "?"} record carries no module hash. The tag " +
                         "is optional, so its absence is permitted."
                 )
 
                 ModuleHash.Outcome.MALFORMED -> row.copy(
-                    inconclusive = true,
+                    state = CheckState.UNVERIFIABLE,
                     detail = "The attested module hash is not a 32-byte digest, so it was not " +
                         "compared."
                 )
 
                 ModuleHash.Outcome.UNREADABLE -> row.copy(
-                    inconclusive = true,
+                    state = CheckState.UNVERIFIABLE,
                     detail = "The module hash could not be read, so nothing was compared."
                 )
 
                 ModuleHash.Outcome.NOT_APPLICABLE -> row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "Needs a KeyMint 4 record and a platform that reports its own " +
                         "module set, which this device does not provide."
                 )
@@ -237,7 +242,7 @@ data class DetectionResult(
         ): DetectionResult {
             if (!v.evaluated) {
                 return row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "No readable hardware-backed, Google-anchored record",
                 )
             }
@@ -283,7 +288,7 @@ data class DetectionResult(
         ): DetectionResult {
             if (!v.evaluated) {
                 return row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "Not evaluated: there was no readable record to bound",
                 )
             }
@@ -291,7 +296,7 @@ data class DetectionResult(
             if (v.aheadOfPlatform) {
                 val b = v.platformBound
                 return row.copy(
-                    warning = true,
+                    state = CheckState.INFORMATIONAL,
                     detail = "Record claims $claimed, above the most this platform can emit " +
                         "(schema ${b?.attestation}, KeyMint ${b?.keyMint}). A vendor update " +
                         "that raises the secure implementation past the system image's own " +
@@ -300,7 +305,7 @@ data class DetectionResult(
             }
             if (v.aheadOfDeclaredHal) {
                 return row.copy(
-                    warning = true,
+                    state = CheckState.INFORMATIONAL,
                     detail = "Record claims KeyMint ${v.keymasterVersion} while this device's " +
                         "keystore feature declares ${v.declaredHalVersion}. That can also mean " +
                         "the vendor's feature declaration is mis-pinned, so it is not by itself " +
@@ -309,7 +314,7 @@ data class DetectionResult(
             }
             if (v.platformBound == null) {
                 return row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "No bound known for this platform, so nothing was judged",
                 )
             }
@@ -328,7 +333,7 @@ data class DetectionResult(
                 )
 
                 ValidityOutcome.EXPIRED_ISSUER -> row.copy(
-                    warning = true,
+                    state = CheckState.INFORMATIONAL,
                     detail = "An issuer certificate lapsed " +
                         "${status.daysPastFloor ?: 0} days before the earliest time this " +
                         "device can prove has passed$offender. Google documents expired " +
@@ -338,7 +343,7 @@ data class DetectionResult(
                 )
 
                 ValidityOutcome.RECENTLY_EXPIRED -> row.copy(
-                    inconclusive = true,
+                    state = CheckState.UNVERIFIABLE,
                     detail = "An issuer certificate lapsed only recently$offender, which a " +
                         "provisioned certificate lagging a rotation also does. Not called."
                 )
@@ -347,24 +352,24 @@ data class DetectionResult(
                 // observation about the chain, and two of three genuine test
                 // handsets have one. It must not turn the card amber.
                 ValidityOutcome.CLOCK_BEHIND -> row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "The device clock is behind the earliest time this device can " +
                         "prove has passed, so the windows cannot be judged."
                 )
 
                 ValidityOutcome.NO_REFERENCE -> row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "No clock-independent reference was available, so nothing was judged."
                 )
 
                 ValidityOutcome.NOT_APPLICABLE -> row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "No issuer windows to judge against a reference. An inverted " +
                         "window would still have been reported."
                 )
 
                 ValidityOutcome.NOT_EVALUATED -> row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "Not evaluated: there was no chain to examine"
                 )
 
@@ -380,7 +385,7 @@ data class DetectionResult(
         ): DetectionResult {
             if (!v.evaluated) {
                 return row.copy(
-                    notApplicable = true,
+                    state = CheckState.NOT_OBSERVABLE,
                     detail = "No hardware-backed, Google-anchored chain to compare against",
                 )
             }
@@ -448,7 +453,7 @@ data class DetectionResult(
             status: RevocationStatus,
         ): DetectionResult = when (status.outcome) {
             RevocationOutcome.KNOWN_REVOKED -> row.copy(
-                warning = true,
+                state = CheckState.INFORMATIONAL,
                 detail = "A serial in this chain is on Google's published list. " +
                     "Batch keys are shared across a production run, so this can also mean " +
                     "the manufacturer's key was published. Not by itself evidence of spoofing."
@@ -459,17 +464,17 @@ data class DetectionResult(
             )
 
             RevocationOutcome.UNVERIFIABLE -> row.copy(
-                inconclusive = true,
+                state = CheckState.UNVERIFIABLE,
                 detail = "Could not be checked: no usable snapshot and no network. This is not a pass."
             )
 
             RevocationOutcome.NOT_APPLICABLE -> row.copy(
-                notApplicable = true,
+                state = CheckState.NOT_OBSERVABLE,
                 detail = "No Google-anchored attestation chain to check"
             )
 
             RevocationOutcome.NOT_EVALUATED -> row.copy(
-                inconclusive = true,
+                state = CheckState.UNVERIFIABLE,
                 detail = "Not evaluated: the chain failed an earlier trust gate"
             )
         }

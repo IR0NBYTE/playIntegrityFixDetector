@@ -47,21 +47,27 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
 
         private fun applyStatusStyle(result: DetectionResult) {
             val ctx = itemView.context
-            val (textRes, colorRes, iconRes) = when {
-                result.detected ->
+            val (textRes, colorRes, iconRes) = when (result.state) {
+                CheckState.DETECTED ->
                     Triple(R.string.result_status_detected, R.color.status_fail, R.drawable.ic_warning)
-                // A generic badge: five rows now use the warning state and the
-                // revocation-specific wording was wrong on four of them. Each
-                // row's detail says what was observed.
-                result.warning ->
+
+                // A generic badge: several rows use this state and the
+                // revocation-specific wording was wrong on most of them. Each
+                // row's detail says what was actually observed.
+                CheckState.INFORMATIONAL ->
                     Triple(R.string.result_status_reported, R.color.status_warn, R.drawable.ic_warning)
-                result.inconclusive ->
+
+                // Tried and reached no verdict, or never ran at all. Either way
+                // it is not a pass, so it does not get the green tick.
+                CheckState.UNVERIFIABLE, CheckState.SKIPPED ->
                     Triple(R.string.result_status_unverified, R.color.status_warn, R.drawable.ic_info)
-                // A check that cannot apply to this device is as unobservable
-                // here as a privileged-only one, and must not read as a pass.
-                result.privilegedOnly || result.notApplicable ->
+
+                // Needs privilege the app does not have, or a platform surface
+                // this device does not expose. Neither reads as a pass.
+                CheckState.NOT_OBSERVABLE ->
                     Triple(R.string.result_status_unobservable, R.color.text_secondary, R.drawable.ic_info)
-                else ->
+
+                CheckState.CLEAN ->
                     Triple(R.string.result_status_pass, R.color.status_pass, R.drawable.ic_check)
             }
             statusView.setText(textRes)
