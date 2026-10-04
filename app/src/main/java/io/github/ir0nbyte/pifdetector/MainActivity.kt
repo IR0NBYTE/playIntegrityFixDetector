@@ -107,7 +107,7 @@ class MainActivity : AppCompatActivity() {
 
             val results = DetectionResult.fromBitmask(
                 report.bitmask, report.revocation, report.crossSource, report.validity,
-                report.versions, report.shape, report.moduleHash,
+                report.versions, report.shape, report.moduleHash, report.reasons,
             )
             // One state per row, so these three buckets cannot overlap and no
             // caller has to re-derive a precedence order. They previously did,
