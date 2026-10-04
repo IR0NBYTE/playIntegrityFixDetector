@@ -23,6 +23,9 @@ data class DetectionReport(
      * reports nothing extra.
      */
     val reasons: List<Int> = emptyList(),
+
+    /** What the device claimed to be during this run, for the report header. */
+    val presentation: DeviceIdentity.Presentation = DeviceIdentity.UNKNOWN,
 )
 
 class DetectionRunner {
@@ -61,6 +64,7 @@ class DetectionRunner {
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
                 reasons = reasons,
+                presentation = presentation,
             )
             mainHandler.post {
                 if (!cancelled.get()) onResult(report)

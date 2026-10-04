@@ -1,7 +1,10 @@
 package io.github.ir0nbyte.pifdetector
 
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
+import android.view.Menu
+import android.view.MenuItem
 import android.view.View
 import android.widget.Button
 import android.widget.Toast
@@ -15,6 +18,14 @@ class MainActivity : AppCompatActivity() {
     private var binding: ActivityMainBinding? = null
     private val resultAdapter = ResultAdapter()
     private val runner = DetectionRunner()
+
+    /*
+     * Held so the report can be exported after a run. A screenshot was the only
+     * thing a user could attach to an issue, and it carries the verdicts
+     * without any of the evidence behind them.
+     */
+    private var lastRows: List<DetectionResult>? = null
+    private var lastReport: DetectionReport? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -118,6 +129,9 @@ class MainActivity : AppCompatActivity() {
             val unresolvedCount = results.count { it.state.needsReview }
             val observableTotal = results.size - unobservableCount
 
+            lastRows = results
+            lastReport = report
+            invalidateOptionsMenu()
             resultAdapter.submitList(results)
             binding?.resultsRecyclerView?.visibility = View.VISIBLE
 
@@ -186,9 +200,41 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.main, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        if (item.itemId != R.id.action_export_report) return super.onOptionsItemSelected(item)
+        exportReport()
+        return true
+    }
+
+    private fun exportReport() {
+        val rows = lastRows
+        val report = lastReport
+        if (rows == null || report == null) {
+            Toast.makeText(this, R.string.export_report_unavailable, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val text = ReportBuilder.build(
+            rows, report, report.presentation,
+            appVersion = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+        )
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, getString(R.string.export_report_subject))
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        startActivity(Intent.createChooser(send, getString(R.string.action_export_report)))
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         runner.shutdown()
+        lastRows = null
+        lastReport = null
         binding = null
     }
 
