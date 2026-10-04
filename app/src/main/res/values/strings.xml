@@ -32,4 +32,7 @@
     <string name="privacy_revocation_body">PIF Detector ships an offline copy of Google\'s public key revocation list and uses it with no network.\n\nIf online refresh stays on, each check makes one HTTPS request to android.googleapis.com to pick up serials revoked since that copy was made. No device identifier, no account, and no attestation data is sent.</string>
     <string name="privacy_revocation_keep_on">Keep refresh on</string>
     <string name="privacy_revocation_offline_only">Offline only</string>
+    <string name="action_export_report">Export report</string>
+    <string name="export_report_subject">PIF Detector report</string>
+    <string name="export_report_unavailable">Run a check first</string>
 </resources>
