@@ -1518,14 +1518,25 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
         {0, [](JNIEnv* e, jobject o) -> jint {
             jint r = 0;
 
-            if (isZygiskActiveEnhanced() ||
-                detectSuBinary() || detectBusyBox() ||
-                detectLegacyRootArtifacts() ||
-                detectRootManagerApp(e, o))
-                r |= DETECTION_ZYGISK;
+            /*
+             * Each arm is evaluated, not short-circuited with ||. The arms are
+             * what the reason codes report, and on a device where more than one
+             * is true a chain of || records only the first, so a report named
+             * the su binary and stayed silent about the root manager package
+             * sitting next to it.
+             */
+            bool zygisk = false;
+            if (isZygiskActiveEnhanced()) zygisk = true;
+            if (detectSuBinary()) zygisk = true;
+            if (detectBusyBox()) zygisk = true;
+            if (detectLegacyRootArtifacts()) zygisk = true;
+            if (detectRootManagerApp(e, o)) zygisk = true;
+            if (zygisk) r |= DETECTION_ZYGISK;
             r |= detectMountArtifacts();
-            if (detectOverlayFS() || detectRWXMappings())
-                r |= DETECTION_ROOT_HIDER;
+            bool hider = false;
+            if (detectOverlayFS()) hider = true;
+            if (detectRWXMappings()) hider = true;
+            if (hider) r |= DETECTION_ROOT_HIDER;
             return r;
         }},
         {1, [](JNIEnv*, jobject) -> jint {

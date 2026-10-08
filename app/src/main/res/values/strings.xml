@@ -35,4 +35,6 @@
     <string name="action_export_report">Export report</string>
     <string name="export_report_subject">PIF Detector report</string>
     <string name="export_report_unavailable">Run a check first</string>
+    <string name="row_expand">Show evidence</string>
+    <string name="row_collapse">Hide evidence</string>
 </resources>

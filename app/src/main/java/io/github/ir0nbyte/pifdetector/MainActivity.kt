@@ -11,6 +11,9 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import io.github.ir0nbyte.pifdetector.databinding.ActivityMainBinding
 
@@ -47,6 +50,7 @@ class MainActivity : AppCompatActivity() {
         val activityBinding = ActivityMainBinding.inflate(layoutInflater)
         binding = activityBinding
         setContentView(activityBinding.root)
+        applyWindowInsets(activityBinding.root)
 
         activityBinding.resultsRecyclerView.apply {
             layoutManager = LinearLayoutManager(this@MainActivity)
@@ -198,6 +202,36 @@ class MainActivity : AppCompatActivity() {
             .setCancelable(false)
             .setPositiveButton(R.string.dialog_button_exit) { _, _ -> finish() }
             .show()
+    }
+
+    /*
+     * From targetSdk 36 Android 16 enforces edge-to-edge and stops insetting
+     * the window, so without this the action bar draws under the status bar and
+     * the run button sits under the navigation bar. Instrumented tests do not
+     * catch it: the views are still reported as displayed, they are simply
+     * covered, which is why this is checked against a screenshot instead.
+     *
+     * Padding the single ConstraintLayout root is enough here. The screen is
+     * one flat layout with no surface that wants to bleed under the bars, and
+     * the list already stops above the controls rather than running to the
+     * bottom of the window.
+     */
+    private fun applyWindowInsets(root: View) {
+        /*
+         * Opt into edge-to-edge on every release rather than only on the ones
+         * that force it. Android 16 enforces exactly this for targetSdk 36, so
+         * asking for it explicitly makes the layout behave the same way on API
+         * 24 as on 36, and makes it testable on hardware that is not Android 16.
+         */
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
+            val bars = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {

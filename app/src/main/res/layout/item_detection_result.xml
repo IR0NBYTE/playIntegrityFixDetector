@@ -8,8 +8,10 @@
     app:cardElevation="2dp">
 
     <LinearLayout
+        android:id="@+id/rowRoot"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:background="?attr/selectableItemBackground"
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:padding="16dp">
@@ -59,5 +61,13 @@
             android:layout_marginStart="8dp"
             android:textSize="12sp"
             android:textStyle="bold" />
+
+        <ImageView
+            android:id="@+id/expandChevron"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:layout_marginStart="4dp"
+            android:src="@drawable/ic_chevron"
+            android:visibility="invisible" />
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>
