@@ -85,6 +85,18 @@ object ReasonCodes {
         Reason(805, DetectionResult.DETECTION_PROP_SPOOF,
             "The board claims a Pixel while the kernel reports other silicon"),
 
+        Reason(1001, DetectionResult.DETECTION_CODE_INTEGRITY,
+            "A libc function begins with a jump into memory that is not a " +
+                "recognised code source"),
+        Reason(1002, DetectionResult.DETECTION_CODE_INTEGRITY,
+            "An executable mapping comes from somewhere the platform never " +
+                "loads code from"),
+        Reason(1003, DetectionResult.DETECTION_CODE_INTEGRITY,
+            "A GOT entry points outside the library that owns it"),
+        Reason(1004, DetectionResult.DETECTION_CODE_INTEGRITY,
+            "The in-memory text of a library differs from the file on disk, " +
+                "which corroborates a hook rather than proving one"),
+
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),
         Reason(902, DetectionResult.DETECTION_ROOT_HIDER,

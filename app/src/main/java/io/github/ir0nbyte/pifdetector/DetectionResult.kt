@@ -92,6 +92,14 @@ data class DetectionResult(
          */
         const val DETECTION_ATTEST_MODULE_HASH = 0x400000
 
+        /**
+         * In-process code integrity: an inline hook on a libc prologue, or an
+         * executable mapping from a source the platform never loads code from.
+         * Both are observable without privilege, because they are facts about
+         * this process's own address space.
+         */
+        const val DETECTION_CODE_INTEGRITY = 0x800000
+
         private val PRIVILEGED_ONLY = setOf(
             DETECTION_PIF,
             DETECTION_TRICKYSTORE,
@@ -149,6 +157,8 @@ data class DetectionResult(
                  "Duplicated, never-attested or misplaced tags in the attestation record"),
             Spec(DETECTION_ATTEST_MODULE_HASH, "Module Hash Cross-Check",
                  "Attested module hash against the hash the platform reports for its own modules"),
+            Spec(DETECTION_CODE_INTEGRITY, "Code Integrity",
+                 "Inline hooks on libc, or executable memory from an unrecognised source"),
         )
 
         val ALL_FLAGS_MASK: Int = SPECS.fold(0) { acc, s -> acc or s.flag }
