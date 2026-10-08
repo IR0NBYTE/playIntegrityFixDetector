@@ -41,6 +41,59 @@ object AttestationAnalysis {
         return !parsedChallenge.contentEquals(expected)
     }
 
+    /**
+     * The distinct public keys of a pinned set, as encoded SubjectPublicKeyInfo.
+     *
+     * Google re-issues one attestation key as several certificates, so the
+     * question a trust gate actually wants answered is whether a certificate
+     * carries an anchor's KEY, not whether it matches an anchor's bytes.
+     * Deriving it in one place stops the gates drifting apart, which they had:
+     * the validity gate compared keys while the revocation gate compared
+     * encodings, so a handset serving a re-issued root had the root's own
+     * serial submitted for revocation lookup.
+     */
+    fun anchorKeyEncodings(pinnedRoots: List<X509Certificate>): Set<List<Byte>> =
+        pinnedRoots.mapNotNullTo(HashSet()) { root ->
+            runCatching { root.publicKey?.encoded?.toList() }.getOrNull()
+        }
+
+    /** Whether this certificate's public key is one of [anchorKeys]. */
+    fun carriesAnchorKey(cert: X509Certificate, anchorKeys: Set<List<Byte>>): Boolean {
+        if (anchorKeys.isEmpty()) return false
+        val key = runCatching { cert.publicKey?.encoded?.toList() }.getOrNull() ?: return false
+        return key in anchorKeys
+    }
+
+    /**
+     * Whether this certificate IS an instance of a trust anchor, rather than
+     * merely carrying an anchor's key.
+     *
+     * Carrying the key is not sufficient, and the difference is reachable.
+     * Anyone holding a leaked keybox can mint a leaf whose SubjectPublicKeyInfo
+     * is a Google root's public key and have the batch key sign it; that chain
+     * still verifies link by link and still anchors. Keying a skip on the
+     * public key alone would let such a leaf exclude itself from whatever the
+     * skip protects. Every published root is self-signed, so requiring that too
+     * describes a root instance exactly and leaves the forgery outside it.
+     *
+     * The cost of the stricter rule is a cross-signed root, which Google does
+     * not currently publish, being treated as an ordinary certificate. That
+     * direction is the safe one.
+     */
+    fun isAnchorInstance(cert: X509Certificate, anchorKeys: Set<List<Byte>>): Boolean {
+        if (!carriesAnchorKey(cert, anchorKeys)) return false
+        return runCatching {
+            cert.issuerX500Principal == cert.subjectX500Principal
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Pinning four certificates over one key does not make this loop redundant
+     * work: it returns on the first root that answers, so an anchored chain
+     * costs one digest and one verification whichever instance it presents.
+     * Collapsing the repeated key up front was measured and was slower, because
+     * it encodes every anchor key before verifying any of them.
+     */
     fun chainAnchorsToPinnedRoot(
         chain: List<X509Certificate>,
         pinnedRoots: List<X509Certificate>

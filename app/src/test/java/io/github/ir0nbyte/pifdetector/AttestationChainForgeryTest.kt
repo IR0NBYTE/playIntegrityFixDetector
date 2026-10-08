@@ -83,6 +83,85 @@ class AttestationChainForgeryTest {
         )
     }
 
+    /**
+     * A leaf that borrows a trust anchor's public key.
+     *
+     * Anyone holding a leaked keybox can do this: the batch key signs a leaf
+     * whose SubjectPublicKeyInfo is a published Google root's, and the chain
+     * still verifies link by link and still anchors. It is the reason the
+     * revocation skip asks whether a certificate IS a root instance rather than
+     * whether it carries a root's key, so that the leaf cannot use the skip to
+     * keep its own serial out of the lookup.
+     */
+    @Test
+    fun aLeafBorrowingTheAnchorKeyIsNotTreatedAsAnAnchor() {
+        val anchorKey = AttestationRoots.pinnedRoots.first().publicKey.encoded
+        val batch = ca("CN=Leaked batch key")
+        val borrowed = build(
+            subjectDn = "CN=Borrows the anchor key",
+            issuerDn = batch.cert.subjectX500Principal.name,
+            spki = anchorKey,
+            signingKey = batch.privateKeySigner,
+            isCa = false,
+            algOid = ECDSA_SHA256_OID,
+        )
+        val anchorKeys = AttestationAnalysis.anchorKeyEncodings(AttestationRoots.pinnedRoots)
+
+        assertTrue(
+            "the forgery does carry the anchor key, which is the whole hazard",
+            AttestationAnalysis.carriesAnchorKey(borrowed, anchorKeys)
+        )
+        assertFalse(
+            "carrying the key must not make it a root instance",
+            AttestationAnalysis.isAnchorInstance(borrowed, anchorKeys)
+        )
+    }
+
+    /**
+     * So its serial still reaches the revocation lookup. The serial is a
+     * realistic width on purpose: lookup keys shorter than eight characters are
+     * dropped before any comparison, so a counter-sized one would leave this
+     * passing for the wrong reason.
+     */
+    @Test
+    fun aLeafBorrowingTheAnchorKeyStillReachesTheRevocationLookup() {
+        val anchorKey = AttestationRoots.pinnedRoots.first().publicKey.encoded
+        val batch = ca("CN=Leaked batch key")
+        val borrowed = build(
+            subjectDn = "CN=Borrows the anchor key",
+            issuerDn = batch.cert.subjectX500Principal.name,
+            spki = anchorKey,
+            signingKey = batch.privateKeySigner,
+            isCa = false,
+            algOid = ECDSA_SHA256_OID,
+            serial = 0x5A1B2C3D4E5F6071L,
+        )
+
+        val keys = RevocationChecker.serialKeysForChain(
+            listOf(borrowed), AttestationRoots.pinnedRoots
+        )
+        assertTrue(
+            "the forged serial must survive the lookup-key floor",
+            keys.contains("5a1b2c3d4e5f6071")
+        )
+        assertTrue(
+            "a leaf must not be able to exclude itself by borrowing the anchor key",
+            keys.isNotEmpty()
+        )
+    }
+
+    /** A genuine root instance is still skipped, which is what the skip is for. */
+    @Test
+    fun aGenuineRootInstanceIsStillSkipped() {
+        val anchorKeys = AttestationAnalysis.anchorKeyEncodings(AttestationRoots.pinnedRoots)
+        for (root in AttestationRoots.pinnedRoots) {
+            assertTrue(
+                "${root.subjectX500Principal} stopped reading as a root instance",
+                AttestationAnalysis.isAnchorInstance(root, anchorKeys)
+            )
+        }
+    }
+
     private class Issued(
         val cert: X509Certificate,
         val keyPair: KeyPair
@@ -133,12 +212,13 @@ class AttestationChainForgeryTest {
         spki: ByteArray,
         signingKey: PrivateKey,
         isCa: Boolean,
-        algOid: ByteArray
+        algOid: ByteArray,
+        serial: Long = nextSerial()
     ): X509Certificate {
         val algId = seq(algOid)
         val tbs = seq(
             explicit(0, int(2)) +
-                int(nextSerial()) +
+                int(serial) +
                 algId +
                 name(issuerDn) +
                 validity() +
