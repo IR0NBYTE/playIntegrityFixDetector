@@ -11,7 +11,7 @@ android {
         applicationId = "io.github.ir0nbyte.pifdetector"
         minSdk = 24
 
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 11
         versionName = "2.9"
 

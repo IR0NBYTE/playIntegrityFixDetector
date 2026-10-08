@@ -11,6 +11,19 @@ import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 
 class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIFF) {
+
+    /*
+     * Which rows are showing their evidence, keyed by flag. Position would
+     * break the moment the list is resubmitted after a second run, and putting
+     * it on the row itself would make DiffUtil treat an expand as a content
+     * change and animate the whole row.
+     */
+    private val expanded = mutableSetOf<Int>()
+
+    private fun toggle(flag: Int, position: Int) {
+        if (!expanded.add(flag)) expanded.remove(flag)
+        notifyItemChanged(position)
+    }
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
             .inflate(R.layout.item_detection_result, parent, false)
@@ -18,7 +31,10 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
     }
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-        holder.bind(getItem(position))
+        val item = getItem(position)
+        holder.bind(item, expanded.contains(item.flag)) {
+            toggle(item.flag, holder.bindingAdapterPosition)
+        }
     }
 
     class ViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -27,24 +43,54 @@ class ResultAdapter : ListAdapter<DetectionResult, ResultAdapter.ViewHolder>(DIF
         private val descView: TextView = itemView.findViewById(R.id.checkDescription)
         private val detailView: TextView = itemView.findViewById(R.id.checkDetail)
         private val statusView: TextView = itemView.findViewById(R.id.checkStatus)
+        private val chevron: ImageView = itemView.findViewById(R.id.expandChevron)
+        private val rowRoot: View = itemView.findViewById(R.id.rowRoot)
 
-        fun bind(result: DetectionResult) {
-            bindData(result)
+        fun bind(result: DetectionResult, isExpanded: Boolean, onToggle: () -> Unit) {
+            bindData(result, isExpanded)
             applyStatusStyle(result)
+            bindExpansion(result, isExpanded, onToggle)
         }
 
-        private fun bindData(result: DetectionResult) {
+        /*
+         * The evidence is worth having but it is long, and twenty-three rows of
+         * it makes the list unreadable at a glance. Collapsed by default, one
+         * tap away, and rows with nothing to show are not tappable at all so a
+         * tap never produces nothing.
+         */
+        private fun bindExpansion(
+            result: DetectionResult,
+            isExpanded: Boolean,
+            onToggle: () -> Unit,
+        ) {
+            val hasEvidence = evidenceLines(result).isNotEmpty()
+            if (!hasEvidence) {
+                chevron.visibility = View.INVISIBLE
+                rowRoot.setOnClickListener(null)
+                rowRoot.isClickable = false
+                rowRoot.contentDescription = null
+                return
+            }
+            chevron.visibility = View.VISIBLE
+            chevron.rotation = if (isExpanded) 180f else 0f
+            rowRoot.isClickable = true
+            rowRoot.setOnClickListener { onToggle() }
+            rowRoot.contentDescription = itemView.context.getString(
+                if (isExpanded) R.string.row_collapse else R.string.row_expand
+            )
+        }
+
+        private fun evidenceLines(result: DetectionResult): List<String> = buildList {
+            result.detail?.takeIf { it.isNotEmpty() }?.let { add(it) }
+            result.reasons.forEach { add("\u2022 $it") }
+        }
+
+        private fun bindData(result: DetectionResult, isExpanded: Boolean) {
             nameView.text = result.name
             descView.text = result.description
 
-            // The reasons say which sub-probe actually spoke. Without them a
-            // detection is a lit row and the only way to learn what fired was
-            // to attach a debugger to the device showing it.
-            val lines = buildList {
-                result.detail?.takeIf { it.isNotEmpty() }?.let { add(it) }
-                result.reasons.forEach { add("\u2022 $it") }
-            }
-            if (lines.isEmpty()) {
+            val lines = evidenceLines(result)
+            if (lines.isEmpty() || !isExpanded) {
                 detailView.visibility = View.GONE
             } else {
                 detailView.visibility = View.VISIBLE

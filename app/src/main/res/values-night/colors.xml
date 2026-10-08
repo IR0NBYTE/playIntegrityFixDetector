@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="card_clean">#FF17331C</color>
+    <color name="card_detected">#FF3A1A1A</color>
+    <color name="card_review">#FF332A12</color>
+
+    <color name="background">#FF121212</color>
+    <color name="text_secondary">#FFB0B0B0</color>
+</resources>
