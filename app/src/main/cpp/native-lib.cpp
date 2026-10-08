@@ -21,6 +21,11 @@
 #include <cstdlib>
 #include <cctype>
 #include <android/api-level.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
+#include <inttypes.h>
+#include <sys/mman.h>
 
 #ifdef IS_DEBUG_BUILD
 #include <android/log.h>
@@ -79,6 +84,8 @@ static constexpr jint DETECTION_ATTEST_SHAPE = 0x200000;
 // Row identity only. Nothing sets this bit: a module-hash mismatch is also what
 // a staged mainline update produces, so it cannot convict on its own.
 static constexpr jint DETECTION_ATTEST_MODULE_HASH = 0x400000;
+
+static constexpr jint DETECTION_CODE_INTEGRITY = 0x800000;
 
 
 static jclass findClassChecked(JNIEnv* env, const char* name) {
@@ -238,6 +245,11 @@ namespace reason {
     constexpr jint kBusyBoxPresent        = 306;
     constexpr jint kLegacyRootArtifact    = 307;
     constexpr jint kRootManagerInstalled  = 308;
+
+    constexpr jint kInlineHookPrologue    = 1001;
+    constexpr jint kForeignExecMapping    = 1002;
+    constexpr jint kGotEntryForeign       = 1003;
+    constexpr jint kTextDivergence        = 1004;
 
     constexpr jint kMountTmpfsShadow      = 901;
     constexpr jint kMountAdbBind          = 902;
@@ -755,6 +767,550 @@ static jint detectMountArtifacts() {
     }
 
     return result;
+}
+
+namespace codeint {
+
+struct Mapping {
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    unsigned long long offset = 0;
+    bool readable = false;
+    bool exec = false;
+    std::string path;
+};
+
+static std::vector<Mapping> readMappings() {
+    std::vector<Mapping> out;
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (!maps.is_open()) return out;
+
+    std::string line;
+    while (std::getline(maps, line)) {
+        unsigned long long start = 0, end = 0, fileOffset = 0;
+        char perms[8] = {0};
+        int pathOffset = 0;
+        if (sscanf(line.c_str(), "%llx-%llx %7s %llx %*s %*s %n",
+                   &start, &end, perms, &fileOffset, &pathOffset) < 4) {
+            continue;
+        }
+        Mapping m;
+        m.start = static_cast<uintptr_t>(start);
+        m.end = static_cast<uintptr_t>(end);
+        m.offset = fileOffset;
+        m.readable = perms[0] == 'r';
+        m.exec = perms[2] == 'x';
+        if (pathOffset > 0 && static_cast<size_t>(pathOffset) <= line.size()) {
+            m.path = line.substr(static_cast<size_t>(pathOffset));
+        }
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
+static const Mapping* findMapping(const std::vector<Mapping>& maps, uintptr_t addr) {
+    for (const auto& m : maps) {
+        if (addr >= m.start && addr < m.end) return &m;
+    }
+    return nullptr;
+}
+
+static bool readableAt(const std::vector<Mapping>& maps, uintptr_t addr, size_t len) {
+    const Mapping* m = findMapping(maps, addr);
+    if (!m || !m->readable) return false;
+    return addr + len <= m->end;
+}
+
+static bool startsWith(const std::string& s, const char* prefix) {
+    const size_t n = strlen(prefix);
+    return s.size() >= n && s.compare(0, n, prefix) == 0;
+}
+
+static bool isLegitimateCodeSource(const std::string& path) {
+    if (path.empty()) return false;
+
+    static const char* const kRoots[] = {
+        "/system/", "/system_ext/", "/vendor/", "/product/", "/odm/",
+        "/apex/", "/lib/", "/bionic/",
+        "/data/app/", "/data/data/", "/data/user/", "/data/user_de/",
+        "/data/misc/apexdata/", "/data/dalvik-cache/",
+        "/mnt/expand/",
+        "/data/local/tmp/", "/data/preloads/",
+    };
+    for (const char* root : kRoots) {
+        if (startsWith(path, root)) return true;
+    }
+
+    static const char* const kAnonNames[] = {
+        "[anon:dalvik-", "[anon:.bss", "[anon:linker", "[anon:scudo",
+        "[anon:libc_malloc", "[anon:bionic", "[anon:thread signal stack",
+        "[anon:System.", "[anon:stack_and_tls", "[anon:arc4random",
+        "jit-cache", "jit-zygote", "[vdso]", "[vectors]", "[sigpage]",
+        "/memfd:jit-cache", "/memfd:jit-zygote", "/dev/ashmem",
+    };
+    for (const char* name : kAnonNames) {
+        if (path.find(name) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static bool foreignExecMapping(const std::vector<Mapping>& maps, std::string* offender) {
+    for (const auto& m : maps) {
+        if (!m.exec) continue;
+        if (isLegitimateCodeSource(m.path)) continue;
+        if (offender) *offender = m.path.empty() ? "<anonymous>" : m.path;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace codeint
+
+
+/*
+ * Inline hooks on libc prologues.
+ *
+ * The scans this engine already had all match names in /proc/self/maps, and a
+ * rename defeats every one of them. COVERAGE.md records the consequence: behind
+ * Shamiko on the Magisk denylist the whole native scan returns nothing. Reading
+ * the first instruction of a function instead asks what the code does rather
+ * than what it is called.
+ *
+ * PORTABILITY. The project builds four ABIs. Only arm64-v8a and x86_64 get
+ * decoders here, because those are the two whose trampoline shapes are
+ * documented well enough to decode without guessing. On armeabi-v7a and x86 the
+ * probe reports nothing and the row says it is not observable, rather than
+ * inventing byte patterns for an architecture nobody verified.
+ */
+#if defined(__aarch64__) || defined(__x86_64__)
+#define PIFD_PROLOGUE_SCAN_SUPPORTED 1
+#else
+#define PIFD_PROLOGUE_SCAN_SUPPORTED 0
+#endif
+
+namespace codeint {
+
+#if PIFD_PROLOGUE_SCAN_SUPPORTED
+
+/*
+ * Decode an unconditional branch at the start of a function. Returns false when
+ * the prologue is ordinary, which is the overwhelmingly common case.
+ */
+static bool branchTargetAt(const std::vector<Mapping>& maps,
+                           uintptr_t addr, uintptr_t* target) {
+    if (!readableAt(maps, addr, 16)) return false;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(addr);
+
+#if defined(__aarch64__)
+    uint32_t insn = 0;
+    memcpy(&insn, p, sizeof(insn));
+
+    // B imm26: the whole function replaced by a jump.
+    if ((insn & 0xFC000000u) == 0x14000000u) {
+        int32_t imm = static_cast<int32_t>(insn << 6) >> 6;  // sign extend imm26
+        *target = addr + static_cast<intptr_t>(imm) * 4;
+        return true;
+    }
+
+    // LDR x16, #8 ; BR x16, the classic absolute trampoline.
+    uint32_t second = 0;
+    memcpy(&second, p + 4, sizeof(second));
+    const bool ldrX16 = insn == 0x58000050u;   // LDR x16, pc+8
+    const bool ldrX17 = insn == 0x58000051u;   // LDR x17, pc+8
+    const bool brX16 = second == 0xD61F0200u;  // BR x16
+    const bool brX17 = second == 0xD61F0220u;  // BR x17
+    if ((ldrX16 && brX16) || (ldrX17 && brX17)) {
+        if (!readableAt(maps, addr + 8, 8)) return false;
+        uint64_t literal = 0;
+        memcpy(&literal, p + 8, sizeof(literal));
+        *target = static_cast<uintptr_t>(literal);
+        return true;
+    }
+    return false;
+
+#elif defined(__x86_64__)
+    // E9 rel32
+    if (p[0] == 0xE9) {
+        int32_t rel = 0;
+        memcpy(&rel, p + 1, sizeof(rel));
+        *target = addr + 5 + static_cast<intptr_t>(rel);
+        return true;
+    }
+    // FF 25 rel32: jump through a RIP-relative pointer.
+    if (p[0] == 0xFF && p[1] == 0x25) {
+        int32_t rel = 0;
+        memcpy(&rel, p + 2, sizeof(rel));
+        uintptr_t slot = addr + 6 + static_cast<intptr_t>(rel);
+        if (!readableAt(maps, slot, 8)) return false;
+        uint64_t value = 0;
+        memcpy(&value, reinterpret_cast<const void*>(slot), sizeof(value));
+        *target = static_cast<uintptr_t>(value);
+        return true;
+    }
+    // movabs rax, imm64 ; jmp rax
+    if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) {
+        uint64_t imm = 0;
+        memcpy(&imm, p + 2, sizeof(imm));
+        *target = static_cast<uintptr_t>(imm);
+        return true;
+    }
+    return false;
+#endif
+}
+
+/*
+ * Symbols worth asking about, chosen because the hiding stacks hook them.
+ *
+ * Signal functions are deliberately absent. ART's libsigchain inline-hooks
+ * sigaction, signal and sigprocmask on every healthy Android device, so probing
+ * them would report a finding on completely stock hardware.
+ */
+static const char* const kProbedSymbols[] = {
+    "open", "openat", "read", "access", "readlink", "faccessat",
+    "stat", "lstat", "fstat", "fopen",
+    "__system_property_get", "__system_property_find",
+    "connect", "socket",
+    "fork", "execve",
+    "mmap", "mprotect",
+};
+
+static bool inlineHookDetected(const std::vector<Mapping>& maps, std::string* offender) {
+    void* libc = dlopen("libc.so", RTLD_NOW | RTLD_NOLOAD);
+    bool found = false;
+
+    for (const char* name : kProbedSymbols) {
+        void* sym = libc ? dlsym(libc, name) : nullptr;
+        if (!sym) sym = dlsym(RTLD_DEFAULT, name);
+        if (!sym) continue;
+
+        uintptr_t addr = reinterpret_cast<uintptr_t>(sym);
+        uintptr_t target = 0;
+        if (!branchTargetAt(maps, addr, &target)) continue;
+
+        /*
+         * A prologue that jumps is not yet evidence. Bionic tail-calls within
+         * its own image, and a legitimate interposer such as libsigchain lands
+         * in another system library. Only a jump into memory that is not a
+         * recognised code source says something was injected.
+         */
+        const Mapping* dest = findMapping(maps, target);
+        if (dest && isLegitimateCodeSource(dest->path)) continue;
+
+        if (offender) {
+            *offender = std::string(name) + " -> " +
+                (dest == nullptr ? "unmapped" :
+                 (dest->path.empty() ? "<anonymous>" : dest->path));
+        }
+        found = true;
+        break;
+    }
+    if (libc) dlclose(libc);
+    return found;
+}
+
+#else  // not a decoded ABI
+
+static bool inlineHookDetected(const std::vector<Mapping>&, std::string*) { return false; }
+
+#endif
+
+}  // namespace codeint
+
+
+
+namespace codeint {
+
+struct GotScanState {
+    const std::vector<Mapping>* maps;
+    std::string offender;
+    int slotsExamined;
+    bool found;
+};
+
+/*
+ * A GOT slot that points somewhere the platform never loads code from.
+ *
+ * A PLT hook rewrites the slot so a call lands in the hooker's trampoline
+ * instead of the real implementation. Lazy binding is not a false positive
+ * here: an unresolved slot points at the linker's own resolver, which lives in
+ * a system path, and so does every honestly resolved slot.
+ */
+static int gotScanCallback(struct dl_phdr_info* info, size_t, void* data) {
+    GotScanState* st = static_cast<GotScanState*>(data);
+    if (st->found || st->slotsExamined > 8000) return 1;
+
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(
+                info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return 0;
+
+    uintptr_t jmprel = 0;
+    size_t pltrelsz = 0;
+    uintptr_t pltrel = 0;
+    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_JMPREL:   jmprel = static_cast<uintptr_t>(d->d_un.d_ptr); break;
+            case DT_PLTRELSZ: pltrelsz = static_cast<size_t>(d->d_un.d_val); break;
+            case DT_PLTREL:   pltrel = static_cast<uintptr_t>(d->d_un.d_val); break;
+            default: break;
+        }
+    }
+    if (!jmprel || !pltrelsz) return 0;
+
+    // DT_JMPREL is already absolute on Android for loaded objects, but a
+    // prelinked value below the load bias needs it added.
+    if (jmprel < info->dlpi_addr) jmprel += info->dlpi_addr;
+
+    const size_t entSize = (pltrel == DT_RELA) ? sizeof(ElfW(Rela)) : sizeof(ElfW(Rel));
+    const size_t count = pltrelsz / entSize;
+
+    for (size_t i = 0; i < count; i++) {
+        if (++st->slotsExamined > 8000) break;
+
+        uintptr_t rOffset;
+        if (pltrel == DT_RELA) {
+            const ElfW(Rela)* r = reinterpret_cast<const ElfW(Rela)*>(jmprel + i * entSize);
+            if (!readableAt(*st->maps, reinterpret_cast<uintptr_t>(r), entSize)) break;
+            rOffset = static_cast<uintptr_t>(r->r_offset);
+        } else {
+            const ElfW(Rel)* r = reinterpret_cast<const ElfW(Rel)*>(jmprel + i * entSize);
+            if (!readableAt(*st->maps, reinterpret_cast<uintptr_t>(r), entSize)) break;
+            rOffset = static_cast<uintptr_t>(r->r_offset);
+        }
+
+        const uintptr_t slot = info->dlpi_addr + rOffset;
+        if (!readableAt(*st->maps, slot, sizeof(uintptr_t))) continue;
+
+        uintptr_t value = 0;
+        memcpy(&value, reinterpret_cast<const void*>(slot), sizeof(value));
+        if (value == 0) continue;  // never bound
+
+        const Mapping* dest = findMapping(*st->maps, value);
+        if (dest && isLegitimateCodeSource(dest->path)) continue;
+        // An address in no mapping at all is a torn read, not evidence.
+        if (!dest) continue;
+
+        const char* owner = (info->dlpi_name && *info->dlpi_name) ? info->dlpi_name : "<main>";
+        st->offender = std::string(owner) + " -> " +
+            (dest->path.empty() ? "<anonymous>" : dest->path);
+        st->found = true;
+        return 1;
+    }
+    return 0;
+}
+
+static bool gotEntryForeign(const std::vector<Mapping>& maps, std::string* offender) {
+    GotScanState st{&maps, "", 0, false};
+    dl_iterate_phdr(gotScanCallback, &st);
+    if (st.found && offender) *offender = st.offender;
+    return st.found;
+}
+
+/*
+ * In-memory text against the file on disk.
+ *
+ * Corroboration only, and the caller must treat it that way. A hider with the
+ * reach to patch a prologue can also redirect a read of the library file, so a
+ * match proves nothing and a mismatch is only consistent with a hook. It is
+ * reported alongside a hook that was already found, never on its own.
+ */
+static bool textDivergesFromDisk(const std::vector<Mapping>& maps, const char* soSuffix) {
+    const Mapping* exec = nullptr;
+    for (const auto& m : maps) {
+        if (!m.exec || m.path.empty()) continue;
+        const size_t n = strlen(soSuffix);
+        if (m.path.size() >= n && m.path.compare(m.path.size() - n, n, soSuffix) == 0) {
+            exec = &m;
+            break;
+        }
+    }
+    if (!exec || !exec->readable) return false;
+
+    ScopedFile f(exec->path.c_str(), "rb");
+    if (!f.isOpen()) return false;
+    if (fseek(f, static_cast<long>(exec->offset), SEEK_SET) != 0) return false;
+
+    constexpr size_t kWindow = 4096;
+    if (exec->start + kWindow > exec->end) return false;
+
+    std::vector<unsigned char> onDisk(kWindow);
+    if (fread(onDisk.data(), 1, kWindow, f) != kWindow) return false;
+
+    return memcmp(onDisk.data(), reinterpret_cast<const void*>(exec->start), kWindow) != 0;
+}
+
+}  // namespace codeint
+
+
+namespace codeint {
+
+/*
+ * Positive controls.
+ *
+ * Neither arm fires on any device available here, which is the right answer
+ * but leaves a check that has never been seen to work. This codebase has
+ * shipped two checks that silently always returned false, so a detection with
+ * no demonstration is not something to take on trust. These run on every
+ * device the instrumented suite touches and assert the machinery can fire.
+ */
+static int selfTestFailures() {
+    int failures = 0;
+    const std::vector<Mapping> maps = readMappings();
+    if (maps.empty()) return 1;
+
+#if PIFD_PROLOGUE_SCAN_SUPPORTED
+    // A synthesised trampoline must decode to the address it jumps to, and an
+    // ordinary prologue must decode to nothing.
+    alignas(8) unsigned char buf[32];
+    uintptr_t target = 0;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(buf);
+
+#if defined(__aarch64__)
+    // B +256
+    memset(buf, 0, sizeof(buf));
+    const uint32_t b = 0x14000040u;
+    memcpy(buf, &b, 4);
+    target = 0;
+    if (!branchTargetAt(maps, base, &target) || target != base + 256) failures++;
+
+    // LDR x16, #8 ; BR x16 ; <literal>
+    memset(buf, 0, sizeof(buf));
+    const uint32_t ldr = 0x58000050u, br = 0xD61F0200u;
+    const uint64_t literal = 0xDEADBEEF1000ull;
+    memcpy(buf, &ldr, 4);
+    memcpy(buf + 4, &br, 4);
+    memcpy(buf + 8, &literal, 8);
+    target = 0;
+    if (!branchTargetAt(maps, base, &target) ||
+        target != static_cast<uintptr_t>(literal)) failures++;
+
+    // STP x29, x30, [sp, #-16]! is an ordinary prologue, not a branch.
+    memset(buf, 0, sizeof(buf));
+    const uint32_t stp = 0xA9BF7BFDu;
+    memcpy(buf, &stp, 4);
+    target = 0;
+    if (branchTargetAt(maps, base, &target)) failures++;
+
+#elif defined(__x86_64__)
+    // E9 rel32
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0xE9;
+    const int32_t rel = 0x100;
+    memcpy(buf + 1, &rel, 4);
+    target = 0;
+    if (!branchTargetAt(maps, base, &target) ||
+        target != base + 5 + static_cast<uintptr_t>(rel)) failures++;
+
+    // movabs rax, imm64 ; jmp rax
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0x48; buf[1] = 0xB8;
+    const uint64_t imm = 0xDEADBEEF2000ull;
+    memcpy(buf + 2, &imm, 8);
+    buf[10] = 0xFF; buf[11] = 0xE0;
+    target = 0;
+    if (!branchTargetAt(maps, base, &target) ||
+        target != static_cast<uintptr_t>(imm)) failures++;
+
+    // push rbp is an ordinary prologue.
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0x55;
+    target = 0;
+    if (branchTargetAt(maps, base, &target)) failures++;
+#endif
+#endif  // PIFD_PROLOGUE_SCAN_SUPPORTED
+
+    /*
+     * An anonymous executable page is exactly the shape the mapping arm looks
+     * for, so mapping one and scanning again proves the arm can see it. It is
+     * unmapped immediately, so it cannot leak into a later real run.
+     */
+    void* page = mmap(nullptr, 4096, PROT_READ | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        // Some hardened kernels refuse anonymous PROT_EXEC. That is not a
+        // failure of the check, so it is not counted as one.
+    } else {
+        const std::vector<Mapping> withPage = readMappings();
+        std::string offender;
+        if (!foreignExecMapping(withPage, &offender)) failures++;
+        munmap(page, 4096);
+
+        // And with it gone, a clean scan must say nothing.
+        const std::vector<Mapping> after = readMappings();
+        std::string none;
+        if (foreignExecMapping(after, &none)) failures++;
+    }
+
+    // A legitimate source must never be reported, whatever else is true.
+    if (isLegitimateCodeSource("/mnt/expand/1234-abcd/app/~~x==/base.apk!/lib/arm64-v8a/libfoo.so")
+        == false) failures++;
+    if (isLegitimateCodeSource("/data/adb/modules/evil/lib/libhook.so")) failures++;
+    if (isLegitimateCodeSource("")) failures++;
+
+    return failures;
+}
+
+}  // namespace codeint
+
+/*
+ * Code integrity of this process.
+ *
+ * Every other in-process scan here matches a name, and a rename defeats all of
+ * them; COVERAGE.md records that the whole native scan returns nothing behind
+ * Shamiko on the denylist. These two arms look at what the code does instead.
+ *
+ * The text-section comparison the issue also asked for is deliberately absent
+ * as a finding. A hider that can redirect a read of the library file can make
+ * the on-disk copy say whatever it likes, so the comparison corroborates a hook
+ * that was already found rather than proving one on its own. It is noted
+ * alongside a hook, never by itself.
+ */
+static bool detectCodeIntegrity() {
+    const std::vector<codeint::Mapping> maps = codeint::readMappings();
+    if (maps.empty()) return false;
+
+    bool found = false;
+
+    std::string hooked;
+    const bool hookFound = codeint::inlineHookDetected(maps, &hooked);
+    if (hookFound) {
+        LOGD("inline hook: %s", hooked.c_str());
+        reason::note(reason::kInlineHookPrologue);
+        found = true;
+    }
+
+    std::string offender;
+    if (codeint::foreignExecMapping(maps, &offender)) {
+        LOGD("foreign executable mapping: %s", offender.c_str());
+        reason::note(reason::kForeignExecMapping);
+        found = true;
+    }
+
+    std::string gotOffender;
+    if (codeint::gotEntryForeign(maps, &gotOffender)) {
+        LOGD("foreign GOT entry: %s", gotOffender.c_str());
+        reason::note(reason::kGotEntryForeign);
+        found = true;
+    }
+
+    /*
+     * Corroboration, and only that. It runs solely when a hook was already
+     * found, because a hider able to patch a prologue can also redirect a read
+     * of the library file, so on its own a difference proves nothing and a
+     * match disproves nothing. Reporting it standalone would also put a finding
+     * on any device whose text legitimately differs from the packaged file.
+     */
+    if (hookFound && codeint::textDivergesFromDisk(maps, "/libc.so")) {
+        LOGD("libc text diverges from disk");
+        reason::note(reason::kTextDivergence);
+    }
+
+    return found;
 }
 
 static bool detectOverlayFS() {
@@ -1539,6 +2095,10 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
             if (hider) r |= DETECTION_ROOT_HIDER;
             return r;
         }},
+        {10, [](JNIEnv*, jobject) -> jint {
+            if (detectCodeIntegrity()) return DETECTION_CODE_INTEGRITY;
+            return 0;
+        }},
         {1, [](JNIEnv*, jobject) -> jint {
             jint r = 0;
             if (detectPIFSideEffects())
@@ -1632,7 +2192,7 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_ATTEST_REVOKED | DETECTION_ATTEST_CROSS_SOURCE |
            DETECTION_ATTEST_SOFTWARE | DETECTION_ATTEST_VALIDITY |
            DETECTION_ATTEST_VERSION | DETECTION_ATTEST_SHAPE |
-           DETECTION_ATTEST_MODULE_HASH;
+           DETECTION_ATTEST_MODULE_HASH | DETECTION_CODE_INTEGRITY;
 }
 
 // Reads the properties the Kotlin cross-source check compares against the

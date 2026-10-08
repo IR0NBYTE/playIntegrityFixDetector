@@ -48,6 +48,7 @@ rows that rest on them:
 | SIGNATURE | signing cert SHA-256 against a build-time digest, fail-closed | Yes | Works; compiled out in debug and when no digest is supplied | Signature-spoofing frameworks that swap the PackageInfo CREATOR |
 | PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC | Yes | Directional, only fires when the scalars claim a clean production build | Global, self-consistent property rewriting |
 | CANARY_FP | global Pixel Canary build id, vendor fingerprint mismatch, brand cross-check | Yes | Only catches global fingerprint spoofing | Zygisk-scoped spoofing, which never reaches our process |
+| CODE_INTEGRITY | libc prologue inline-hook decode (arm64-v8a and x86_64 only), executable mappings from unrecognised sources, PLT GOT slots pointing outside any recognised code source, libc text against the file on disk | Yes | Reads only this process's own address space, so no privilege is involved. Measured silent on a clean API 34 emulator and on a rooted Samsung A06: Magisk's root is filesystem-level and inline-hooks nothing in our process, so silence there is the correct answer rather than a dead check. The arms are proven to fire by the native self test, which synthesises arm64 and x86_64 trampolines and maps an anonymous executable page on every device the suite runs on | A hider that hooks nothing in our address space is invisible to it, by construction. On armeabi-v7a and x86 the prologue arm does not run at all: only arm64-v8a and x86_64 have decoders, and the other two report nothing rather than guess at byte patterns nobody verified. The text comparison is corroboration only and never fires alone, because a hider that can patch a prologue can also redirect a read of the library file |
 | TREAT_WHEEL | maps needle | Yes | In-process, genuinely fires | A renamed build |
 | ATTEST_ANOMALY | chain signatures, CA issuers, root anchoring, challenge echo, RootOfTrust vs tamper, boot properties vs RootOfTrust | Yes | Fires on the test device: properties claim locked while the genuine Titan M2 reports the bootloader unlocked | A keystore simulator that also sanitizes the properties it contradicts |
 | ATTEST_FORGERY | attest-key provocation, auth-bound SHA-512 provocation, self-signed single cert | Yes | Works. The tag-503 arm now fires on nothing current and is retained only for TEESimulator v3 and older | Simulators that honour setAttestKeyAlias and auth-bound keys |
@@ -120,7 +121,11 @@ keystore spoofing module installed:
   /adb bind that leaks a module name disappears. All remaining tmpfs mounts
   carry the genuine source "tmpfs".
 - The whole native scan returns 0. Zygisk, Root Hider, property and artifact
-  checks all report clean.
+  checks all report clean. CODE_INTEGRITY is the answer to this row, and it is an
+  honest partial one: it verifies code rather than names, so a rename does not defeat
+  it, but it only sees a hider that actually touches this process. Shamiko cleaning a
+  namespace leaves no hook behind, so it stays silent here too. What it covers is the
+  injection case, not the mount-hiding case.
 - Key attestation still fires. The properties claim verifiedbootstate=green and
   flash.locked=1, while the genuine TEE attests a bootloader that is necessarily
   unlocked, and a root hider cannot reach what the TEE signs.
