@@ -88,6 +88,23 @@ The native function returns a bitmask: `0` means clean, any set bit indicates a 
 
 Flag values are owned by the native side; `DetectionRunner.verifyFlagsInSync()` asserts at startup that the Kotlin mirrors match `nativeAllFlagsMask()`.
 
+## Reading a result
+
+Each check reports one state rather than a pass or fail: detected, reported (a real
+observation that cannot convict on its own), unverifiable (it tried and reached no verdict),
+skipped (a precondition failed), not observable (this device cannot produce the evidence) or
+pass. Only detected counts as a finding, and only observable rows count towards the pass
+total, so the summary never claims coverage the sandbox or the hardware forbids.
+
+Rows that have evidence carry a chevron. Tapping one shows what the engine actually saw: the
+detail line and, where the check is wired for them, the reason lines naming which sub-probe
+fired, such as `ro.boot.flash.locked is zero` rather than just a lit row.
+
+The overflow menu exports a plain-text report with every check, its state, its reasons, an
+attestation summary, the bundled revocation snapshot date and the build identity. It is meant
+to be attached to an issue. It deliberately carries no certificate serials, no attestation
+challenge and no certificate bytes, and a test fails if any of those appear.
+
 ## Build
 
 ```bash

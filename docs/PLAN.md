@@ -196,6 +196,24 @@ colours and stay out of the pass count.
 Done when: DetectionResultTest still asserts the bitmask SSOT, a report exported from a
 lab device names the exact needle that fired, and the API 36 layout is correct.
 
+LANDED in 3.0. CheckState carries one state per row instead of five booleans; it has six
+states, not the five named above, because the checks added in 2.8 and 2.9 produce real
+observations that are not findings and belong in neither CLEAN nor DETECTED. The engine
+returns the bitmask and reason codes in one array, and ReasonCodesSyncTest reads the
+constants out of native-lib.cpp so the two sides cannot drift. The report is plain text and
+deliberately carries no serials, challenge or certificate bytes.
+
+Verified on a rooted Pixel 7a and a rooted Samsung A06 rather than only on an emulator,
+which is what turned up the list running under the controls, the unreadable status card in
+dark mode, and the root family short-circuiting so that only the first arm was ever
+reported.
+
+Caveat on D4: the API 36 system image on this machine will not boot, failing with
+qemu_mprotect mprotect: Permission denied, so the layout was confirmed on API 34 with the
+decor explicitly told not to fit system windows. That is the same mechanism Android 16
+enforces for targetSdk 36, but it is not the same as seeing it on Android 16, and it should
+be checked there when an image boots.
+
 ### Phase E: v3.0, behavioural probes
 
 Branch: feat/keystore-behaviour. These are the new load-bearing signals; each ships only
