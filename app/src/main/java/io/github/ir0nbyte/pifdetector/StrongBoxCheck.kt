@@ -79,12 +79,36 @@ object StrongBoxCheck {
     enum class AesOutcome { ACCEPTED, REFUSED, UNAVAILABLE, NOT_ATTEMPTED }
 
     /**
-     * The one AES size a StrongBox must not support. 128 and 256 are the two it
-     * must, so 192 is the only value in the gap. A wildly invalid size would
-     * prove nothing, because something other than the StrongBox rule could
-     * refuse it.
+     * The one AES size a KeyMint StrongBox must not support. 128 and 256 are
+     * the two it must, so 192 is the only value in the gap. A wildly invalid
+     * size would prove nothing, because something other than the StrongBox rule
+     * could refuse it.
      */
     const val AES_FORBIDDEN_SIZE_BITS = 192
+
+    /**
+     * The strongbox_keystore feature version from which the AES size
+     * restriction exists at all.
+     *
+     * MEASURED, and the measurement is the reason this gate is here. The
+     * exclusive sentence, "STRONGBOX IKeyMintDevices must only support 128 and
+     * 256-bit keys", appears in IKeyMintDevice.aidl and in no earlier HAL. The
+     * Keymaster 4.0 document that preceded it lists AES as "128 and 256-bit
+     * keys" with no StrongBox clause of any kind, so it never forbade 192 to a
+     * secure element. A stock, locked Samsung SM-G780G declaring
+     * strongbox_keystore=4 accepts a 192 bit StrongBox AES key, and it is
+     * entitled to: it implements Keymaster 4.0, not KeyMint.
+     *
+     * PackageManager's javadoc gives the version ladder as 40 and 41 for the
+     * Keymaster generations and 100 upward for KeyMint, 100 being where
+     * hardware ECDH and app-generated attestation keys arrive. So 100 is the
+     * first version whose HAL carries the restriction.
+     *
+     * A device that declares no version reads as 0 and is never judged, which
+     * is the safe direction: the javadoc warns the version may be unset on
+     * anything launched before Android 12.
+     */
+    const val STRONGBOX_FEATURE_VERSION_KEYMINT_1 = 100
 
     /**
      * The two security levels one attestation record states.
@@ -117,6 +141,7 @@ object StrongBoxCheck {
      */
     data class Observation(
         val featureDeclared: Boolean? = null,
+        val strongBoxFeatureVersion: Int? = null,
         val availability: Availability? = null,
         val ordinaryKeyLevel: Int? = null,
         val ordinaryRecord: Record? = null,
@@ -156,13 +181,18 @@ object StrongBoxCheck {
         }
 
         // The constraint arm, and the only one here that asks a StrongBox to
-        // refuse something rather than asking it to exist. Gated on the
+        // refuse something rather than asking it to exist. Gated twice. On the
         // keystore having actually served a StrongBox key, because on a device
         // with no secure element the AES request is turned away for that reason
-        // and says nothing about key sizes. Phrased as acceptance being the
-        // finding, never refusal, which is what a genuine StrongBox does.
+        // and says nothing about key sizes. And on the secure element being a
+        // KeyMint one, because the restriction does not exist before KeyMint
+        // and a genuine Keymaster 4.0 StrongBox on the bench accepts the size:
+        // see STRONGBOX_FEATURE_VERSION_KEYMINT_1. Phrased as acceptance being
+        // the finding, never refusal, which is what a conforming StrongBox
+        // does.
         if (observation.availability == Availability.SERVED &&
-            observation.aes192 == AesOutcome.ACCEPTED
+            observation.aes192 == AesOutcome.ACCEPTED &&
+            (observation.strongBoxFeatureVersion ?: 0) >= STRONGBOX_FEATURE_VERSION_KEYMINT_1
         ) {
             reasons.add(REASON_STRONGBOX_TOOK_AES_192)
         }

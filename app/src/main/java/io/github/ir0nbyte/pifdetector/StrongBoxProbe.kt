@@ -42,12 +42,13 @@ import javax.crypto.KeyGenerator
  * because both StrongBox requests land at getSecurityLevel before any key is
  * generated.
  *
- * The AES 192 arm is the constraint half of issue 7, built here because it is
- * the one candidate that survives primary source: the HAL is exclusive about
- * the size and the framework does not pre-empt the request. What this bench can
- * verify is that the request is well formed and reaches the keystore; what it
- * cannot is a genuine secure element refusing it, because no attached device
- * has one. See docs/COVERAGE.md.
+ * The AES 192 arm is the constraint half of issue 7: the KeyMint HAL is
+ * exclusive about that size and the framework does not pre-empt the request, so
+ * the refusal has to come from the secure element. It is gated on the StrongBox
+ * being a KeyMint one, because a Keymaster 4.0 secure element was never told to
+ * refuse it and a genuine one on the phone station does not. Measured on the
+ * station: a Pixel 7a at strongbox_keystore=300 refuses the key, and a Samsung
+ * SM-G780G at strongbox_keystore=4 accepts it. See docs/COVERAGE.md.
  *
  * Specced in issue 7 and deliberately not built, with the reasons:
  *
@@ -97,6 +98,7 @@ class StrongBoxProbe {
         val ordinary = observeOrdinaryKey()
         return StrongBoxCheck.Observation(
             featureDeclared = declaresStrongBox(context),
+            strongBoxFeatureVersion = strongBoxFeatureVersion(context),
             availability = observeAvailability(),
             ordinaryKeyLevel = ordinary?.level,
             ordinaryRecord = ordinary?.record,
@@ -118,6 +120,27 @@ class StrongBoxProbe {
             context.packageManager.hasSystemFeature(FEATURE_STRONGBOX_KEYSTORE)
         } catch (e: Throwable) {
             Log.d(TAG, "feature list unavailable", e)
+            null
+        }
+    }
+
+    /**
+     * The version the device's own strongbox_keystore feature declares, which
+     * says which StrongBox generation this is and therefore which HAL document
+     * applies. Null when the feature list cannot be read; 0 when the feature
+     * carries no version, which the AES arm treats as "do not judge".
+     *
+     * hasSystemFeature(name, version) only answers a threshold question, so the
+     * feature list is walked to read the value, as DeviceIdentity does.
+     */
+    private fun strongBoxFeatureVersion(context: Context): Int? {
+        return try {
+            context.packageManager.systemAvailableFeatures
+                .firstOrNull { it.name == FEATURE_STRONGBOX_KEYSTORE }
+                ?.version
+                ?: 0
+        } catch (e: Throwable) {
+            Log.d(TAG, "feature versions unavailable", e)
             null
         }
     }
