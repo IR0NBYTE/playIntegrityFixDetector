@@ -51,7 +51,7 @@ rows that rest on them:
 | CODE_INTEGRITY | libc prologue inline-hook decode (arm64-v8a and x86_64 only), executable mappings from unrecognised sources, PLT GOT slots pointing outside any recognised code source, libc text against the file on disk | Yes | Reads only this process's own address space, so no privilege is involved. Measured silent on a clean API 34 emulator and on a rooted Samsung A06: Magisk's root is filesystem-level and inline-hooks nothing in our process, so silence there is the correct answer rather than a dead check. The arms are proven to fire by the native self test, which synthesises arm64 and x86_64 trampolines and maps an anonymous executable page on every device the suite runs on | A hider that hooks nothing in our address space is invisible to it, by construction. On armeabi-v7a and x86 the prologue arm does not run at all: only arm64-v8a and x86_64 have decoders, and the other two report nothing rather than guess at byte patterns nobody verified. The text comparison is corroboration only and never fires alone, because a hider that can patch a prologue can also redirect a read of the library file |
 | TREAT_WHEEL | maps needle | Yes | In-process, genuinely fires | A renamed build |
 | ATTEST_ANOMALY | chain signatures, CA issuers, root anchoring, challenge echo, RootOfTrust vs tamper, boot properties vs RootOfTrust | Yes | Fires on the test device: properties claim locked while the genuine Titan M2 reports the bootloader unlocked | A keystore simulator that also sanitizes the properties it contradicts |
-| ATTEST_FORGERY | attest-key provocation, auth-bound SHA-512 provocation, self-signed single cert, plus two keystore boundary probes: a key generated with no attestation challenge, and a challenge one byte past the documented 128 byte maximum, plus the identifier probe: an ordinary attestation record that carries a device identifier nothing asked for, a record carrying an identifier this app cannot request at all, and a device-properties request that is accepted and then attests nothing or attests identifiers the secure environment did not vouch for, plus the StrongBox cross-check: an ordinary key the keystore labels StrongBox, or a record claiming StrongBox, after keystore2 has already said it has no StrongBox instance, and a StrongBox key served on a device whose own feature list declares no StrongBox | Yes | Works. The tag-503 arm now fires on nothing current and is retained only for TEESimulator v3 and older. The boundary arms are silent on both bench devices, which is the documented answer: a no-challenge key comes back self-signed with no record, and a 129 byte challenge draws INVALID_INPUT_LENGTH. Both are quoted from the KeyMint HAL, and both are answered by KeyMint rather than by the framework, so they reach the layer a simulator replaces. The identifier arms are silent on both bench devices for the same kind of reason: an ordinary record carries no identifier tag at all, and the device-properties request is refused with CANNOT_ATTEST_IDS, which Tag.aidl requires from a device that cannot attest its identifiers. Neither bench device declares `android.software.device_id_attestation`, so the accepted path has no hardware witness here and the three arms that judge an acceptance rest on the decision table alone. The StrongBox arms are silent on the two devices this pass could install on, a Samsung SM-A065F TEE and the AOSP emulator, both API 34 and neither declaring `android.hardware.strongbox_keystore`: the StrongBox request is refused with `StrongBoxUnavailableException`, and nothing else on either device comes back labelled StrongBox. That refusal is a platform answer rather than a framework one, which is the whole reason the arm is worth having: keystore2's `get_security_level` returns `HARDWARE_TYPE_UNAVAILABLE` when no KeyMint instance is registered at that level, `AndroidKeyStoreKeyPairGeneratorSpi` maps that one error to `StrongBoxUnavailableException`, and there is no `hasSystemFeature` test anywhere in the generate path. Both of the clean arms are therefore hardware-witnessed; what is not witnessed is a device that actually has a secure element, so the served-and-honest row is table-only until a StrongBox device is attached | Simulators that honour setAttestKeyAlias and auth-bound keys. A simulator that fills the identifier block unconditionally, which is what forging device-properties attestation takes. The known false positive vector mirrors the over-limit one: the Tag.aidl sentence that identifier tags "must be set only when requesting attestation of the device's identifiers" is addressed to the caller, so an OEM KeyMint that populates the identifier block unprompted would be reported. The privileged half carries no such risk, because an app without READ_PRIVILEGED_PHONE_STATE receiving an attested serial or IMEI is a platform violation on any reading. For the boundary arms, a simulator that reproduces both behaviours exactly. The known false positive vector is an OEM KeyMint that accepts an over-limit challenge: Tag.aidl says INVALID_INPUT_LENGTH "should" be returned rather than must, so a non-conformant implementation would be reported. For the StrongBox arms, a simulator that registers a fake StrongBox KeyMint instance, or a forged record copied from a leaked StrongBox keybox onto a device with no secure element. The two arms that need keystore2 to have denied StrongBox carry no false positive vector at all, because a device claiming a part it has just said it does not have has contradicted itself whatever any document says. The third arm does carry one: it reads the feature list as the authority on whether the hardware is there, which is what CTS does, so an OEM that ships the StrongBox HAL instance and omits the feature entry would be reported |
+| ATTEST_FORGERY | attest-key provocation, auth-bound SHA-512 provocation, self-signed single cert, plus two keystore boundary probes: a key generated with no attestation challenge, and a challenge one byte past the documented 128 byte maximum, plus the identifier probe: an ordinary attestation record that carries a device identifier nothing asked for, a record carrying an identifier this app cannot request at all, and a device-properties request that is accepted and then attests nothing or attests identifiers the secure environment did not vouch for, plus the StrongBox cross-check: an ordinary key the keystore labels StrongBox, or a record claiming StrongBox, after keystore2 has already said it has no StrongBox instance, and a StrongBox key served on a device whose own feature list declares no StrongBox, and a secure element that accepts a 192 bit AES key | Yes | Works. The tag-503 arm now fires on nothing current and is retained only for TEESimulator v3 and older. The boundary arms are silent on both bench devices, which is the documented answer: a no-challenge key comes back self-signed with no record, and a 129 byte challenge draws INVALID_INPUT_LENGTH. Both are quoted from the KeyMint HAL, and both are answered by KeyMint rather than by the framework, so they reach the layer a simulator replaces. The identifier arms are silent on both bench devices for the same kind of reason: an ordinary record carries no identifier tag at all, and the device-properties request is refused with CANNOT_ATTEST_IDS, which Tag.aidl requires from a device that cannot attest its identifiers. Neither bench device declares `android.software.device_id_attestation`, so the accepted path has no hardware witness here and the three arms that judge an acceptance rest on the decision table alone. The StrongBox arms are silent on the two devices this pass could install on, a Samsung SM-A065F TEE and the AOSP emulator, both API 34 and neither declaring `android.hardware.strongbox_keystore`: the StrongBox request is refused with `StrongBoxUnavailableException`, and nothing else on either device comes back labelled StrongBox. That refusal is a platform answer rather than a framework one, which is the whole reason the arm is worth having: keystore2's `get_security_level` returns `HARDWARE_TYPE_UNAVAILABLE` when no KeyMint instance is registered at that level, `AndroidKeyStoreKeyPairGeneratorSpi` maps that one error to `StrongBoxUnavailableException`, and there is no `hasSystemFeature` test anywhere in the generate path. Both of the claim arms are therefore hardware-witnessed; what is not witnessed is a device that actually has a secure element, so the served-and-honest row is table-only until a StrongBox device is attached. The AES 192 arm is the constraint half, and its verification is deliberately partial and split: what the bench proves is that the request is well formed and reaches the keystore rather than being rejected locally by the framework, which is what the `NOT_ATTEMPTED` outcome exists to detect and what `theAesRequestIsWellFormedAndReachesTheKeystore` asserts on both devices. What the bench cannot prove is a genuine secure element refusing the size, because none is attached. The arm is gated on the keystore having actually served a StrongBox key, so it is inert rather than guessing everywhere on this bench | Simulators that honour setAttestKeyAlias and auth-bound keys. A simulator that fills the identifier block unconditionally, which is what forging device-properties attestation takes. The known false positive vector mirrors the over-limit one: the Tag.aidl sentence that identifier tags "must be set only when requesting attestation of the device's identifiers" is addressed to the caller, so an OEM KeyMint that populates the identifier block unprompted would be reported. The privileged half carries no such risk, because an app without READ_PRIVILEGED_PHONE_STATE receiving an attested serial or IMEI is a platform violation on any reading. For the boundary arms, a simulator that reproduces both behaviours exactly. The known false positive vector is an OEM KeyMint that accepts an over-limit challenge: Tag.aidl says INVALID_INPUT_LENGTH "should" be returned rather than must, so a non-conformant implementation would be reported. For the StrongBox arms, a simulator that registers a fake StrongBox KeyMint instance, or a forged record copied from a leaked StrongBox keybox onto a device with no secure element. The two arms that need keystore2 to have denied StrongBox carry no false positive vector at all, because a device claiming a part it has just said it does not have has contradicted itself whatever any document says. The third arm does carry one: it reads the feature list as the authority on whether the hardware is there, which is what CTS does, so an OEM that ships the StrongBox HAL instance and omits the feature entry would be reported. The AES 192 arm's vector is an OEM secure element that supports 192 anyway, which the HAL forbids in the exclusive form ("must only support 128 and 256-bit keys") but which nothing on this bench could check |
 | ATTEST_REVOKED | chain serials against Google's published revocation list, offline snapshot plus optional online refresh. Informational only: sets no detection bit | Yes | See the section below | A keybox not yet published as revoked, which is the normal case for a fresh rotation |
 | ATTEST_CROSS_SOURCE | attested osPatchLevel NEWER than `ro.build.version.security_patch`, which is ungated because CTS forbids it in every configuration; the two levels DISAGREEING in either direction, behind a locked-and-verified gate plus a Keymaster 4 gate; the attested verifiedBootHash differing from `ro.boot.vbmeta.digest` when both are real 32-byte digests; and a day-precision tag that is neither a valid date nor a month. Five arms are computed and reported but do NOT drive the verdict: both vendor-patch arms, the absent boot patch level, a month-precision day field, and an attested boot hash carrying no usable digest | Yes | Silent on all three. The OS comparison resolves real-to-real on each (202412, 202409, 202508). The boot-hash arm drives the verdict on the strength of three vendors agreeing plus the VTS assertion, rather than one device family | A simulator that also rewrites the properties in the same pass, or scopes its spoof to other packages so our process is served the genuine record |
 | ATTEST_SOFTWARE | software-level attestation on a device presenting as production hardware with a declared hardware-backed keystore | Yes | Silent on the test device, whose chain is TrustedEnvironment and Google anchored | Presenting honestly as an emulator, which is also the legitimate case |
@@ -118,9 +118,12 @@ the reasons are worth keeping so they are not re-proposed.
   keystore mis-sizes the buffer. That is a defect in that device, not evidence
   about spoofing.
 - **updateAad on a signing operation, and update after abort.** Neither is
-  reachable through public API. Both need the keystore2 operation interface, so
-  probing them would mean reflecting into non-public internals that move between
-  releases.
+  reachable through public API, which is checkable rather than asserted:
+  `java.security.Signature` publishes four `update` overloads and no
+  `updateAAD` and no `abort`, and `SignatureSpi` likewise. `Cipher.updateAAD`
+  exists but belongs to a cipher operation, not a signing one. Both would need
+  the keystore2 operation interface, so probing them would mean reflecting into
+  non-public internals that move between releases.
 - **A unique ID request.** `setUniqueIdIncluded` is `@hide`, `@TestApi` and
   `@UnsupportedAppUsage`, so it is a system-app call and the hidden API
   denylist blocks reflection at it.
@@ -171,7 +174,8 @@ smaller ones.
 The spec for the StrongBox cross-check put most of its weight on a second half
 it called the discriminating one: a genuine secure element has to refuse things
 a reimplementation will happily accept. Three of the four candidates did not
-survive primary source, and the fourth did but cannot be witnessed here.
+survive primary source. The fourth, AES 192, did, and it is built; what is
+recorded below is why the other three are not.
 
 - **RSA 3072 in StrongBox.** The spec's headline arm, and it is not a rule.
   `IKeyMintDevice.aidl` says "StrongBox IKeyMintDevice implementations must
@@ -185,14 +189,6 @@ survive primary source, and the fourth did but cannot be witnessed here.
   `InvalidAlgorithmParameterException` for a StrongBox EC key of any size other
   than 256, and again for curve 25519. The real framework refuses it on a
   spoofed device exactly as on a genuine one, so the arm cannot discriminate.
-- **AES 192 in StrongBox.** This one survives both tests and is the arm to
-  build first when a secure element is attached. The HAL is exclusive,
-  "STRONGBOX IKeyMintDevices must only support 128 and 256-bit keys", and
-  `AndroidKeyStoreKeyGeneratorSpi` permits 128, 192 and 256 with no StrongBox
-  branch, so the request does reach KeyMint. It is unbuilt because its clean
-  path can only be witnessed on a device that has StrongBox, and this project
-  has already shipped one arm against a document that measured behaviour
-  contradicted.
 - **Treating a refusal as a finding.** A device that declares StrongBox and then
   fails to serve a key may be out of remotely provisioned keys with no network,
   which `ResponseCode.aidl` documents as
@@ -212,6 +208,49 @@ survive primary source, and the fourth did but cannot be witnessed here.
   anyway. Both levels are read regardless, because either one naming StrongBox
   is a claim. The API 36.1 emulator that would witness it cannot be installed
   on, its data partition being at 95 per cent.
+
+## Why the RKP provisioning era is not a detection
+
+A leaked keybox is a factory keybox, and remote key provisioning issues
+short-lived per-app certificates instead, so "this chain is factory-provisioned
+on a device that should be RKP-only" looks like a clean discriminator. It is
+not, and the reasons are structural rather than a question of effort. Recorded
+here so it is not re-proposed.
+
+- **RKP-only is a system property, not a device fact.** `is_rkp_only()` in
+  keystore2's `remote_provisioning.rs` reads `remote_provisioning.tee.rkp_only`
+  or `remote_provisioning.strongbox.rkp_only` and **defaults to false**. A
+  property is exactly what every resetprop module rewrites, so a rule keyed on
+  the era is keyed on attacker-controlled input.
+- **Falling back to the factory key is working as intended.** The comment above
+  `get_rkpd_attestation_key` says so in as many words: "Depending on the Android
+  release, RKP may not have been mandatory for the TEE or StrongBox KM
+  instances. In such cases, lookup failure for the IRPC HAL service is WAI and
+  should not cause a failure. The error should be caught by the calling function
+  and allow for natural fallback to the factory key." A genuine RKP-era handset
+  with no network therefore serves a factory chain.
+- **The caller chooses the regime, in two ways.** `get_attest_key_info` in
+  `attestation_key_utils.rs` selects an RKP key only when an attestation
+  challenge is present and `Tag::DEVICE_UNIQUE_ATTESTATION` is absent, with the
+  comment "Do not select an RKP key if DEVICE_UNIQUE_ATTESTATION is present".
+  `get_rkpd_attestation_key_and_certs` additionally returns nothing, and so
+  falls back to the factory key, unless the key is asymmetric and its domain is
+  `Domain::APP`. Which chain a device presents is thus partly a property of the
+  request, not of the device.
+
+So the only rule the chain's own structure supports is "a factory-shaped chain
+is suspicious", and a genuine device produces one in at least three documented
+situations. Any threshold would flag real handsets, which is the bar this file
+exists to enforce. The bench observation that the Pixel 7a and moto g04 present
+short-lived leaves under Droid CA3 while the Samsung presents ten-year
+certificates under the RSA root is real and reproducible, and it is a readout
+about provisioning history rather than evidence about honesty.
+
+What covers the actual threat instead is already shipped and does not depend on
+the era: every certificate's serial is checked against Google's revocation list
+in both encodings, the chain is anchored by public key to the five published
+Google roots, and every issuer in the chain has to be a real CA. A leaked keybox
+is caught by being revoked, not by being old.
 
 ## Notes on best-effort checks
 
