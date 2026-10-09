@@ -12,37 +12,35 @@ object RevocationChecker {
 
     /**
      * Collects the serial lookup keys for a chain, skipping any certificate that
-     * is byte identical to a pinned Google root.
+     * is an instance of a pinned Google root.
      *
      * A trust anchor appears in the chain of every genuine device. If Google ever
      * revokes one, that is a fleet wide CA event rather than evidence about this
      * device, and including it here would flag every honest user at once.
+     *
+     * The comparison is by public key rather than by encoded bytes because
+     * Google issues one attestation key as several certificates with different
+     * windows, and a handset keeps serving the instance it was provisioned
+     * with. Byte identity therefore skipped the instance this build happens to
+     * embed and submitted the others, which are the same key and the same CA,
+     * for revocation lookup. No root serial is on the current published list,
+     * so this was a latent mismatch rather than a false positive anyone saw.
+     *
+     * The skip needs the certificate to be a root INSTANCE, not merely to
+     * carry an anchor's key, so it goes through
+     * [AttestationAnalysis.isAnchorInstance]. A leaked keybox can sign a leaf
+     * whose public key is a Google root's, and that chain verifies and anchors;
+     * keying the skip on the public key alone would let such a leaf hide its
+     * own serial. Requiring self-signature, which every published root has,
+     * keeps the skip to the certificates it is for.
      */
     fun serialKeysForChain(
         chain: List<X509Certificate>,
         pinnedRoots: List<X509Certificate>,
     ): List<String> {
-        val pinnedEncodings = pinnedRoots.mapNotNull { root ->
-            try {
-                root.encoded?.toList()
-            } catch (_: Exception) {
-                null
-            }
-        }
-        return chain.filterNot { cert -> isPinnedRoot(cert, pinnedEncodings) }
+        val anchorKeys = AttestationAnalysis.anchorKeyEncodings(pinnedRoots)
+        return chain.filterNot { AttestationAnalysis.isAnchorInstance(it, anchorKeys) }
             .flatMap { AttestationAnalysis.serialLookupKeys(it.serialNumber) }
-    }
-
-    private fun isPinnedRoot(
-        cert: X509Certificate,
-        pinnedEncodings: List<List<Byte>>,
-    ): Boolean {
-        val encoded = try {
-            cert.encoded?.toList()
-        } catch (_: Exception) {
-            null
-        } ?: return false
-        return pinnedEncodings.any { it == encoded }
     }
 
     /**

@@ -137,14 +137,10 @@ object ChainValidity {
         pinnedRoots: List<X509Certificate>,
     ): List<X509Certificate> {
         if (chain.size < 2) return emptyList()
-        val anchorKeys = pinnedRoots.mapNotNull {
-            runCatching { it.publicKey.encoded?.toList() }.getOrNull()
-        }
+        val anchorKeys = AttestationAnalysis.anchorKeyEncodings(pinnedRoots)
         return chain.drop(1).filter { cert ->
-            val key = runCatching { cert.publicKey.encoded?.toList() }.getOrNull()
-            val isAnchorKey = key != null && anchorKeys.any { it == key }
             val selfSigned = cert.issuerX500Principal == cert.subjectX500Principal
-            !isAnchorKey && !selfSigned
+            !AttestationAnalysis.carriesAnchorKey(cert, anchorKeys) && !selfSigned
         }
     }
 
