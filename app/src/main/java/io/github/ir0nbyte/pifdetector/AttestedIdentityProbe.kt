@@ -26,13 +26,14 @@ import java.security.cert.X509Certificate
  * Tag.aidl requires from a device that cannot attest its identifiers. Neither
  * declares `android.software.device_id_attestation`.
  *
- * The accepted path is measured too, on a Pixel 7a that does declare it. The
- * request is accepted and the record carries tags 710, 711, 712, 716 and 717,
- * brand, device, product, manufacturer and model, in the hardwareEnforced list
- * at TrustedEnvironment level, with nothing in softwareEnforced and no
- * privileged identifier anywhere. So all three arms that judge an acceptance
- * are silent on a device that genuinely performs the attestation, which is the
- * check they shipped without.
+ * The accepted path is measured too, on a Pixel 7a and a moto g04 that both do
+ * declare it. Each accepts the request and returns tags 710, 711, 712, 716 and
+ * 717, brand, device, product, manufacturer and model, in the hardwareEnforced
+ * list at TrustedEnvironment level, with nothing in softwareEnforced and no
+ * privileged identifier anywhere. They agree on every field across two vendors
+ * and two KeyMint versions, so all three arms that judge an acceptance are
+ * silent on devices that genuinely perform the attestation, which is the check
+ * they shipped without.
  *
  * Two key generations per run, which is the cost of the arms being a comparison
  * between two requests rather than a reading of one. Measured on the bench
