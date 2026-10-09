@@ -4,9 +4,10 @@ package io.github.ir0nbyte.pifdetector
  * Human text for the reason codes a run produces beside the bitmask.
  *
  * Most come from the native engine. The 1100 family comes from
- * [KeystoreBoundary], which runs in Kotlin because the requests it makes are
- * framework API calls, so [ReasonCodesSyncTest] checks this table against both
- * producers rather than against native-lib.cpp alone.
+ * [KeystoreBoundary] and [AttestedIdentity], which run in Kotlin because the
+ * requests they make are framework API calls, so [ReasonCodesSyncTest] checks
+ * this table against all three producers rather than against native-lib.cpp
+ * alone.
  *
  * A detection used to be a lit row and nothing else, so the only way to learn
  * which needle, property or path actually fired was to attach a debugger to the
@@ -114,6 +115,19 @@ object ReasonCodes {
         Reason(1104, DetectionResult.DETECTION_ATTEST_FORGERY,
             "That over-limit request was served from software while a legal one " +
                 "was served from hardware"),
+
+        Reason(1105, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "An ordinary attestation record carried a device identifier that " +
+                "nothing asked it to attest"),
+        Reason(1106, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "An attestation record carried a privileged identifier this app " +
+                "cannot request"),
+        Reason(1107, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "A request to attest the device properties was accepted and then " +
+                "attested no identifier at all"),
+        Reason(1108, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The attested identifiers sit where the Android system puts its own " +
+                "entries, not where the secure environment vouches for them"),
 
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),

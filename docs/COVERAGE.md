@@ -51,7 +51,7 @@ rows that rest on them:
 | CODE_INTEGRITY | libc prologue inline-hook decode (arm64-v8a and x86_64 only), executable mappings from unrecognised sources, PLT GOT slots pointing outside any recognised code source, libc text against the file on disk | Yes | Reads only this process's own address space, so no privilege is involved. Measured silent on a clean API 34 emulator and on a rooted Samsung A06: Magisk's root is filesystem-level and inline-hooks nothing in our process, so silence there is the correct answer rather than a dead check. The arms are proven to fire by the native self test, which synthesises arm64 and x86_64 trampolines and maps an anonymous executable page on every device the suite runs on | A hider that hooks nothing in our address space is invisible to it, by construction. On armeabi-v7a and x86 the prologue arm does not run at all: only arm64-v8a and x86_64 have decoders, and the other two report nothing rather than guess at byte patterns nobody verified. The text comparison is corroboration only and never fires alone, because a hider that can patch a prologue can also redirect a read of the library file |
 | TREAT_WHEEL | maps needle | Yes | In-process, genuinely fires | A renamed build |
 | ATTEST_ANOMALY | chain signatures, CA issuers, root anchoring, challenge echo, RootOfTrust vs tamper, boot properties vs RootOfTrust | Yes | Fires on the test device: properties claim locked while the genuine Titan M2 reports the bootloader unlocked | A keystore simulator that also sanitizes the properties it contradicts |
-| ATTEST_FORGERY | attest-key provocation, auth-bound SHA-512 provocation, self-signed single cert, plus two keystore boundary probes: a key generated with no attestation challenge, and a challenge one byte past the documented 128 byte maximum | Yes | Works. The tag-503 arm now fires on nothing current and is retained only for TEESimulator v3 and older. The boundary arms are silent on both bench devices, which is the documented answer: a no-challenge key comes back self-signed with no record, and a 129 byte challenge draws INVALID_INPUT_LENGTH. Both are quoted from the KeyMint HAL, and both are answered by KeyMint rather than by the framework, so they reach the layer a simulator replaces | Simulators that honour setAttestKeyAlias and auth-bound keys. For the boundary arms, a simulator that reproduces both behaviours exactly. The known false positive vector is an OEM KeyMint that accepts an over-limit challenge: Tag.aidl says INVALID_INPUT_LENGTH "should" be returned rather than must, so a non-conformant implementation would be reported |
+| ATTEST_FORGERY | attest-key provocation, auth-bound SHA-512 provocation, self-signed single cert, plus two keystore boundary probes: a key generated with no attestation challenge, and a challenge one byte past the documented 128 byte maximum, plus the identifier probe: an ordinary attestation record that carries a device identifier nothing asked for, a record carrying an identifier this app cannot request at all, and a device-properties request that is accepted and then attests nothing or attests identifiers the secure environment did not vouch for | Yes | Works. The tag-503 arm now fires on nothing current and is retained only for TEESimulator v3 and older. The boundary arms are silent on both bench devices, which is the documented answer: a no-challenge key comes back self-signed with no record, and a 129 byte challenge draws INVALID_INPUT_LENGTH. Both are quoted from the KeyMint HAL, and both are answered by KeyMint rather than by the framework, so they reach the layer a simulator replaces. The identifier arms are silent on both bench devices for the same kind of reason: an ordinary record carries no identifier tag at all, and the device-properties request is refused with CANNOT_ATTEST_IDS, which Tag.aidl requires from a device that cannot attest its identifiers. Neither bench device declares `android.software.device_id_attestation`, so the accepted path has no hardware witness here and the three arms that judge an acceptance rest on the decision table alone | Simulators that honour setAttestKeyAlias and auth-bound keys. A simulator that fills the identifier block unconditionally, which is what forging device-properties attestation takes. The known false positive vector mirrors the over-limit one: the Tag.aidl sentence that identifier tags "must be set only when requesting attestation of the device's identifiers" is addressed to the caller, so an OEM KeyMint that populates the identifier block unprompted would be reported. The privileged half carries no such risk, because an app without READ_PRIVILEGED_PHONE_STATE receiving an attested serial or IMEI is a platform violation on any reading. For the boundary arms, a simulator that reproduces both behaviours exactly. The known false positive vector is an OEM KeyMint that accepts an over-limit challenge: Tag.aidl says INVALID_INPUT_LENGTH "should" be returned rather than must, so a non-conformant implementation would be reported |
 | ATTEST_REVOKED | chain serials against Google's published revocation list, offline snapshot plus optional online refresh. Informational only: sets no detection bit | Yes | See the section below | A keybox not yet published as revoked, which is the normal case for a fresh rotation |
 | ATTEST_CROSS_SOURCE | attested osPatchLevel NEWER than `ro.build.version.security_patch`, which is ungated because CTS forbids it in every configuration; the two levels DISAGREEING in either direction, behind a locked-and-verified gate plus a Keymaster 4 gate; the attested verifiedBootHash differing from `ro.boot.vbmeta.digest` when both are real 32-byte digests; and a day-precision tag that is neither a valid date nor a month. Five arms are computed and reported but do NOT drive the verdict: both vendor-patch arms, the absent boot patch level, a month-precision day field, and an attested boot hash carrying no usable digest | Yes | Silent on all three. The OS comparison resolves real-to-real on each (202412, 202409, 202508). The boot-hash arm drives the verdict on the strength of three vendors agreeing plus the VTS assertion, rather than one device family | A simulator that also rewrites the properties in the same pass, or scopes its spoof to other packages so our process is served the genuine record |
 | ATTEST_SOFTWARE | software-level attestation on a device presenting as production hardware with a declared hardware-backed keystore | Yes | Silent on the test device, whose chain is TrustedEnvironment and Google anchored | Presenting honestly as an emulator, which is also the legitimate case |
@@ -131,6 +131,40 @@ the reasons are worth keeping so they are not re-proposed.
   Implementing the documented rule would have flagged every device including a
   stock emulator, so the arm was dropped rather than shipped against a document
   nothing honours.
+
+## Identifier attestation arms that were specced and not built
+
+The spec for device-properties attestation had an arm that compared the attested
+values against `Build.BRAND` and friends. It did not ship, and neither did three
+smaller ones.
+
+- **Comparing the attested values against `Build.*`.** `KeyGenParameterSpec`'s
+  javadoc says the attested values "should be the same as" `Build.BRAND`,
+  `Build.DEVICE`, `Build.MANUFACTURER`, `Build.MODEL` and `Build.PRODUCT`, and
+  `AndroidKeyStoreKeyPairGeneratorSpi` contradicts it: for each field it sends
+  `Build.<X>_FOR_ATTESTATION` whenever that is neither empty nor `unknown`, and
+  that field resolves through `ro.product.<x>_for_attestation` and
+  `ro.product.vendor.<x>` rather than through the property `Build.<X>` reads. A
+  multi-SKU or carrier-variant device can therefore attest a value that
+  legitimately differs from `Build`, which is the false positive the review of
+  this spec blocked on. The value the framework actually sent is not knowable
+  from an app either, because every `Build.<X>_FOR_ATTESTATION` field is `@hide`
+  and `@TestApi`. The properties are real rather than theoretical: the bench
+  Samsung declares `ro.product.device_for_attestation`.
+- **Treating a refusal as a finding on a device that declares
+  `android.software.device_id_attestation`.** A genuine device refuses when its
+  remotely provisioned keys are exhausted and it is offline, and permanently
+  after `destroyAttestationIds()`. That is inconclusive, not evidence.
+- **Gating the probe on `android.software.device_id_attestation`.** That feature
+  governs the privileged identifier subset. Nothing documents it as governing
+  device-properties attestation, and the javadoc for
+  `setDevicePropertiesAttestationIncluded` names no feature at all, so its
+  absence does not make an acceptance provably illegitimate. Gating on it would
+  also have skipped the probe on every device on this bench.
+- **Requesting serial, IMEI or MEID.** Those need
+  `READ_PRIVILEGED_PHONE_STATE` and the hidden `setAttestationIds`, and asking
+  for identifiers this app has no business holding is not something a detector
+  should do. They are watched for in the answer instead.
 
 ## Notes on best-effort checks
 
