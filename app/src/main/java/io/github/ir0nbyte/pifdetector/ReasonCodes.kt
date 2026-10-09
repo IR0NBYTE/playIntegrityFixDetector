@@ -4,10 +4,10 @@ package io.github.ir0nbyte.pifdetector
  * Human text for the reason codes a run produces beside the bitmask.
  *
  * Most come from the native engine. The 1100 family comes from
- * [KeystoreBoundary] and [AttestedIdentity], which run in Kotlin because the
- * requests they make are framework API calls, so [ReasonCodesSyncTest] checks
- * this table against all three producers rather than against native-lib.cpp
- * alone.
+ * [KeystoreBoundary], [AttestedIdentity] and [StrongBoxCheck], which run in
+ * Kotlin because the requests they make are framework API calls, so
+ * [ReasonCodesSyncTest] checks this table against all four producers rather
+ * than against native-lib.cpp alone.
  *
  * A detection used to be a lit row and nothing else, so the only way to learn
  * which needle, property or path actually fired was to attach a debugger to the
@@ -128,6 +128,16 @@ object ReasonCodes {
         Reason(1108, DetectionResult.DETECTION_ATTEST_FORGERY,
             "The attested identifiers sit where the Android system puts its own " +
                 "entries, not where the secure environment vouches for them"),
+
+        Reason(1109, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The keystore has no StrongBox instance, yet it reported an " +
+                "ordinary key as living in one"),
+        Reason(1110, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The keystore has no StrongBox instance, yet an attestation record " +
+                "claims StrongBox"),
+        Reason(1111, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "A StrongBox key was served on a device whose own feature list " +
+                "declares no StrongBox"),
 
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),

@@ -13,12 +13,12 @@ import java.io.File
  * a code nothing can emit is text that can never appear. Neither fails anything
  * at runtime, which is exactly why it needs a build-time guard.
  *
- * There are three producers. The native engine declares its codes in
+ * There are four producers. The native engine declares its codes in
  * native-lib.cpp, read here as source rather than trusted to be edited
  * alongside, the same approach as RootManagerQueriesSyncTest. The keystore
- * boundary probe and the attested identity probe run in Kotlin because their
+ * boundary, attested identity and StrongBox probes run in Kotlin because their
  * requests are framework API calls, so each declares its own codes in a
- * REASON_CODES set. All three sets must stay pairwise disjoint, because a code
+ * REASON_CODES set. All four sets must stay pairwise disjoint, because a code
  * identifies one arm.
  */
 class ReasonCodesSyncTest {
@@ -183,6 +183,7 @@ class ReasonCodesSyncTest {
         val KOTLIN_PRODUCERS: List<Pair<String, Set<Int>>> = listOf(
             "the keystore boundary probe" to KeystoreBoundary.REASON_CODES,
             "the attested identity probe" to AttestedIdentity.REASON_CODES,
+            "the StrongBox probe" to StrongBoxCheck.REASON_CODES,
         )
     }
 

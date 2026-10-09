@@ -184,6 +184,67 @@ class AttestationAnalysisTest {
         }
     }
 
+    @Test
+    fun realPixelChainParsesTheKeyMintLevelTooAndTheyAgree() {
+        val ext = realAkitaExtension()
+        assertEquals(TRUSTED_ENVIRONMENT, AttestationAnalysis.parseKeyMintSecurityLevel(ext))
+        assertEquals(
+            AttestationAnalysis.parseAttestationSecurityLevel(ext),
+            AttestationAnalysis.parseKeyMintSecurityLevel(ext)
+        )
+    }
+
+    /**
+     * The two levels sit at different indices, and a fixture where they agree
+     * would pass whichever index the parser read. This one disagrees on
+     * purpose, so reading child 1 for the KeyMint level would fail it.
+     */
+    @Test
+    fun theTwoSecurityLevelsAreReadFromTheirOwnIndices() {
+        val ext = buildExtensionWithBothSecurityLevels(attestation = 1, keyMint = 2)
+        assertEquals(1, AttestationAnalysis.parseAttestationSecurityLevel(ext))
+        assertEquals(2, AttestationAnalysis.parseKeyMintSecurityLevel(ext))
+
+        val swapped = buildExtensionWithBothSecurityLevels(attestation = 2, keyMint = 0)
+        assertEquals(2, AttestationAnalysis.parseAttestationSecurityLevel(swapped))
+        assertEquals(0, AttestationAnalysis.parseKeyMintSecurityLevel(swapped))
+    }
+
+    @Test
+    fun unparseableKeyMintSecurityLevelIsNullNotSoftware() {
+        for (bad in listOf(byteArrayOf(0x01, 0x02, 0x03), ByteArray(0), byteArrayOf(0x05, 0x00))) {
+            val level = AttestationAnalysis.parseKeyMintSecurityLevel(bad)
+            assertNull(level)
+            assertNotEquals(AttestationAnalysis.SECURITY_LEVEL_SOFTWARE, level)
+        }
+    }
+
+    /** A record whose level member is not an ENUMERATED is rejected, not coerced. */
+    @Test
+    fun aKeyMintLevelThatIsNotAnEnumeratedIsNull() {
+        val keyDescription = tlv(
+            0x30,
+            tlv(0x02, byteArrayOf(0x03)) +
+                tlv(0x0A, byteArrayOf(0x01)) +
+                tlv(0x02, byteArrayOf(0x04)) +
+                tlv(0x02, byteArrayOf(0x01)) +          // INTEGER where ENUMERATED belongs
+                tlv(0x04, byteArrayOf(0x01, 0x02))
+        )
+        assertNull(AttestationAnalysis.parseKeyMintSecurityLevel(tlv(0x04, keyDescription)))
+    }
+
+    private fun buildExtensionWithBothSecurityLevels(attestation: Int, keyMint: Int): ByteArray {
+        val keyDescription = tlv(
+            0x30,
+            tlv(0x02, byteArrayOf(0x03)) +
+                tlv(0x0A, byteArrayOf(attestation.toByte())) +
+                tlv(0x02, byteArrayOf(0x04)) +
+                tlv(0x0A, byteArrayOf(keyMint.toByte())) +
+                tlv(0x04, byteArrayOf(0x01, 0x02))
+        )
+        return tlv(0x04, keyDescription)
+    }
+
     private fun buildExtensionWithSecurityLevel(level: Int): ByteArray {
         val keyDescription = tlv(
             0x30,
