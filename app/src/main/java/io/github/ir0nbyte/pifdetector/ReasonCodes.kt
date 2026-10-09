@@ -1,7 +1,12 @@
 package io.github.ir0nbyte.pifdetector
 
 /**
- * Human text for the reason codes the native engine returns beside the bitmask.
+ * Human text for the reason codes a run produces beside the bitmask.
+ *
+ * Most come from the native engine. The 1100 family comes from
+ * [KeystoreBoundary], which runs in Kotlin because the requests it makes are
+ * framework API calls, so [ReasonCodesSyncTest] checks this table against both
+ * producers rather than against native-lib.cpp alone.
  *
  * A detection used to be a lit row and nothing else, so the only way to learn
  * which needle, property or path actually fired was to attach a debugger to the
@@ -96,6 +101,19 @@ object ReasonCodes {
         Reason(1004, DetectionResult.DETECTION_CODE_INTEGRITY,
             "The in-memory text of a library differs from the file on disk, " +
                 "which corroborates a hook rather than proving one"),
+
+        Reason(1101, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "A key generated with no attestation challenge came back carrying " +
+                "an attestation record"),
+        Reason(1102, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "A signing key generated with no attestation challenge came back " +
+                "without a self-signed certificate"),
+        Reason(1103, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "An attestation challenge past the documented 128 byte maximum was " +
+                "accepted instead of refused"),
+        Reason(1104, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "That over-limit request was served from software while a legal one " +
+                "was served from hardware"),
 
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),

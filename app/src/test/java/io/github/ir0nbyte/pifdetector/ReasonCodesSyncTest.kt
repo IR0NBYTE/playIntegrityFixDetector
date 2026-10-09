@@ -6,15 +6,19 @@ import org.junit.Test
 import java.io.File
 
 /**
- * The native reason codes and the Kotlin text table have to agree.
+ * The reason codes a run can emit and the Kotlin text table have to agree.
  *
- * A report carries raw integers, so a code the engine emits but this table has
+ * A report carries raw integers, so a code something emits but this table has
  * no text for produces a report that says a check fired and cannot say why, and
- * a code only Kotlin knows about is text that can never appear. Neither fails
- * anything at runtime, which is exactly why it needs a build-time guard.
+ * a code nothing can emit is text that can never appear. Neither fails anything
+ * at runtime, which is exactly why it needs a build-time guard.
  *
- * Same approach as RootManagerQueriesSyncTest: read the other side's source
- * rather than trusting the two to be edited together.
+ * There are two producers. The native engine declares its codes in
+ * native-lib.cpp, read here as source rather than trusted to be edited
+ * alongside, the same approach as RootManagerQueriesSyncTest. The keystore
+ * boundary probe runs in Kotlin because its requests are framework API calls,
+ * so it declares its codes in [KeystoreBoundary.REASON_CODES]. The two sets
+ * must stay disjoint, because a code identifies one arm.
  */
 class ReasonCodesSyncTest {
 
@@ -33,14 +37,33 @@ class ReasonCodesSyncTest {
     }
 
     @Test
-    fun noKotlinTextForACodeTheEngineCannotEmit() {
-        val native = nativeReasonCodes().values.toSet()
-        val orphaned = ReasonCodes.knownCodes.sorted().filterNot { it in native }
+    fun everyProbeReasonCodeHasText() {
+        val missing = KeystoreBoundary.REASON_CODES.sorted() - ReasonCodes.knownCodes
         assertEquals(
-            "these codes have text but no native constant, so the text is unreachable: $orphaned",
+            "the boundary probe can emit these codes but ReasonCodes has no text " +
+                "for them: $missing",
+            emptyList<Int>(),
+            missing
+        )
+    }
+
+    @Test
+    fun noKotlinTextForACodeNothingCanEmit() {
+        val emittable = nativeReasonCodes().values.toSet() + KeystoreBoundary.REASON_CODES
+        val orphaned = ReasonCodes.knownCodes.sorted().filterNot { it in emittable }
+        assertEquals(
+            "these codes have text but no producer, so the text is unreachable: $orphaned",
             emptyList<Int>(),
             orphaned
         )
+    }
+
+    /** A code names one arm, so the two producers may not both claim it. */
+    @Test
+    fun theTwoProducersDoNotShareACode() {
+        val shared = nativeReasonCodes().values.toSet()
+            .intersect(KeystoreBoundary.REASON_CODES)
+        assertEquals("a code claimed by both producers: $shared", emptySet<Int>(), shared)
     }
 
     /** Codes are append-only, so two constants must never share a value. */

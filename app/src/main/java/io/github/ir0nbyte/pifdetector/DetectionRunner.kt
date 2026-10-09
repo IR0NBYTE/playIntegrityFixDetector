@@ -18,9 +18,9 @@ data class DetectionReport(
     val moduleHash: ModuleHash.Status? = null,
 
     /**
-     * Reason codes from the native engine, naming which sub-probe set a bit.
-     * Advisory: a bit with no reason is still set, so an unwired check simply
-     * reports nothing extra.
+     * Reason codes naming which sub-probe set a bit, from the native engine and
+     * from the keystore boundary probe. Advisory: a bit with no reason is still
+     * set, so an unwired check simply reports nothing extra.
      */
     val reasons: List<Int> = emptyList(),
 
@@ -34,6 +34,7 @@ class DetectionRunner {
     private val cancelled = AtomicBoolean(false)
     private val attestationProbe = KeyAttestationProbe()
     private val activeAttestationProbe = ActiveAttestationProbe()
+    private val boundaryProbe = KeystoreBoundaryProbe()
 
     fun runCheck(
         context: Context,
@@ -55,15 +56,16 @@ class DetectionRunner {
             )
 
             val activeMask = activeAttestationProbe.probe(passive.mask != 0, presentation)
+            val boundary = boundaryProbe.probe()
             val report = DetectionReport(
-                bitmask = nativeMask or passive.mask or activeMask,
+                bitmask = nativeMask or passive.mask or activeMask or boundary.mask,
                 revocation = passive.revocation,
                 crossSource = passive.crossSource,
                 validity = passive.validity,
                 versions = passive.versions,
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
-                reasons = reasons,
+                reasons = reasons + boundary.reasons,
                 presentation = presentation,
             )
             mainHandler.post {
