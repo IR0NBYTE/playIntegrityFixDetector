@@ -1,6 +1,7 @@
 package io.github.ir0nbyte.pifdetector
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -30,10 +31,22 @@ class StrongBoxCheckTest {
         availability: StrongBoxCheck.Availability? = StrongBoxCheck.Availability.UNAVAILABLE,
         ordinaryKeyLevel: Int? = teeLevel,
         ordinaryRecord: StrongBoxCheck.Record? = record(),
+        aes192: StrongBoxCheck.AesOutcome? = StrongBoxCheck.AesOutcome.UNAVAILABLE,
     ) = StrongBoxCheck.evaluate(
         StrongBoxCheck.Observation(
-            featureDeclared, availability, ordinaryKeyLevel, ordinaryRecord
+            featureDeclared, availability, ordinaryKeyLevel, ordinaryRecord, aes192
         )
+    )
+
+    /** A genuine StrongBox device: declares it, serves it, refuses AES 192. */
+    private fun honestStrongBox(
+        aes192: StrongBoxCheck.AesOutcome = StrongBoxCheck.AesOutcome.REFUSED,
+    ) = evaluate(
+        featureDeclared = true,
+        availability = StrongBoxCheck.Availability.SERVED,
+        ordinaryKeyLevel = teeLevel,
+        ordinaryRecord = record(),
+        aes192 = aes192,
     )
 
     // ---- the measured baseline ---------------------------------------------
@@ -46,16 +59,13 @@ class StrongBoxCheckTest {
         assertFalse(verdict.isFinding)
     }
 
-    /** A genuine StrongBox device that declares it and serves it is clean. */
+    /**
+     * A genuine StrongBox device that declares it, serves it and refuses the
+     * size a secure element must refuse is clean.
+     */
     @Test
     fun aDeviceThatDeclaresStrongBoxAndServesItIsSilent() {
-        val verdict = evaluate(
-            featureDeclared = true,
-            availability = StrongBoxCheck.Availability.SERVED,
-            ordinaryKeyLevel = teeLevel,
-            ordinaryRecord = record(),
-        )
-        assertEquals(0, verdict.mask)
+        assertEquals(0, honestStrongBox().mask)
     }
 
     /** An emulator attesting at software level throughout is clean too. */
@@ -185,6 +195,92 @@ class StrongBoxCheckTest {
         assertEquals(0, verdict.mask)
     }
 
+    // ---- the AES size restriction ------------------------------------------
+
+    @Test
+    fun aStrongBoxThatTakesAOneHundredAndNinetyTwoBitAesKeyIsAFinding() {
+        val verdict = honestStrongBox(aes192 = StrongBoxCheck.AesOutcome.ACCEPTED)
+        assertEquals(DetectionResult.DETECTION_ATTEST_FORGERY, verdict.mask)
+        assertEquals(listOf(StrongBoxCheck.REASON_STRONGBOX_TOOK_AES_192), verdict.reasons)
+    }
+
+    /**
+     * The review's first required change, pinned: the finding is acceptance,
+     * never refusal. Refusing is what a genuine secure element does.
+     */
+    @Test
+    fun refusingThatSizeIsTheHonestAnswerAndNeverAFinding() {
+        assertEquals(0, honestStrongBox(aes192 = StrongBoxCheck.AesOutcome.REFUSED).mask)
+    }
+
+    /**
+     * Acceptance only means something once the keystore has actually served a
+     * StrongBox key. Without that, the AES request was turned away because
+     * there is no secure element, not because of a key size.
+     */
+    @Test
+    fun anAcceptedAesKeyIsNotJudgedWhereThereIsNoStrongBox() {
+        for (availability in listOf(
+            StrongBoxCheck.Availability.UNAVAILABLE,
+            StrongBoxCheck.Availability.INCONCLUSIVE,
+            null,
+        )) {
+            val verdict = evaluate(
+                availability = availability,
+                aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            )
+            assertEquals(
+                "availability $availability does not license the AES arm",
+                0,
+                verdict.mask
+            )
+        }
+    }
+
+    /**
+     * A probe whose own request was rejected locally must not read as a pass.
+     * The outcome is kept distinct from a refusal precisely so this cannot
+     * become a dead arm reporting clean.
+     */
+    @Test
+    fun anArmThatNeverRanIsNotTreatedAsARefusal() {
+        for (outcome in listOf(
+            StrongBoxCheck.AesOutcome.NOT_ATTEMPTED,
+            StrongBoxCheck.AesOutcome.UNAVAILABLE,
+            null,
+        )) {
+            assertEquals(0, honestStrongBox(aes192 = outcome ?: StrongBoxCheck.AesOutcome.UNAVAILABLE).mask)
+        }
+        assertNotEquals(
+            "a refusal and an arm that did not run must not be the same value",
+            StrongBoxCheck.AesOutcome.REFUSED,
+            StrongBoxCheck.AesOutcome.NOT_ATTEMPTED
+        )
+    }
+
+    /** The AES arm and the claim arms are independent, so both can fire. */
+    @Test
+    fun theAesArmAndTheUndeclaredArmAreReportedSeparately() {
+        val verdict = evaluate(
+            featureDeclared = false,
+            availability = StrongBoxCheck.Availability.SERVED,
+            aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+        )
+        assertEquals(
+            listOf(
+                StrongBoxCheck.REASON_UNDECLARED_STRONGBOX,
+                StrongBoxCheck.REASON_STRONGBOX_TOOK_AES_192,
+            ),
+            verdict.reasons
+        )
+    }
+
+    /** The size asked for is the one value the HAL leaves no room for. */
+    @Test
+    fun theForbiddenSizeIsTheOneBetweenTheTwoRequiredOnes() {
+        assertEquals(192, StrongBoxCheck.AES_FORBIDDEN_SIZE_BITS)
+    }
+
     // ---- arms that could not run -------------------------------------------
 
     @Test
@@ -239,7 +335,10 @@ class StrongBoxCheckTest {
                 ordinaryKeyLevel = strongBoxLevel,
                 ordinaryRecord = record(attestation = strongBoxLevel),
             ),
-            evaluate(availability = StrongBoxCheck.Availability.SERVED),
+            evaluate(
+                availability = StrongBoxCheck.Availability.SERVED,
+                aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            ),
         ).flatMap { it.reasons }.toSet()
 
         assertEquals(StrongBoxCheck.REASON_CODES, emitted)
@@ -271,8 +370,8 @@ class StrongBoxCheckTest {
 
     /** The codes continue the forgery family rather than starting a new one. */
     @Test
-    fun theCodesAreTheNextThreeInTheForgeryFamily() {
-        assertEquals(listOf(1109, 1110, 1111), StrongBoxCheck.REASON_CODES.sorted())
+    fun theCodesAreTheNextFourInTheForgeryFamily() {
+        assertEquals(listOf(1109, 1110, 1111, 1112), StrongBoxCheck.REASON_CODES.sorted())
     }
 
     /**

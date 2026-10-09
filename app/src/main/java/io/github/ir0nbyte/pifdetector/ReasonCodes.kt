@@ -138,6 +138,9 @@ object ReasonCodes {
         Reason(1111, DetectionResult.DETECTION_ATTEST_FORGERY,
             "A StrongBox key was served on a device whose own feature list " +
                 "declares no StrongBox"),
+        Reason(1112, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "StrongBox accepted a 192 bit AES key, a size the HAL says a " +
+                "secure element must not support"),
 
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),

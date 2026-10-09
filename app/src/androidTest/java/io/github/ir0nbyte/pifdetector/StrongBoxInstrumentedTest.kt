@@ -45,6 +45,46 @@ class StrongBoxInstrumentedTest {
                 observation.ordinaryKeyLevel
             )
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            assertNotNull("the AES size arm did not run", observation.aes192)
+        }
+    }
+
+    /**
+     * The guard against a dead arm, and the only part of the AES size
+     * restriction a bench without a secure element can verify.
+     *
+     * NOT_ATTEMPTED means the framework rejected this probe's own parameter
+     * spec before the keystore saw it, which would leave the arm silent
+     * forever on the devices that matter. Anything else means the request was
+     * well formed and reached the keystore, whatever the keystore then said.
+     */
+    @Test
+    fun theAesRequestIsWellFormedAndReachesTheKeystore() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+
+        assertNotEquals(
+            "the AES arm's request never reached the keystore, so the arm is dead",
+            StrongBoxCheck.AesOutcome.NOT_ATTEMPTED,
+            probe.observe(context).aes192
+        )
+    }
+
+    /**
+     * On a device with a secure element, IKeyMintDevice.aidl requires the 192
+     * bit key to be refused. Skipped where there is no StrongBox, because then
+     * the request is turned away for a different reason entirely.
+     */
+    @Test
+    fun aSecureElementRefusesTheSizeItMustRefuse() {
+        val observation = probe.observe(context)
+        if (observation.availability != StrongBoxCheck.Availability.SERVED) return
+
+        assertEquals(
+            "a StrongBox must only support 128 and 256 bit AES keys",
+            StrongBoxCheck.AesOutcome.REFUSED,
+            observation.aes192
+        )
     }
 
     /**

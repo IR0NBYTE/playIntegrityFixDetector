@@ -10,7 +10,10 @@ package io.github.ir0nbyte.pifdetector
  * not, which makes it one of the few claims a property spoofer cannot arrange.
  *
  * Three places on one device state whether StrongBox is there, and this table
- * asks whether they agree:
+ * asks whether they agree, then asks a fourth question of a device that does
+ * have one: whether it refuses what a real secure element has to refuse.
+ *
+ * The three statements are:
  *
  * - keystore2, when asked for a StrongBox key. service.rs answers
  *   HARDWARE_TYPE_UNAVAILABLE when no KeyMint instance is registered at that
@@ -57,6 +60,33 @@ object StrongBoxCheck {
     enum class Availability { SERVED, UNAVAILABLE, INCONCLUSIVE }
 
     /**
+     * What happened when StrongBox was asked for a 192 bit AES key.
+     *
+     * IKeyMintDevice.aidl is exclusive about this one: "STRONGBOX
+     * IKeyMintDevices must only support 128 and 256-bit keys". Unlike the EC
+     * restrictions, nothing in the framework pre-empts it.
+     * AndroidKeyStoreKeyGeneratorSpi permits 128, 192 and 256 with no StrongBox
+     * branch, so the request reaches KeyMint and the refusal has to come from
+     * there.
+     *
+     * [NOT_ATTEMPTED] is kept apart from [UNAVAILABLE] deliberately. If the
+     * request were malformed, the framework would reject the parameter spec
+     * before the keystore ever saw it, and recording that as a refusal would
+     * leave a dead arm reporting clean forever. That is the failure this
+     * codebase keeps auditing for, so a spec rejected locally is
+     * [NOT_ATTEMPTED] and the instrumented test asserts against it.
+     */
+    enum class AesOutcome { ACCEPTED, REFUSED, UNAVAILABLE, NOT_ATTEMPTED }
+
+    /**
+     * The one AES size a StrongBox must not support. 128 and 256 are the two it
+     * must, so 192 is the only value in the gap. A wildly invalid size would
+     * prove nothing, because something other than the StrongBox rule could
+     * refuse it.
+     */
+    const val AES_FORBIDDEN_SIZE_BITS = 192
+
+    /**
      * The two security levels one attestation record states.
      *
      * Both are read because either one naming StrongBox is the record making
@@ -90,6 +120,7 @@ object StrongBoxCheck {
         val availability: Availability? = null,
         val ordinaryKeyLevel: Int? = null,
         val ordinaryRecord: Record? = null,
+        val aes192: AesOutcome? = null,
     )
 
     data class Verdict(val mask: Int, val reasons: List<Int>) {
@@ -97,7 +128,7 @@ object StrongBoxCheck {
     }
 
     fun evaluate(observation: Observation): Verdict {
-        val reasons = ArrayList<Int>(3)
+        val reasons = ArrayList<Int>(4)
 
         // keystore2 has just said there is no StrongBox instance on this
         // device. Both arms below are the device disagreeing with itself, so
@@ -124,6 +155,18 @@ object StrongBoxCheck {
             reasons.add(REASON_UNDECLARED_STRONGBOX)
         }
 
+        // The constraint arm, and the only one here that asks a StrongBox to
+        // refuse something rather than asking it to exist. Gated on the
+        // keystore having actually served a StrongBox key, because on a device
+        // with no secure element the AES request is turned away for that reason
+        // and says nothing about key sizes. Phrased as acceptance being the
+        // finding, never refusal, which is what a genuine StrongBox does.
+        if (observation.availability == Availability.SERVED &&
+            observation.aes192 == AesOutcome.ACCEPTED
+        ) {
+            reasons.add(REASON_STRONGBOX_TOOK_AES_192)
+        }
+
         val mask = if (reasons.isEmpty()) 0 else DetectionResult.DETECTION_ATTEST_FORGERY
         return Verdict(mask, reasons)
     }
@@ -131,6 +174,7 @@ object StrongBoxCheck {
     const val REASON_KEY_IN_ABSENT_STRONGBOX = 1109
     const val REASON_RECORD_CLAIMS_ABSENT_STRONGBOX = 1110
     const val REASON_UNDECLARED_STRONGBOX = 1111
+    const val REASON_STRONGBOX_TOOK_AES_192 = 1112
 
     /**
      * Every code this probe can emit. [ReasonCodesSyncTest] unions this with
@@ -141,5 +185,6 @@ object StrongBoxCheck {
         REASON_KEY_IN_ABSENT_STRONGBOX,
         REASON_RECORD_CLAIMS_ABSENT_STRONGBOX,
         REASON_UNDECLARED_STRONGBOX,
+        REASON_STRONGBOX_TOOK_AES_192,
     )
 }

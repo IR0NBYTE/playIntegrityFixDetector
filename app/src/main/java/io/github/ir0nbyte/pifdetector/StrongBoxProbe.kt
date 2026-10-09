@@ -8,12 +8,14 @@ import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
 import android.util.Log
 import androidx.annotation.RequiresApi
+import java.security.InvalidAlgorithmParameterException
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import javax.crypto.KeyGenerator
 
 /**
  * Asks the device three separate times whether it has StrongBox and hands the
@@ -32,13 +34,22 @@ import java.security.cert.X509Certificate
  * strongbox_keystore: the StrongBox request is refused with
  * StrongBoxUnavailableException on both, the ordinary key is labelled
  * TrustedEnvironment on the Samsung and Software on the emulator, and no record
- * claims StrongBox in either of its two level fields. Cost measured at BENCH
- * strongbox=69ms on the Samsung and 84ms on the emulator, which is cheap
- * because the refusal lands at getSecurityLevel before any key is generated.
+ * claims StrongBox in either of its two level fields. The AES arm reports
+ * UNAVAILABLE on both, which is the outcome that matters here: the request was
+ * well formed and reached the keystore, rather than being rejected locally by
+ * the framework, so the arm is live and not dead. Cost measured at BENCH
+ * strongbox=72ms on the Samsung and 90ms on the emulator, which is cheap
+ * because both StrongBox requests land at getSecurityLevel before any key is
+ * generated.
  *
- * Specced in issue 7 and deliberately not built, with the reasons, because
- * each needs a secure element to establish the clean baseline and none is
- * attached:
+ * The AES 192 arm is the constraint half of issue 7, built here because it is
+ * the one candidate that survives primary source: the HAL is exclusive about
+ * the size and the framework does not pre-empt the request. What this bench can
+ * verify is that the request is well formed and reaches the keystore; what it
+ * cannot is a genuine secure element refusing it, because no attached device
+ * has one. See docs/COVERAGE.md.
+ *
+ * Specced in issue 7 and deliberately not built, with the reasons:
  *
  * - RSA 3072 in StrongBox. The spec called this the discriminating arm, and
  *   primary source does not support it: IKeyMintDevice.aidl says "StrongBox
@@ -52,14 +63,6 @@ import java.security.cert.X509Certificate
  *   for a StrongBox EC key of any size but 256, and separately for curve 25519.
  *   The real framework refuses it on a spoofed device exactly as it does on a
  *   genuine one, so the arm cannot discriminate.
- * - AES 192 in StrongBox. This one survives both tests: the HAL is exclusive,
- *   "STRONGBOX IKeyMintDevices must only support 128 and 256-bit keys", and
- *   AndroidKeyStoreKeyGeneratorSpi permits 128, 192 and 256 with no StrongBox
- *   branch, so the request does reach KeyMint. It is still unbuilt, because its
- *   clean path can only be witnessed on a device with a secure element and this
- *   codebase has already shipped one arm against a document that measured
- *   behaviour contradicted. It is the first thing to build when a StrongBox
- *   device is attached.
  * - The keygen latency floor. Ruled out by the review before this pass, and
  *   docs/DETECTION.md gives the general reason timing is not used here.
  * - The two security levels one record states having to match each other. The
@@ -97,6 +100,7 @@ class StrongBoxProbe {
             availability = observeAvailability(),
             ordinaryKeyLevel = ordinary?.level,
             ordinaryRecord = ordinary?.record,
+            aes192 = observeAes192(),
         )
     }
 
@@ -121,6 +125,19 @@ class StrongBoxProbe {
     private fun observeAvailability(): StrongBoxCheck.Availability? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
         return StrongBoxArm().observe()
+    }
+
+    /**
+     * Attempted on every device, judged on almost none.
+     *
+     * Running it even where there is no StrongBox is what proves the request is
+     * well formed and reaches the keystore, which is the only part of this arm
+     * a bench without a secure element can verify. A device with no StrongBox
+     * answers UNAVAILABLE, and [StrongBoxCheck] judges nothing in that case.
+     */
+    private fun observeAes192(): StrongBoxCheck.AesOutcome? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+        return StrongBoxAesArm().observe()
     }
 
     /**
@@ -234,6 +251,55 @@ class StrongBoxProbe {
         }
     }
 
+    /**
+     * The AES size restriction, in its own gated class for the same reason as
+     * [StrongBoxArm]: it catches StrongBoxUnavailableException.
+     */
+    @RequiresApi(Build.VERSION_CODES.P)
+    private inner class StrongBoxAesArm {
+        fun observe(): StrongBoxCheck.AesOutcome {
+            return try {
+                wipe(ALIAS_AES)
+                generateAes(ALIAS_AES, StrongBoxCheck.AES_FORBIDDEN_SIZE_BITS)
+                StrongBoxCheck.AesOutcome.ACCEPTED
+            } catch (e: StrongBoxUnavailableException) {
+                // No secure element, so the size was never the question.
+                Log.d(TAG, "no StrongBox instance for the AES arm", e)
+                StrongBoxCheck.AesOutcome.UNAVAILABLE
+            } catch (e: InvalidAlgorithmParameterException) {
+                // The framework rejected the parameter spec locally, so KeyMint
+                // never saw it. That is a defect in this probe rather than an
+                // answer from the device, and reporting it as a refusal would
+                // leave the arm dead and silent.
+                Log.w(TAG, "the AES arm's own request was rejected; arm did not run", e)
+                StrongBoxCheck.AesOutcome.NOT_ATTEMPTED
+            } catch (e: Exception) {
+                // What a genuine StrongBox does: UNSUPPORTED_KEY_SIZE, which
+                // the framework surfaces as a ProviderException.
+                Log.d(TAG, "StrongBox refused a 192 bit AES key", e)
+                StrongBoxCheck.AesOutcome.REFUSED
+            } finally {
+                wipe(ALIAS_AES)
+            }
+        }
+
+        private fun generateAes(alias: String, sizeBits: Int) {
+            val spec = KeyGenParameterSpec.Builder(
+                alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_CBC)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_PKCS7)
+                .setKeySize(sizeBits)
+                .setIsStrongBoxBacked(true)
+                .build()
+
+            val generator =
+                KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+            generator.init(spec)
+            generator.generateKey()
+        }
+    }
+
     /** KeyInfo.getSecurityLevel arrived in API 31, so it is isolated too. */
     @RequiresApi(Build.VERSION_CODES.S)
     private inner class KeyLevelArm {
@@ -276,6 +342,7 @@ class StrongBoxProbe {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val ALIAS_STRONGBOX = "pifd_strongbox_request"
         const val ALIAS_ORDINARY = "pifd_strongbox_ordinary"
+        const val ALIAS_AES = "pifd_strongbox_aes"
 
         /** PackageManager.FEATURE_STRONGBOX_KEYSTORE, a literal because minSdk is 24. */
         const val FEATURE_STRONGBOX_KEYSTORE = "android.hardware.strongbox_keystore"
