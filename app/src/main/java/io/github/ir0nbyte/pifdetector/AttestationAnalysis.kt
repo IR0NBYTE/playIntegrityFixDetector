@@ -816,9 +816,21 @@ object AttestationAnalysis {
         return if (tagByte == TAG_OCTET_STRING) content else null
     }
 
-    fun parseAttestationSecurityLevel(extensionValue: ByteArray): Int? {
-        val (tagByte, content) =
-            keyDescriptionChild(extensionValue, ATTESTATION_SECURITY_LEVEL_INDEX) ?: return null
+    fun parseAttestationSecurityLevel(extensionValue: ByteArray): Int? =
+        parseSecurityLevel(extensionValue, ATTESTATION_SECURITY_LEVEL_INDEX)
+
+    /**
+     * KeyDescription.keyMintSecurityLevel, the level of the IKeyMintDevice that
+     * produced the record, as opposed to attestationSecurityLevel, which is the
+     * level the attested key is stored at. They are separate fields, and from
+     * attestation version 400 KeyCreationResult.aidl requires each to match the
+     * other.
+     */
+    fun parseKeyMintSecurityLevel(extensionValue: ByteArray): Int? =
+        parseSecurityLevel(extensionValue, KEYMINT_SECURITY_LEVEL_INDEX)
+
+    private fun parseSecurityLevel(extensionValue: ByteArray, index: Int): Int? {
+        val (tagByte, content) = keyDescriptionChild(extensionValue, index) ?: return null
         if (tagByte != TAG_ENUMERATED || content.isEmpty()) return null
         return content[0].toInt() and 0xFF
     }
@@ -855,6 +867,7 @@ object AttestationAnalysis {
     private const val ATTESTATION_SECURITY_LEVEL_INDEX = 1
     private const val ATTESTATION_VERSION_INDEX = 0
     private const val KEYMASTER_VERSION_INDEX = 2
+    private const val KEYMINT_SECURITY_LEVEL_INDEX = 3
 
     /** KeyMint 3.0, the first release whose VTS requires a boot patch level. */
     const val ATTESTATION_VERSION_KEYMINT_3 = 300
