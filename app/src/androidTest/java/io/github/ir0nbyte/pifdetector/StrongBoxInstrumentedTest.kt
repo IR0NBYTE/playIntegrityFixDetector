@@ -71,19 +71,40 @@ class StrongBoxInstrumentedTest {
     }
 
     /**
-     * On a device with a secure element, IKeyMintDevice.aidl requires the 192
-     * bit key to be refused. Skipped where there is no StrongBox, because then
-     * the request is turned away for a different reason entirely.
+     * On a KeyMint secure element, IKeyMintDevice.aidl requires the 192 bit key
+     * to be refused. Skipped where there is no StrongBox, and skipped on a
+     * Keymaster era one, whose HAL never carried the restriction: a stock
+     * Samsung SM-G780G at strongbox_keystore=4 accepts the size and is entitled
+     * to, which is what the version gate exists for.
      */
     @Test
-    fun aSecureElementRefusesTheSizeItMustRefuse() {
+    fun aKeyMintSecureElementRefusesTheSizeItMustRefuse() {
         val observation = probe.observe(context)
         if (observation.availability != StrongBoxCheck.Availability.SERVED) return
+        val version = observation.strongBoxFeatureVersion ?: return
+        if (version < StrongBoxCheck.STRONGBOX_FEATURE_VERSION_KEYMINT_1) return
 
         assertEquals(
-            "a StrongBox must only support 128 and 256 bit AES keys",
+            "a KeyMint StrongBox must only support 128 and 256 bit AES keys",
             StrongBoxCheck.AesOutcome.REFUSED,
             observation.aes192
+        )
+    }
+
+    /**
+     * The version has to be readable wherever the feature is declared, or the
+     * AES arm silently never judges anything.
+     */
+    @Test
+    fun aDeviceThatDeclaresStrongBoxAlsoDeclaresItsVersion() {
+        val observation = probe.observe(context)
+        if (observation.featureDeclared != true) return
+
+        val version = observation.strongBoxFeatureVersion
+        assertNotNull("the strongbox_keystore version was not read", version)
+        assertTrue(
+            "a declared StrongBox should carry a version, got $version",
+            (version ?: 0) > 0
         )
     }
 

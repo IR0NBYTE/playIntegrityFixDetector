@@ -17,6 +17,11 @@ import org.junit.Test
  */
 class StrongBoxCheckTest {
 
+    private companion object {
+        /** What the bench Pixel 7a declares, measured. */
+        const val PIXEL_FEATURE_VERSION = 300
+    }
+
     private val teeLevel = AttestationAnalysis.SECURITY_LEVEL_TRUSTED_ENVIRONMENT
     private val strongBoxLevel = AttestationAnalysis.SECURITY_LEVEL_STRONGBOX
     private val softwareLevel = AttestationAnalysis.SECURITY_LEVEL_SOFTWARE
@@ -28,21 +33,28 @@ class StrongBoxCheckTest {
 
     private fun evaluate(
         featureDeclared: Boolean? = false,
+        strongBoxFeatureVersion: Int? = 0,
         availability: StrongBoxCheck.Availability? = StrongBoxCheck.Availability.UNAVAILABLE,
         ordinaryKeyLevel: Int? = teeLevel,
         ordinaryRecord: StrongBoxCheck.Record? = record(),
         aes192: StrongBoxCheck.AesOutcome? = StrongBoxCheck.AesOutcome.UNAVAILABLE,
     ) = StrongBoxCheck.evaluate(
         StrongBoxCheck.Observation(
-            featureDeclared, availability, ordinaryKeyLevel, ordinaryRecord, aes192
+            featureDeclared, strongBoxFeatureVersion, availability,
+            ordinaryKeyLevel, ordinaryRecord, aes192,
         )
     )
 
-    /** A genuine StrongBox device: declares it, serves it, refuses AES 192. */
+    /**
+     * The measured Pixel 7a: declares StrongBox at feature version 300, serves
+     * it, and refuses the AES size its HAL forbids.
+     */
     private fun honestStrongBox(
         aes192: StrongBoxCheck.AesOutcome = StrongBoxCheck.AesOutcome.REFUSED,
+        strongBoxFeatureVersion: Int? = PIXEL_FEATURE_VERSION,
     ) = evaluate(
         featureDeclared = true,
+        strongBoxFeatureVersion = strongBoxFeatureVersion,
         availability = StrongBoxCheck.Availability.SERVED,
         ordinaryKeyLevel = teeLevel,
         ordinaryRecord = record(),
@@ -228,6 +240,7 @@ class StrongBoxCheckTest {
             val verdict = evaluate(
                 availability = availability,
                 aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+                strongBoxFeatureVersion = PIXEL_FEATURE_VERSION,
             )
             assertEquals(
                 "availability $availability does not license the AES arm",
@@ -263,6 +276,7 @@ class StrongBoxCheckTest {
     fun theAesArmAndTheUndeclaredArmAreReportedSeparately() {
         val verdict = evaluate(
             featureDeclared = false,
+            strongBoxFeatureVersion = PIXEL_FEATURE_VERSION,
             availability = StrongBoxCheck.Availability.SERVED,
             aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
         )
@@ -275,10 +289,65 @@ class StrongBoxCheckTest {
         )
     }
 
-    /** The size asked for is the one value the HAL leaves no room for. */
+    /** The size asked for is the one value the KeyMint HAL leaves no room for. */
     @Test
     fun theForbiddenSizeIsTheOneBetweenTheTwoRequiredOnes() {
         assertEquals(192, StrongBoxCheck.AES_FORBIDDEN_SIZE_BITS)
+    }
+
+    /**
+     * MEASURED on the phone station, and the reason the gate exists. A stock,
+     * locked Samsung SM-G780G declaring strongbox_keystore=4 serves StrongBox
+     * and accepts a 192 bit AES key. It implements Keymaster 4.0, whose HAL
+     * lists AES as "128 and 256-bit keys" with no StrongBox clause at all, so
+     * it was never told to refuse the size. Reporting it would be a false
+     * positive on a genuine retail handset.
+     */
+    @Test
+    fun aKeymasterEraSecureElementThatTakesTheSizeIsNotAFinding() {
+        for (version in listOf(0, 4, 40, 41, 99)) {
+            val verdict = honestStrongBox(
+                aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+                strongBoxFeatureVersion = version,
+            )
+            assertEquals(
+                "strongbox_keystore=$version predates the AES restriction",
+                0,
+                verdict.mask
+            )
+        }
+    }
+
+    /** From KeyMint 1.0 the restriction exists, so acceptance is a finding. */
+    @Test
+    fun aKeyMintSecureElementThatTakesTheSizeIsAFinding() {
+        for (version in listOf(100, 200, 300, 400)) {
+            val verdict = honestStrongBox(
+                aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+                strongBoxFeatureVersion = version,
+            )
+            assertEquals(
+                "strongbox_keystore=$version carries the AES restriction",
+                listOf(StrongBoxCheck.REASON_STRONGBOX_TOOK_AES_192),
+                verdict.reasons
+            )
+        }
+    }
+
+    /** An unreadable feature list is not a licence to judge the size. */
+    @Test
+    fun anUnknownStrongBoxVersionIsNeverJudged() {
+        val verdict = honestStrongBox(
+            aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            strongBoxFeatureVersion = null,
+        )
+        assertEquals(0, verdict.mask)
+    }
+
+    /** The gate is pinned to the version the restriction arrived in. */
+    @Test
+    fun theGateIsTheFirstKeyMintFeatureVersion() {
+        assertEquals(100, StrongBoxCheck.STRONGBOX_FEATURE_VERSION_KEYMINT_1)
     }
 
     // ---- arms that could not run -------------------------------------------
@@ -338,6 +407,7 @@ class StrongBoxCheckTest {
             evaluate(
                 availability = StrongBoxCheck.Availability.SERVED,
                 aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+                strongBoxFeatureVersion = PIXEL_FEATURE_VERSION,
             ),
         ).flatMap { it.reasons }.toSet()
 
