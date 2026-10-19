@@ -121,6 +121,24 @@ class ReportBuilderTest {
     }
 
     /**
+     * The finding's own reason text has to land on the row its flag lights, or
+     * a report says a check fired and cannot say why.
+     */
+    @Test
+    fun theCompanionFindingNamesItselfOnTheForgeryRow() {
+        val text = build(
+            bitmask = DetectionResult.DETECTION_ATTEST_FORGERY,
+            reasons = listOf(CompanionAlgorithmCheck.COMPANION_SOFTWARE_ROOT),
+        )
+        assertTrue("names the software fallback arm", text.contains("software fallback"))
+        assertTrue("marks the row as a finding", text.contains("[DETECTED"))
+        assertFalse(
+            "the reason fell into the unattributed bucket",
+            text.contains("Unrecognised reason code")
+        )
+    }
+
+    /**
      * The two companion verdicts that set no bit are only ever visible in the
      * report, so a refusal or an unfamiliar root has to reach the text.
      */
