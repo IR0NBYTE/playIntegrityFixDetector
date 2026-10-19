@@ -170,6 +170,30 @@ not observable, and on a stock emulator all 13 observable passed with 10 not
 observable. None of the four rows 2.9 adds fires on any genuine device
 measured, which is the result those rows were built to produce.
 
+## Outcome (3.1, 2026-10-19)
+
+Neither arm in 3.1 came off the D list. Both came from the daily watch on the
+module repositories, which is a different pipeline: the D list asks what the
+detector should check next, and the watch asks what the other side shipped this
+week. Both are recorded here because the two arms change what the flags in
+COVERAGE.md observe.
+
+| Item | Outcome | Evidence |
+|---|---|---|
+| Reason 806, a property area mapped private | Landed | `KOWX712/PlayIntegrityFix#17` stopped hooking property reads and re-maps each `/dev/__properties__` area `MAP_FIXED \| MAP_PRIVATE` from the genuine fd instead, which defeats the latency arm (804) outright. It cannot defeat the sharing column: bionic passes `MAP_SHARED` in every path that maps a property file, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote. The upstream verifier asserts `permissions[3] == 'p'` on its own mappings, so the author knows. Silent on four devices, 111 property areas, none private. The true positive side is reasoned from the upstream source and is not observed, because no device here has the virtualizer installed |
+| Reason 1113, a software-rooted companion chain | Landed | `qwq233/OhMyKeymint` `b12557c15` dropped the requirement that a keybox carry an RSA entry and falls back to a bundled template that is the AOSP software chain, so an EC-only keybox produces a Google-rooted hardware chain for one algorithm and the software fallback for the other. The detector only ever asked for EC keys. The first draft of the arm was root equality across the two algorithms and would have convicted a stock API 32 emulator; see COVERAGE.md for why. Silent on four devices across three keystore generations. The true positive side is reasoned from the module's source and its bundled template, and needs a rooted handset to observe |
+| Reasons 801 to 805 | Wired | They existed and none had ever reached a report, because the property walk ended at its first finding with a bare `return true`. The walk now accumulates, so a device caught by the fingerprint is no longer silent about the mapping sitting next to it |
+
+Measured effect of 3.1: the reason table goes from 50 codes to 52, and both new
+arms are silent on every device available to this project. 419 unit tests and 50
+instrumented tests pass on an SM-A065F and on two emulator images spanning API
+30 and 34.
+
+What 3.1 does not have is a positive witness for either arm. Both would need a
+rooted handset running the module in question, and the phone station was
+unreachable for the whole of this work. That is stated in the release notes
+rather than left for a reader to infer.
+
 ## Sequencing
 
 1. D1 first. It is the smallest change with the highest live value and it closes
