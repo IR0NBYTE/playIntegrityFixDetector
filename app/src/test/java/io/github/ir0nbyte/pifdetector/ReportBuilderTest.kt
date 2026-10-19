@@ -119,4 +119,29 @@ class ReportBuilderTest {
         val text = build(bitmask = DetectionResult.DETECTION_TREAT_WHEEL)
         assertTrue(text.contains("Treat Wheel"))
     }
+
+    /**
+     * The two companion verdicts that set no bit are only ever visible in the
+     * report, so a refusal or an unfamiliar root has to reach the text.
+     */
+    @Test
+    fun theCompanionAlgorithmVerdictIsCarriedEvenWhenItSetsNoBit() {
+        for (verdict in CompanionAlgorithmCheck.Verdict.entries) {
+            val r = report().copy(companionAlgorithm = verdict)
+            val rows = DetectionResult.fromBitmask(
+                r.bitmask, r.revocation, null, null, null, null, null, r.reasons,
+            )
+            val text = ReportBuilder.build(rows, r, presentation, appVersion = "2.9 (11)")
+            assertTrue(
+                "the report dropped the $verdict verdict",
+                text.contains("companion algorithm") && text.contains(verdict.name)
+            )
+            for (banned in listOf("BEGIN CERTIFICATE", "serial", "challenge")) {
+                assertFalse(
+                    "a companion verdict leaked '$banned'",
+                    text.lowercase().contains(banned.lowercase())
+                )
+            }
+        }
+    }
 }

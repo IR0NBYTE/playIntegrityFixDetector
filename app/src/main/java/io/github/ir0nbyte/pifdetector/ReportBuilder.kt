@@ -87,6 +87,10 @@ object ReportBuilder {
             appendLine("  attested KeyMint        ${v.keymasterVersion ?: "?"}")
         }
         report.moduleHash?.let { appendLine("  module hash             ${it.outcome}") }
+        // Carried whatever it says. The two silent-but-interesting verdicts,
+        // a keystore that refused RSA and a root this build does not know, are
+        // only ever visible here.
+        report.companionAlgorithm?.let { appendLine("  companion algorithm     $it") }
     }
 
     private fun StringBuilder.appendChecks(rows: List<DetectionResult>) {

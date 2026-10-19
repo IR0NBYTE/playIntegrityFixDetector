@@ -16,12 +16,13 @@ data class DetectionReport(
     val versions: VersionBounds.Verdict? = null,
     val shape: RecordShape.Verdict? = null,
     val moduleHash: ModuleHash.Status? = null,
+    val companionAlgorithm: CompanionAlgorithmCheck.Verdict? = null,
 
     /**
      * Reason codes naming which sub-probe set a bit, from the native engine,
-     * the keystore boundary probe, the attested identity probe and the
-     * StrongBox probe. Advisory: a bit with no reason is still set, so an
-     * unwired check simply reports nothing extra.
+     * the keystore boundary probe, the attested identity probe, the StrongBox
+     * probe and the companion algorithm probe. Advisory: a bit with no reason
+     * is still set, so an unwired check simply reports nothing extra.
      */
     val reasons: List<Int> = emptyList(),
 
@@ -38,6 +39,7 @@ class DetectionRunner {
     private val boundaryProbe = KeystoreBoundaryProbe()
     private val identityProbe = AttestedIdentityProbe()
     private val strongBoxProbe = StrongBoxProbe()
+    private val companionAlgorithmProbe = CompanionAlgorithmProbe()
 
     fun runCheck(
         context: Context,
@@ -62,17 +64,19 @@ class DetectionRunner {
             val boundary = boundaryProbe.probe()
             val identity = identityProbe.probe()
             val strongBox = strongBoxProbe.probe(appContext)
+            val companionAlgorithm = companionAlgorithmProbe.probe()
             val report = DetectionReport(
                 bitmask = nativeMask or passive.mask or activeMask or boundary.mask or
-                    identity.mask or strongBox.mask,
+                    identity.mask or strongBox.mask or companionAlgorithm.mask,
                 revocation = passive.revocation,
                 crossSource = passive.crossSource,
                 validity = passive.validity,
                 versions = passive.versions,
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
+                companionAlgorithm = companionAlgorithm.verdict,
                 reasons = reasons + boundary.reasons + identity.reasons +
-                    strongBox.reasons,
+                    strongBox.reasons + companionAlgorithm.reasons,
                 presentation = presentation,
             )
             mainHandler.post {
