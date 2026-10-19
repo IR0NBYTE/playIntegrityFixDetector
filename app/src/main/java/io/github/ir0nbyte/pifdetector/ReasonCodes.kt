@@ -90,6 +90,8 @@ object ReasonCodes {
             "Property reads were slow enough to suggest a hook"),
         Reason(805, DetectionResult.DETECTION_PROP_SPOOF,
             "The board claims a Pixel while the kernel reports other silicon"),
+        Reason(806, DetectionResult.DETECTION_PROP_SPOOF,
+            "A /dev/__properties__ area is mapped private rather than shared"),
 
         Reason(1001, DetectionResult.DETECTION_CODE_INTEGRITY,
             "A libc function begins with a jump into memory that is not a " +

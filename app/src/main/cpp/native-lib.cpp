@@ -270,6 +270,7 @@ namespace reason {
     constexpr jint kFlavorMismatch        = 803;
     constexpr jint kPropertyReadSlow      = 804;
     constexpr jint kBoardSocMismatch      = 805;
+    constexpr jint kPropertyAreaPrivate   = 806;
 
     /*
      * Collected for the duration of one engine run. The engine is entered from
@@ -523,7 +524,10 @@ static bool fingerprintContradicts(const std::string& fp, const char* brand) {
         std::string b(brand);
         std::transform(fpBrand.begin(), fpBrand.end(), fpBrand.begin(), ::tolower);
         std::transform(b.begin(), b.end(), b.begin(), ::tolower);
-        if (!fpBrand.empty() && fpBrand != b) return true;
+        if (!fpBrand.empty() && fpBrand != b) {
+            reason::note(reason::kBrandMismatch);
+            return true;
+        }
     }
 
     char buildType[PROP_VALUE_MAX] = {0};
@@ -544,7 +548,10 @@ static bool fingerprintContradicts(const std::string& fp, const char* brand) {
             if (slash != std::string::npos && slash > 0 && slash + 1 < tail.size()) {
                 std::string fpType = tail.substr(0, slash);
                 std::string fpTags = tail.substr(slash + 1);
-                if (fpType != "user" || fpTags != "release-keys") return true;
+                if (fpType != "user" || fpTags != "release-keys") {
+                    reason::note(reason::kBuildIdentityMismatch);
+                    return true;
+                }
             }
         }
 
@@ -557,11 +564,120 @@ static bool fingerprintContradicts(const std::string& fp, const char* brand) {
                 size_t n = strlen(suffix);
                 return fl.size() >= n && fl.compare(fl.size() - n, n, suffix) == 0;
             };
-            if (endsWith("-userdebug") || endsWith("-eng")) return true;
+            if (endsWith("-userdebug") || endsWith("-eng")) {
+                reason::note(reason::kFlavorMismatch);
+                return true;
+            }
         }
     }
 
     return false;
+}
+
+/*
+ * Classifies one /proc/self/maps line as a property area and says whether that
+ * area is a private mapping. Split out from the walk below so the parser can be
+ * driven from fixtures in nativeSelfTest rather than only against whatever this
+ * device happens to map.
+ *
+ * A line that does not parse, or whose permission field is too short to carry a
+ * sharing column, sets neither flag. A genuine device must not be convicted by
+ * a line this parser failed to read.
+ */
+static void classifyPropertyAreaLine(const std::string& line,
+                                     const std::string& propertyDir,
+                                     bool* isPropertyArea,
+                                     bool* isPrivate) {
+    *isPropertyArea = false;
+    *isPrivate = false;
+
+    unsigned long long start = 0, end = 0, fileOffset = 0;
+    char perms[8] = {0};
+    int pathOffset = 0;
+    if (sscanf(line.c_str(), "%llx-%llx %7s %llx %*s %*s %n",
+               &start, &end, perms, &fileOffset, &pathOffset) < 4) {
+        return;
+    }
+    if (pathOffset <= 0 || static_cast<size_t>(pathOffset) >= line.size())
+        return;
+    if (line.compare(static_cast<size_t>(pathOffset), propertyDir.size(),
+                     propertyDir) != 0) {
+        return;
+    }
+    if (strnlen(perms, sizeof(perms)) < 4)
+        return;
+
+    *isPropertyArea = true;
+    *isPrivate = perms[3] == 'p';
+}
+
+/* Number of /dev/__properties__ areas this process has mapped. */
+static int countPropertyAreaMappings() {
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (!maps.is_open()) return -1;
+
+    const std::string propertyDir =
+        Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+    int areas = 0;
+    std::string line;
+    while (std::getline(maps, line)) {
+        bool isArea = false, isPrivate = false;
+        classifyPropertyAreaLine(line, propertyDir, &isArea, &isPrivate);
+        if (isArea) areas++;
+    }
+    return areas;
+}
+
+/*
+ * A property area that is a private mapping of /dev/__properties__.
+ *
+ * bionic maps every property file shared: map_fd_ro, which every reader takes,
+ * passes PROT_READ | MAP_SHARED, map_prop_area_rw passes MAP_SHARED too, and
+ * the property_info area is mapped MAP_SHARED by the info parser. That holds
+ * byte for byte from android10-release through the current tree, and fork
+ * carries a shared mapping across the zygote, so the sharing column of every
+ * /dev/__properties__ area reads 's' on a stock device. Three bench handsets on
+ * API 33, 34 and 35 agree: 43 areas, every one of them 's'.
+ *
+ * Writing a spoofed value into the area without hooking a read needs the page
+ * writable in this process and nowhere else, which means MAP_PRIVATE, and the
+ * kernel reports that as 'p' whichever file backs the mapping. Re-mapping the
+ * genuine file MAP_FIXED keeps the pathname, device and inode intact, so those
+ * three cannot carry the detection, but the sharing column is not the mapper's
+ * to choose.
+ *
+ * This reads only this process's own maps, which needs no permission beyond
+ * being the process, so the SELinux ceiling that blocks /data/adb does not
+ * apply.
+ *
+ * The context node array bionic allocates next to these areas is MAP_PRIVATE
+ * and would read 'p', but it is anonymous and the kernel gives it a bracketed
+ * anon name rather than a /dev/__properties__ pathname, so scoping the match to
+ * the pathname keeps it out.
+ */
+static bool detectPrivatePropertyArea() {
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (!maps.is_open()) return false;
+
+    const std::string propertyDir =
+        Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+
+    bool sawPropertyArea = false;
+    bool privateArea = false;
+    std::string line;
+    while (std::getline(maps, line)) {
+        bool isArea = false, isPrivate = false;
+        classifyPropertyAreaLine(line, propertyDir, &isArea, &isPrivate);
+        if (!isArea) continue;
+        sawPropertyArea = true;
+        if (isPrivate) privateArea = true;
+    }
+
+    /*
+     * No area at all is not evidence of a spoof, it is evidence that this walk
+     * saw nothing, so it must not flag.
+     */
+    return sawPropertyArea && privateArea;
 }
 
 static bool detectPropertyInconsistencies() {
@@ -577,7 +693,15 @@ static bool detectPropertyInconsistencies() {
     const bool fingerprintParses =
         strlen(fingerprint) > 0 && fp.find('/') != std::string::npos;
 
-    if (fingerprintParses && fingerprintContradicts(fp, brand)) return true;
+    /*
+     * Each arm records its own code and none of them ends the walk. A device
+     * can be caught by more than one, and a chain of early returns would name
+     * the fingerprint and stay silent about the private property area sitting
+     * next to it.
+     */
+    bool spoofed = false;
+
+    if (fingerprintParses && fingerprintContradicts(fp, brand)) spoofed = true;
 
     long long bestMicros = -1;
     for (int round = 0; round < 5; round++) {
@@ -594,7 +718,10 @@ static bool detectPropertyInconsistencies() {
         if (bestMicros <= 50000) break;
     }
 
-    if (bestMicros > 50000) return true;
+    if (bestMicros > 50000) {
+        reason::note(reason::kPropertyReadSlow);
+        spoofed = true;
+    }
 
     char board[PROP_VALUE_MAX] = {0};
     __system_property_get(
@@ -619,11 +746,19 @@ static bool detectPropertyInconsistencies() {
                     }
                 }
             }
-            if (boardContradictsSoc(brand, fp, board, cpuHardware)) return true;
+            if (boardContradictsSoc(brand, fp, board, cpuHardware)) {
+                reason::note(reason::kBoardSocMismatch);
+                spoofed = true;
+            }
         }
     }
 
-    return false;
+    if (detectPrivatePropertyArea()) {
+        reason::note(reason::kPropertyAreaPrivate);
+        spoofed = true;
+    }
+
+    return spoofed;
 }
 
 // Mount-table analysis.
@@ -2274,6 +2409,77 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
                  c.brand, c.board, c.cpuHardware);
             failures++;
         }
+    }
+
+    /*
+     * Property area parser cases. The first three lines are verbatim from
+     * /proc/self/maps on the Pixel 7a (API 35), SM-G780G (API 33) and moto g04
+     * (API 34), so the shared shape is a measurement rather than an assumption.
+     * The fourth is the same Pixel line with the sharing column flipped, which
+     * is the whole observable difference a private remap leaves behind.
+     */
+    struct PropertyAreaCase {
+        const char* line;
+        bool expectedArea;
+        bool expectedPrivate;
+    };
+    static const PropertyAreaCase kPropertyAreaCases[] = {
+        {"6e23965000-6e23985000 r--s 00000000 00:10 124    "
+         "/dev/__properties__/u:object_r:build_prop:s0", true, false},
+        {"7fae686000-7fae6a4000 r--s 00000000 00:12 20864  "
+         "/dev/__properties__/property_info", true, false},
+        {"74d84f8000-74d8518000 r--s 00000000 00:11 497    "
+         "/dev/__properties__/properties_serial", true, false},
+
+        {"6e23965000-6e23985000 r--p 00000000 00:10 124    "
+         "/dev/__properties__/u:object_r:build_prop:s0", true, true},
+        {"6e23965000-6e23985000 rw-p 00000000 00:10 124    "
+         "/dev/__properties__/u:object_r:build_prop:s0", true, true},
+
+        // init holds the writable area, and holds it shared.
+        {"6e23965000-6e23985000 rw-s 00000000 00:10 124    "
+         "/dev/__properties__/u:object_r:build_prop:s0", true, false},
+
+        // bionic's context node array: private, but anonymous, so not an area.
+        {"7035400000-7035401000 rw-p 00000000 00:00 0      "
+         "[anon:System property context nodes]", false, false},
+
+        {"7035210000-703522a000 r--p 00000000 00:10 85     "
+         "/dev/__propertiesXX/property_info", false, false},
+        {"70339c2000-70339e2000 r-xp 00000000 fe:09 1234   "
+         "/apex/com.android.runtime/lib64/bionic/libc.so", false, false},
+
+        // Short permission field: no sharing column to read, so no verdict.
+        {"74d84f8000-74d8518000 r-- 00000000 00:11 497     "
+         "/dev/__properties__/properties_serial", false, false},
+
+        {"not a maps line at all", false, false},
+        {"74d84f8000-74d8518000 r--s 00000000 00:11 497", false, false},
+        {"", false, false},
+    };
+    const std::string selfTestPropertyDir =
+        Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+    for (const auto& c : kPropertyAreaCases) {
+        bool isArea = false, isPrivate = false;
+        classifyPropertyAreaLine(c.line, selfTestPropertyDir, &isArea, &isPrivate);
+        if (isArea != c.expectedArea || isPrivate != c.expectedPrivate) {
+            LOGD("classifyPropertyAreaLine wrong for '%s': area=%d private=%d",
+                 c.line, isArea ? 1 : 0, isPrivate ? 1 : 0);
+            failures++;
+        }
+    }
+
+    /*
+     * An arm that sees nothing passes for the wrong reason. Every Android
+     * process maps at least the build_prop area and property_info, so a count
+     * of zero means the walk is reading the wrong thing, not that the device is
+     * clean.
+     */
+    const int propertyAreas = countPropertyAreaMappings();
+    if (propertyAreas <= 0) {
+        LOGD("no property area mappings visible, the arm has no surface (%d)",
+             propertyAreas);
+        failures++;
     }
 
     return failures;
