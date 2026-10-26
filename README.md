@@ -51,7 +51,7 @@ Newer forks add: streaming the dex payload over a Zygisk companion IPC channel (
 `MainActivity` is UI-only. `DetectionRunner` owns the worker executor and the JNI binding to the native engine. The native engine runs in two phases:
 
 1. **Debug/instrumentation checks** run first (fail-fast): `isTraced()`, Frida TCP-connect probe and thread scan, parent process check, debuggable flag (release only)
-2. **Tampering checks** run in randomized order each time: Zygisk maps scan plus PackageManager root-app probe and su-binary scan, PIF side-effect probe, companion-streaming probe, mount-table analysis, OverlayFS, bootloader props, APK signature, TrickyStore paths, property consistency including a `/dev/__properties__` area mapped private rather than shared, Pixel Canary fingerprint, TS-Enhancer-Extreme, PIF Pure Rust, Treat Wheel
+2. **Tampering checks** run in randomized order each time: Zygisk maps scan plus PackageManager root-app probe and su-binary scan, PIF side-effect probe, companion-streaming probe, mount-table analysis, OverlayFS, bootloader props, APK signature, TrickyStore paths, property consistency including a `/dev/__properties__` area mapped private rather than shared and one holding allocated space its own trie cannot reach, Pixel Canary fingerprint, TS-Enhancer-Extreme, PIF Pure Rust, Treat Wheel
 
 The native engine needs a `Context` for the three checks that touch the framework (root-manager package probe, debuggable flag, APK signature), so `isIntegrityTampered` takes one explicitly. It previously received the `DetectionRunner` instance instead, which under CheckJNI aborts the process and without it is undefined behaviour that made all three silently fail open.
 
