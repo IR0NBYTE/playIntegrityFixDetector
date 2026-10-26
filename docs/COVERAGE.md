@@ -31,14 +31,28 @@ flagship:
 
 | Device | Android | SDK | first_api_level | keystore feature | What it contributes |
 |---|---|---|---|---|---|
-| Samsung SM-A065F (a06) | 14 | 34 | 34 | 100, no StrongBox | A genuine mdfpp TEE on an RKP chain, bootloader unlocked, stock and unrooted. The only device here whose EC chain anchors to a pinned Google root, so the only one that opens the companion algorithm gate |
+| Samsung SM-A065F (a06) | 14 | 34 | 34 | 100, no StrongBox | A genuine mdfpp TEE on an RKP chain, bootloader unlocked, **rooted**: Magisk 30.6 with Shamiko and Zygisk Next, and frida-server listening on 27042. The only device here whose EC chain anchors to a pinned Google root, so the only one that opens the companion algorithm gate |
 | `Pixel3_adb_root_test_sdk30` | 11 | 30 | 30 | none declared | AOSP software keymaster, pre-RKP. Serves a DIFFERENT attestation root per key algorithm |
 | `Pixel3_malware_sdk32` | 12L | 32 | 31 | 41 | The same two software roots while declaring `hardware_keystore` 41, which is why the feature flag is not a usable gate |
 | `Pixel3_malware_sdk34` | 14 | 34 | 34 | 300 | The RKP `Droid Unregistered Device CA` chain, one root for both algorithms |
 
-The SM-A065F is an unlocked-bootloader unit, so it witnesses keystore- and
-maps-shaped arms and is explicitly NOT a witness for verified-boot or
-lock-state arms.
+The SM-A065F is an unlocked-bootloader **rooted** unit, so it witnesses
+keystore- and maps-shaped arms and is explicitly NOT a witness for verified-boot,
+lock-state, root or hook arms. It is a positive witness for those last two: the
+root, hider and frida families all fire on it and are right to.
+
+This row said "stock and unrooted" from 2026-10-19, when it was added, until
+2026-10-26. That was wrong, and wrong in the direction that matters, because it
+described the device this file leans on for genuine-negative measurements. The
+error came from inferring root state from an unprivileged shell: `/data/adb` was
+unreadable and the shell ran as uid 2000, which is true of a rooted device as
+well. `su -c id` was never run. It returns uid 0 in `u:r:magisk:s0`.
+`docs/PLAN.md` and the CODE_INTEGRITY row below had said "rooted Samsung A06"
+all along, so the file contradicted itself for a week.
+
+The measurements taken on it stand, and one of them is stronger than claimed:
+the 68 property areas read as shared on a device that is running Magisk, rather
+than on a stock one.
 
 Every attestation-record row below is silent on all three station handsets. The
 root and hook rows are not in scope for that claim: the Pixel in this population is the
