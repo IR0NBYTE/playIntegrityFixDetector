@@ -184,8 +184,10 @@ COVERAGE.md observe.
 | Reason 1113, a software-rooted companion chain | Landed | `qwq233/OhMyKeymint` `b12557c15` dropped the requirement that a keybox carry an RSA entry and falls back to a bundled template that is the AOSP software chain, so an EC-only keybox produces a Google-rooted hardware chain for one algorithm and the software fallback for the other. The detector only ever asked for EC keys. The first draft of the arm was root equality across the two algorithms and would have convicted a stock API 32 emulator; see COVERAGE.md for why. Silent on four devices across three keystore generations. The true positive side is reasoned from the module's source and its bundled template, and needs a rooted handset to observe |
 | Reasons 801 to 805 | Wired | They existed and none had ever reached a report, because the property walk ended at its first finding with a bare `return true`. The walk now accumulates, so a device caught by the fingerprint is no longer silent about the mapping sitting next to it |
 
-Measured effect of 3.1: the reason table goes from 50 codes to 52, and both new
-arms are silent on every device available to this project. 419 unit tests and 50
+Measured effect of 3.1: the reason table goes from 49 codes to 51, and both new
+arms are silent on every device available to this project. (The release notes
+for 3.1 say 50 to 52. That was off by one at both ends, counted again on
+2026-10-26 against the table and the emittable set.) 419 unit tests and 50
 instrumented tests pass on an SM-A065F and on two emulator images spanning API
 30 and 34.
 
@@ -193,6 +195,29 @@ What 3.1 does not have is a positive witness for either arm. Both would need a
 rooted handset running the module in question, and the phone station was
 unreachable for the whole of this work. That is stated in the release notes
 rather than left for a reader to infer.
+
+## Outcome (3.2, 2026-10-26)
+
+Three things, and two of them are about us rather than about the other side.
+
+| Item | Outcome | Evidence |
+|---|---|---|
+| Thirteen reason codes that could never reach a report | Fixed | The whole frida family (201 to 205), four zygisk arms (301 to 304) and all four mount and hider arms (901 to 904) were declared and never passed to `reason::note`. Three families could set their bit and leave the reader a red row with nothing under it. This is the same defect as the property walk before 3.1, where 801 to 805 never reached a report, and it survived because `ReasonCodesSyncTest` parses the constants and the text table and both were present and agreed. Declaring a constant is not a producer; calling `note` is, and the sync test now says so |
+| Reason 807, a property area holding allocations its trie cannot reach | Landed, **witnessed both ways** | `JingMatrix/TEESimulator#270` stopped flipping `remote_provisioning.*.rkp_only` to false and deletes it instead, because a deleted property reads back as unset and is indistinguishable from one the device never shipped. True through the property API, false through the area: bionic's `prop_area` is a bump allocator with no free list and AOSP has no delete at all, so Magisk's `prop_area::remove` leaves a zeroed hole nothing points at. `AlwaysStrong` v1.0.5 does the same from a different motive, deleting pihook and pixelprops properties to keep the table clean of markers a detector could fingerprint on. 893 areas across two images account to the byte with one exception, and a controlled `resetprop` moved the number by exactly the 144 bytes the test property allocated |
+| What the bench device actually is | Corrected | COVERAGE.md called the SM-A065F "stock and unrooted" from the 3.1 release commit until 2026-10-26. It is rooted: Magisk 30.6 with Shamiko and Zygisk Next, and frida-server on 27042. The claim came from reading an unprivileged shell as evidence of absence. `PLAN.md` and the CODE_INTEGRITY row had said rooted all along |
+
+3.2 is the first release here whose new arm has a positive hardware witness as
+well as a negative one. 807 fires on the SM-A065F, alone in its row with 801 to
+806 silent, and Property Spoofing stays PASS on the API 30 emulator.
+
+It is also the first release to ship a detection whose residual false positive
+vector is a measured unknown rather than a reasoned one. The 15500 unreachable
+bytes in `bootloader_prop` on that handset have no identified author, and
+Samsung is known to patch the property area size, so the stock-bionic
+assumption is not free for that vendor. COVERAGE.md states this, names what
+would close it, and says what to do if a stock device ever trips the arm.
+
+The reason table goes from 51 codes to 52.
 
 ## Sequencing
 
