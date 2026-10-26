@@ -336,14 +336,17 @@ static inline int detectSuspiciousParent() {
 
 __attribute__((always_inline))
 static inline bool isZygiskActiveEnhanced() {
+    bool found = false;
+    bool libraryMapped = false;
+
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
         std::string line;
         while (std::getline(maps, line)) {
             if (line.find("libandroid_runtime.so") != std::string::npos &&
                 line.find("rwxp") != std::string::npos) {
-                maps.close();
-                return true;
+                libraryMapped = true;
+                break;
             }
 
             if (line.find("rezygisk") != std::string::npos ||
@@ -359,26 +362,43 @@ static inline bool isZygiskActiveEnhanced() {
                 line.find(Deobfuscate(base64_decode("SiEjKD8iby4hIjgmQg=="))) != std::string::npos ||
                 line.find("LSPosed") != std::string::npos ||
                 line.find("[anon:zygisk]") != std::string::npos) {
-                maps.close();
-                return true;
+                libraryMapped = true;
+                break;
             }
         }
         maps.close();
     }
+    if (libraryMapped) {
+        reason::note(reason::kZygiskLibraryMapped);
+        found = true;
+    }
 
     if (getenv("ZYGISK_ENABLED") != nullptr ||
-        getenv("MAGISK_VER_CODE") != nullptr)
-        return true;
+        getenv("MAGISK_VER_CODE") != nullptr) {
+        reason::note(reason::kZygiskEnvironment);
+        found = true;
+    }
 
     char prop[PROP_VALUE_MAX] = {0};
     __system_property_get("ro.magisk.zygisk", prop);
-    if (strlen(prop) > 0 && strcmp(prop, "0") != 0) return true;
+    if (strlen(prop) > 0 && strcmp(prop, "0") != 0) {
+        reason::note(reason::kZygiskProperty);
+        found = true;
+    }
 
-    if (access("/data/adb/magisk", F_OK) == 0) return true;
-    if (access("/data/adb/ksu", F_OK) == 0) return true;
-    if (access("/data/adb/ap", F_OK) == 0) return true;
+    /*
+     * One code covers the three directories: the reason text names a root
+     * manager module directory rather than which manager owns it, and an app
+     * that can see any of them has learned the same fact.
+     */
+    if (access("/data/adb/magisk", F_OK) == 0 ||
+        access("/data/adb/ksu", F_OK) == 0 ||
+        access("/data/adb/ap", F_OK) == 0) {
+        reason::note(reason::kRootModuleDirectory);
+        found = true;
+    }
 
-    return false;
+    return found;
 }
 
 __attribute__((always_inline))
@@ -769,6 +789,14 @@ static bool detectPropertyInconsistencies() {
 // only the caller's own table, which is always available.
 static constexpr jint MOUNT_RULE_NONE = 0;
 
+/*
+ * Which rule matched, kept apart from the detection bits the classifier
+ * returns so the classifier stays a pure function the self test can drive.
+ * The caller turns these into reason codes.
+ */
+static constexpr jint MOUNT_RULE_TMPFS_SHADOW = 1;
+static constexpr jint MOUNT_RULE_ADB_BIND = 2;
+
 static std::vector<std::string> splitMountFields(const std::string& line) {
     std::vector<std::string> fields;
     std::size_t i = 0;
@@ -790,7 +818,8 @@ static bool pathIsUnder(const std::string& path, const std::string& prefix) {
 // fully understand returns 0, so a malformed table can never raise a finding.
 static jint classifyMountLine(const std::string& line,
                               const std::string& dataDev,
-                              std::string* moduleNameOut) {
+                              std::string* moduleNameOut,
+                              jint* ruleOut = nullptr) {
     const std::vector<std::string> f = splitMountFields(line);
     if (f.size() < 10) return MOUNT_RULE_NONE;
 
@@ -825,6 +854,7 @@ static jint classifyMountLine(const std::string& line,
         };
         for (const char* encoded : kSystemPartitions) {
             if (pathIsUnder(mountPoint, Deobfuscate(base64_decode(encoded)))) {
+                if (ruleOut != nullptr) *ruleOut = MOUNT_RULE_TMPFS_SHADOW;
                 return DETECTION_ROOT_HIDER;
             }
         }
@@ -844,6 +874,7 @@ static jint classifyMountLine(const std::string& line,
                     ? mountRoot.substr(start)
                     : mountRoot.substr(start, end - start);
             }
+            if (ruleOut != nullptr) *ruleOut = MOUNT_RULE_ADB_BIND;
             return DETECTION_ROOT_HIDER;
         }
     }
@@ -879,12 +910,19 @@ static jint detectMountArtifacts() {
     }
 
     jint result = MOUNT_RULE_NONE;
+    bool tmpfsShadow = false;
+    bool adbBind = false;
     std::vector<std::string> moduleNames;
     for (const std::string& line : lines) {
         std::string moduleName;
-        result |= classifyMountLine(line, dataDev, &moduleName);
+        jint rule = MOUNT_RULE_NONE;
+        result |= classifyMountLine(line, dataDev, &moduleName, &rule);
+        if (rule == MOUNT_RULE_TMPFS_SHADOW) tmpfsShadow = true;
+        if (rule == MOUNT_RULE_ADB_BIND) adbBind = true;
         if (!moduleName.empty()) moduleNames.push_back(moduleName);
     }
+    if (tmpfsShadow) reason::note(reason::kMountTmpfsShadow);
+    if (adbBind) reason::note(reason::kMountAdbBind);
 
     static const char* kModuleNeedles[] = {
         "SiEjKD8iby4hIjgmQg==",   // zygisk_vector
@@ -1517,53 +1555,86 @@ static bool tryConnectLoopback(uint16_t port) {
     return listening;
 }
 
+/*
+ * Each arm records its own code. They are evaluated rather than chained with
+ * ||, for the reason the root family already carries: a chain of || records
+ * only the first arm, so a process with an agent mapped and a port open
+ * reported the port and stayed silent about the agent. Before this, no arm
+ * here recorded anything at all, so the family could light a red row with
+ * nothing under it to read.
+ */
 static bool detectFridaPort() {
-    if (tryConnectLoopback(27042) || tryConnectLoopback(27043))
-        return true;
+    bool found = false;
+
+    if (tryConnectLoopback(27042)) {
+        reason::note(reason::kFridaPort27042);
+        found = true;
+    }
+    if (tryConnectLoopback(27043)) {
+        reason::note(reason::kFridaPort27043);
+        found = true;
+    }
 
     std::string tcpFiles[] = {
         Deobfuscate(base64_decode("Hyg2Li9mXj0wbjgqQA==")),
         Deobfuscate(base64_decode("Hyg2Li9mXj0wbjgqQG4=")),
     };
 
+    bool socketInTable = false;
     for (const auto& tcpFile : tcpFiles) {
+        if (socketInTable) break;
         ScopedFile fp(tcpFile.c_str(), "r");
         if (!fp.isOpen()) continue;
 
         char line[512];
         while (fgets(line, sizeof(line), fp)) {
             if (strstr(line, ":69A2") || strstr(line, ":69a2") ||
-                strstr(line, ":69A3") || strstr(line, ":69a3"))
-                return true;
-        }
-    }
-    return false;
-}
-
-static bool detectFridaThreads() {
-    DIR* taskDir = opendir("/proc/self/task");
-    if (!taskDir) return false;
-
-    struct dirent* entry;
-    while ((entry = readdir(taskDir)) != nullptr) {
-        if (entry->d_name[0] == '.') continue;
-
-        char commPath[256];
-        snprintf(commPath, sizeof(commPath), "/proc/self/task/%s/comm", entry->d_name);
-
-        ScopedFile fp(commPath, "r");
-        if (!fp.isOpen()) continue;
-
-        char comm[64] = {0};
-        if (fgets(comm, sizeof(comm), fp)) {
-            if (strstr(comm, "gum-js-loop") || strstr(comm, "frida")) {
-                closedir(taskDir);
-                return true;
+                strstr(line, ":69A3") || strstr(line, ":69a3")) {
+                socketInTable = true;
+                break;
             }
         }
     }
-    closedir(taskDir);
+    if (socketInTable) {
+        reason::note(reason::kFridaProcfsSocket);
+        found = true;
+    }
+    return found;
+}
 
+static bool detectFridaThreads() {
+    bool threadNamed = false;
+
+    /*
+     * An unreadable task directory used to return early and skip the mapping
+     * scan below it entirely, so a process that denied one read answered the
+     * other question with silence rather than with its own evidence.
+     */
+    DIR* taskDir = opendir("/proc/self/task");
+    if (taskDir) {
+        struct dirent* entry;
+        while ((entry = readdir(taskDir)) != nullptr) {
+            if (entry->d_name[0] == '.') continue;
+
+            char commPath[256];
+            snprintf(commPath, sizeof(commPath), "/proc/self/task/%s/comm", entry->d_name);
+
+            ScopedFile fp(commPath, "r");
+            if (!fp.isOpen()) continue;
+
+            char comm[64] = {0};
+            if (fgets(comm, sizeof(comm), fp)) {
+                if (strstr(comm, "gum-js-loop") || strstr(comm, "frida")) {
+                    threadNamed = true;
+                    break;
+                }
+            }
+        }
+        closedir(taskDir);
+    }
+    if (threadNamed) reason::note(reason::kFridaThreadName);
+
+    bool libraryMapped = false;
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
         std::string line;
@@ -1571,13 +1642,15 @@ static bool detectFridaThreads() {
             if (line.find("frida-agent") != std::string::npos ||
                 line.find("frida-gadget") != std::string::npos ||
                 line.find("libgadget") != std::string::npos) {
-                maps.close();
-                return true;
+                libraryMapped = true;
+                break;
             }
         }
         maps.close();
     }
-    return false;
+    if (libraryMapped) reason::note(reason::kFridaLibraryMapped);
+
+    return threadNamed || libraryMapped;
 }
 
 static bool detectCompanionStreaming() {
@@ -2190,7 +2263,9 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
         reason::note(reason::kTracerPidSet);
     }
 
-    if (detectFridaPort() || detectFridaThreads())
+    const bool fridaPort = detectFridaPort();
+    const bool fridaThreads = detectFridaThreads();
+    if (fridaPort || fridaThreads)
         result |= DETECTION_FRIDA;
 
     if (detectSuspiciousParent() == 1) {
@@ -2225,8 +2300,14 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
             if (zygisk) r |= DETECTION_ZYGISK;
             r |= detectMountArtifacts();
             bool hider = false;
-            if (detectOverlayFS()) hider = true;
-            if (detectRWXMappings()) hider = true;
+            if (detectOverlayFS()) {
+                reason::note(reason::kOverlayOnSystem);
+                hider = true;
+            }
+            if (detectRWXMappings()) {
+                reason::note(reason::kExcessRwxMappings);
+                hider = true;
+            }
             if (hider) r |= DETECTION_ROOT_HIDER;
             return r;
         }},

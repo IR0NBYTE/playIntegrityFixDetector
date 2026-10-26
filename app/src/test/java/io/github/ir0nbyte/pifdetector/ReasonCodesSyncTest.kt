@@ -169,6 +169,38 @@ class ReasonCodesSyncTest {
         assertTrue(rows.all { it.reasons.isEmpty() })
     }
 
+    /**
+     * A constant that no arm ever passes to reason::note is a code that can
+     * never reach a report, so the family can set its bit and leave the reader
+     * a red row with nothing under it to read.
+     *
+     * This is the same defect PR #20 fixed for the property walk, where the
+     * walk returned at its first finding and 801 to 805 never reached a report.
+     * It was found again on 2026-10-26 with thirteen of the thirty-eight native
+     * codes declared and never emitted: the whole frida family, four of the
+     * zygisk arms and all four mount and hider arms. A phone running
+     * frida-server reported DETECTED and said nothing about why.
+     *
+     * Declaring the constant is not the producer. Calling note is.
+     */
+    @Test
+    fun everyNativeReasonCodeIsEmittedBySomeArm() {
+        val src = repoFile("src/main/cpp/native-lib.cpp").readText()
+        val emitted = Regex("""reason::note\(\s*reason::(k\w+)""")
+            .findAll(src)
+            .map { it.groupValues[1] }
+            .toSet()
+        assertTrue("no reason::note call sites parsed out of native-lib.cpp", emitted.isNotEmpty())
+
+        val declared = nativeReasonCodes()
+        val unreachable = declared.filterKeys { it !in emitted }
+        assertTrue(
+            "these native codes are declared but never passed to reason::note, so " +
+                "nothing can ever report them: $unreachable",
+            unreachable.isEmpty(),
+        )
+    }
+
     private fun nativeReasonCodes(): Map<String, Int> {
         val src = repoFile("src/main/cpp/native-lib.cpp").readText()
         val block = Regex("""namespace reason \{(.*?)\n\}""", RegexOption.DOT_MATCHES_ALL)
