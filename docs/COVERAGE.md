@@ -404,12 +404,34 @@ phone moved the number exactly as the allocator predicts:
 and a 112 byte `prop_info`. The delete returned none of it and the trie reaches
 neither.
 
-### What defeats it
+### What defeats it, and what could falsely accuse
 
 `resetprop --compact` rebuilds the area and erases the evidence, and Magisk
 ships it as a command. This arm therefore reads a module that deleted and did
 not tidy up. A module that compacts afterwards is invisible to it, which is
 worth saying plainly rather than discovering later.
+
+The false positive vector is a vendor whose own init deletes properties. AOSP
+cannot: there is no delete in bionic at all. But the stock-bionic assumption is
+not free, and the measurement above contains a warning about it. Every property
+area on the SM-A065F is 196608 bytes, and bionic ships 131072 or, under
+`LARGE_SYSTEM_PROPERTY_NODE`, 1048576. Samsung patched that constant, which
+proves this vendor does modify the property area build. A vendor that went
+further and added a delete primitive would be reported by this arm.
+
+Two things bound that risk rather than removing it. Of the 723 areas on that
+handset, 722 account to the byte, so whatever produced the one anomaly is not a
+routine habit of that vendor's init. And the anomaly sits in
+`bootloader_prop`, the one context a bootloader-status spoofer targets, on a
+phone that is rooted and running a module which rewrites exactly those
+properties.
+
+**This arm has not been measured on a stock Samsung**, and the 15500 unreachable
+bytes on the rooted one have no identified author. Attributing them, or
+measuring a stock handset from the same family, is the open question, and it is
+recorded as the top lead in the watch state. If a stock device is ever found to
+trip this, the gate is one condition and the arm should be demoted to reported
+rather than deleted.
 
 ## Why the RKP provisioning era is not a detection
 
