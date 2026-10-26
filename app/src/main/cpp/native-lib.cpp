@@ -271,6 +271,7 @@ namespace reason {
     constexpr jint kPropertyReadSlow      = 804;
     constexpr jint kBoardSocMismatch      = 805;
     constexpr jint kPropertyAreaPrivate   = 806;
+    constexpr jint kPropertyAreaWiped     = 807;
 
     /*
      * Collected for the duration of one engine run. The engine is entered from
@@ -607,7 +608,9 @@ static bool fingerprintContradicts(const std::string& fp, const char* brand) {
 static void classifyPropertyAreaLine(const std::string& line,
                                      const std::string& propertyDir,
                                      bool* isPropertyArea,
-                                     bool* isPrivate) {
+                                     bool* isPrivate,
+                                     unsigned long long* startOut = nullptr,
+                                     unsigned long long* endOut = nullptr) {
     *isPropertyArea = false;
     *isPrivate = false;
 
@@ -626,6 +629,19 @@ static void classifyPropertyAreaLine(const std::string& line,
     }
     if (strnlen(perms, sizeof(perms)) < 4)
         return;
+
+    /*
+     * Only a mapping that starts at the beginning of the file carries the
+     * prop_area header, and only a readable one can be walked. A partial or
+     * write-only mapping is handed back as an area but with no range, so the
+     * accounting walk leaves it alone instead of reading a header that is not
+     * there.
+     */
+    if (startOut != nullptr && endOut != nullptr &&
+        fileOffset == 0 && perms[0] == 'r' && end > start) {
+        *startOut = start;
+        *endOut = end;
+    }
 
     *isPropertyArea = true;
     *isPrivate = perms[3] == 'p';
@@ -698,6 +714,248 @@ static bool detectPrivatePropertyArea() {
      * saw nothing, so it must not flag.
      */
     return sawPropertyArea && privateArea;
+}
+
+/*
+ * Allocation accounting for one property area, reason 807.
+ *
+ * bionic's prop_area is a bump allocator with no free list: allocate_obj only
+ * ever moves bytes_used_ forward, and nothing in AOSP ever takes a property
+ * back out. There is no delete in the platform at all. __system_property_find,
+ * _get, _set, _read and _foreach are the whole public surface, and the trie is
+ * documented as written only by init. So on a stock device every byte below
+ * bytes_used_ belongs to something the trie can still reach, and walking from
+ * the root accounts for all of them exactly.
+ *
+ * Magisk adds the delete the platform does not have. prop_area::remove detaches
+ * the property from its trie node, memsets the prop_info, and with prune on,
+ * which is what resetprop --delete passes, walks the trie wiping any node left
+ * with no property and no children. None of that space is reclaimed, so the
+ * area keeps a run of zeroes below bytes_used_ that nothing points at.
+ *
+ * This is worth reading because deletion is now a technique rather than an
+ * accident. TEESimulator moved from flipping remote_provisioning.*.rkp_only to
+ * false to deleting it outright on 2026-10-19, and said why in the pull
+ * request: a flipped value "leaves an anomalous reading behind", while a
+ * deleted property "reads back as unset, indistinguishable from one the device
+ * never shipped". Through the property API that is exactly true. Through the
+ * area it is not.
+ *
+ * Measured. 893 areas across two images, an SM-A065F with 723 and an API 30
+ * emulator with 170, account to the byte with one exception, and a controlled
+ * resetprop on the SM-A065F moved the number the way this predicts: creating
+ * debug.pifd_test added 144 bytes with nothing unreachable, and deleting it
+ * left exactly those 144 bytes unreachable and zeroed.
+ *
+ * Deliberately a pure function over a buffer so the fixtures in nativeSelfTest
+ * can drive it on every device the suite runs on.
+ */
+namespace propa {
+    constexpr uint32_t kMagic = 0x504f5250u;        // "PROP"
+    constexpr uint32_t kVersion = 0xfc6ed0abu;
+    constexpr size_t kHeaderBytes = 128;            // bytes_used, serial, magic, version, reserved
+    constexpr size_t kNodeBytes = 20;               // namelen, prop, left, right, children
+    constexpr size_t kInfoBytes = 96;               // serial, value[92]; the name follows
+    constexpr size_t kValueMax = 92;                // PROP_VALUE_MAX
+    constexpr uint32_t kLongFlag = 1u << 16;
+    constexpr size_t kLongOffsetField = 60;         // error_message[56] then the offset
+    constexpr size_t kMaxNodes = 200000;
+    constexpr uint32_t kNearFullSlack = 4096;
+}
+
+struct PropAreaAccount {
+    bool parsed = false;
+    bool nearFull = false;
+    uint32_t bytesUsed = 0;
+    uint32_t unreachable = 0;
+    bool unreachableAllZero = false;
+    uint32_t nodes = 0;
+    uint32_t props = 0;
+};
+
+/*
+ * Returns false, and judges nothing, for anything it cannot read exactly: a bad
+ * magic or version, a header that does not fit, an offset outside the used
+ * region, a name with no terminator, a namelen that disagrees with the string
+ * beside it, two allocations claiming one byte, or a trie deeper than the node
+ * budget. Every one of those is a reading this parser got wrong rather than a
+ * device that did something wrong, and a wrong reading must not convict.
+ */
+static bool accountPropertyArea(const unsigned char* base, size_t len,
+                                PropAreaAccount* out,
+                                std::vector<unsigned char>* scratch) {
+    *out = PropAreaAccount{};
+    if (base == nullptr || scratch == nullptr || len < propa::kHeaderBytes) return false;
+
+    auto rdAbs = [&](size_t off) -> uint32_t {
+        uint32_t v = 0;
+        memcpy(&v, base + off, sizeof(v));
+        return v;
+    };
+
+    const uint32_t bytesUsed = rdAbs(0);
+    if (rdAbs(8) != propa::kMagic || rdAbs(12) != propa::kVersion) return false;
+
+    const size_t dataSize = len - propa::kHeaderBytes;
+    const uint64_t minimum =
+        propa::kNodeBytes + ((propa::kValueMax + 3u) & ~static_cast<uint64_t>(3));
+    if (bytesUsed < minimum || bytesUsed > dataSize) return false;
+
+    const unsigned char* data = base + propa::kHeaderBytes;
+    auto rd = [&](uint64_t off) -> uint32_t {
+        uint32_t v = 0;
+        memcpy(&v, data + off, sizeof(v));
+        return v;
+    };
+    auto align4 = [](uint64_t n) -> uint64_t { return (n + 3u) & ~static_cast<uint64_t>(3); };
+
+    scratch->assign(bytesUsed, 0);
+    auto mark = [&](uint64_t off, uint64_t size) -> bool {
+        if (size == 0 || off + size > bytesUsed) return false;
+        for (uint64_t i = off; i < off + size; i++) {
+            if ((*scratch)[i] != 0) return false;
+            (*scratch)[i] = 1;
+        }
+        return true;
+    };
+    auto cstrLen = [&](uint64_t off, uint64_t* lenOut) -> bool {
+        if (off >= bytesUsed) return false;
+        uint64_t i = off;
+        while (i < bytesUsed && data[i] != '\0') i++;
+        if (i >= bytesUsed) return false;
+        *lenOut = i - off;
+        return true;
+    };
+
+    // The root node and the dirty backup area, both reserved by the constructor.
+    if (!mark(0, propa::kNodeBytes)) return false;
+    if (!mark(propa::kNodeBytes, align4(propa::kValueMax))) return false;
+
+    std::vector<uint32_t> stack;
+    stack.push_back(0);
+    size_t visited = 0;
+    while (!stack.empty()) {
+        const uint32_t off = stack.back();
+        stack.pop_back();
+        if (++visited > propa::kMaxNodes) return false;
+        if (static_cast<uint64_t>(off) + propa::kNodeBytes > bytesUsed) return false;
+
+        const uint32_t namelen = rd(off);
+        const uint32_t prop = rd(off + 4);
+        const uint32_t left = rd(off + 8);
+        const uint32_t right = rd(off + 12);
+        const uint32_t children = rd(off + 16);
+
+        if (off != 0) {
+            uint64_t nameLen = 0;
+            if (!cstrLen(off + propa::kNodeBytes, &nameLen)) return false;
+            if (nameLen != namelen) return false;
+            if (!mark(off, align4(propa::kNodeBytes + namelen + 1))) return false;
+            out->nodes++;
+        }
+
+        if (prop != 0) {
+            if (static_cast<uint64_t>(prop) + propa::kInfoBytes > bytesUsed) return false;
+            uint64_t propNameLen = 0;
+            if (!cstrLen(prop + propa::kInfoBytes, &propNameLen)) return false;
+            if (!mark(prop, align4(propa::kInfoBytes + propNameLen + 1))) return false;
+            out->props++;
+
+            if ((rd(prop) & propa::kLongFlag) != 0) {
+                const uint64_t longOff =
+                    static_cast<uint64_t>(prop) + rd(prop + propa::kLongOffsetField);
+                uint64_t valueLen = 0;
+                if (!cstrLen(longOff, &valueLen)) return false;
+                if (!mark(longOff, align4(valueLen + 1))) return false;
+            }
+        }
+
+        if (left != 0) stack.push_back(left);
+        if (right != 0) stack.push_back(right);
+        if (children != 0) stack.push_back(children);
+    }
+
+    uint32_t unreachable = 0;
+    bool allZero = true;
+    for (uint32_t i = 0; i < bytesUsed; i++) {
+        if ((*scratch)[i] != 0) continue;
+        unreachable++;
+        if (data[i] != '\0') allZero = false;
+    }
+
+    out->bytesUsed = bytesUsed;
+    out->unreachable = unreachable;
+    out->unreachableAllZero = allZero;
+    out->nearFull =
+        static_cast<uint64_t>(bytesUsed) + propa::kNearFullSlack >= dataSize;
+    out->parsed = true;
+    return true;
+}
+
+/*
+ * Walks every property area this process has mapped and asks whether any of
+ * them holds allocated space the trie can no longer reach.
+ *
+ * Three gates stand between an observation and a finding, and all three exist
+ * because a genuine device must not be convicted by a race or by a reading this
+ * code got wrong.
+ *
+ * The area is walked twice. find_property links a new trie node before it
+ * allocates the prop_info that hangs off it, and allocate_obj moves bytes_used_
+ * before either is written, so a reader can catch an ordinary property being
+ * added and see bytes that are briefly unreachable. That window closes in
+ * microseconds. A deletion does not close. An area is only reported when both
+ * passes agree on bytes_used_ and on the same unreachable count.
+ *
+ * The unreachable bytes must all be zero. prop_area::remove memsets what it
+ * detaches, so a deletion leaves zeroes; a half written allocation does not.
+ *
+ * An area close to full is skipped. Running out of space is the one way AOSP
+ * itself can leave an allocation stranded, because traverse_trie links the path
+ * nodes it creates before new_prop_info can fail underneath them.
+ */
+static bool detectWipedPropertyAllocations() {
+    std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+    if (!maps.is_open()) return false;
+
+    const std::string propertyDir =
+        Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+
+    std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
+    std::string line;
+    while (std::getline(maps, line)) {
+        bool isArea = false, isPrivate = false;
+        unsigned long long start = 0, end = 0;
+        classifyPropertyAreaLine(line, propertyDir, &isArea, &isPrivate, &start, &end);
+        if (!isArea || start == 0 || end <= start) continue;
+        ranges.emplace_back(start, end);
+    }
+    maps.close();
+    if (ranges.empty()) return false;
+
+    std::vector<unsigned char> scratch;
+    std::vector<PropAreaAccount> first(ranges.size());
+    for (size_t i = 0; i < ranges.size(); i++) {
+        const auto* base = reinterpret_cast<const unsigned char*>(ranges[i].first);
+        accountPropertyArea(base, ranges[i].second - ranges[i].first, &first[i], &scratch);
+    }
+
+    bool wiped = false;
+    for (size_t i = 0; i < ranges.size(); i++) {
+        const PropAreaAccount& a = first[i];
+        if (!a.parsed || a.nearFull || a.unreachable == 0 || !a.unreachableAllZero)
+            continue;
+
+        PropAreaAccount again;
+        const auto* base = reinterpret_cast<const unsigned char*>(ranges[i].first);
+        if (!accountPropertyArea(base, ranges[i].second - ranges[i].first, &again, &scratch))
+            continue;
+        if (!again.parsed || again.nearFull || !again.unreachableAllZero) continue;
+        if (again.bytesUsed != a.bytesUsed || again.unreachable != a.unreachable) continue;
+
+        wiped = true;
+    }
+    return wiped;
 }
 
 static bool detectPropertyInconsistencies() {
@@ -775,6 +1033,11 @@ static bool detectPropertyInconsistencies() {
 
     if (detectPrivatePropertyArea()) {
         reason::note(reason::kPropertyAreaPrivate);
+        spoofed = true;
+    }
+
+    if (detectWipedPropertyAllocations()) {
+        reason::note(reason::kPropertyAreaWiped);
         spoofed = true;
     }
 
@@ -2561,6 +2824,133 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         LOGD("no property area mappings visible, the arm has no surface (%d)",
              propertyAreas);
         failures++;
+    }
+
+    /*
+     * Fixtures for accountPropertyArea, built by the same rules bionic's
+     * allocator follows: a root node, the dirty backup area beside it, then one
+     * named trie node carrying one property.
+     */
+    {
+        std::vector<unsigned char> area(propa::kHeaderBytes + 1024, 0);
+        unsigned char* data = area.data() + propa::kHeaderBytes;
+        uint32_t used = 0;
+        auto alloc = [&](uint32_t size) -> uint32_t {
+            const uint32_t off = used;
+            used += (size + 3u) & ~3u;
+            return off;
+        };
+        auto wr = [&](uint32_t off, uint32_t v) { memcpy(data + off, &v, sizeof(v)); };
+        auto wrHdr = [&](size_t off, uint32_t v) { memcpy(area.data() + off, &v, sizeof(v)); };
+
+        wrHdr(8, propa::kMagic);
+        wrHdr(12, propa::kVersion);
+
+        const uint32_t root = alloc(propa::kNodeBytes);
+        alloc(propa::kValueMax);
+        const char* kNodeName = "test";
+        const uint32_t nodeLen = 4;
+        const uint32_t node = alloc(propa::kNodeBytes + nodeLen + 1);
+        const char* kPropName = "test";
+        const uint32_t propLen = 4;
+        const uint32_t info = alloc(propa::kInfoBytes + propLen + 1);
+        const uint32_t infoSize = (propa::kInfoBytes + propLen + 1 + 3u) & ~3u;
+
+        wr(node, nodeLen);
+        memcpy(data + node + propa::kNodeBytes, kNodeName, nodeLen + 1);
+        wr(node + 4, info);
+        wr(root + 16, node);
+        memcpy(data + info + propa::kInfoBytes, kPropName, propLen + 1);
+        memcpy(data + info + 4, "1", 2);
+        wrHdr(0, used);
+
+        std::vector<unsigned char> scratch;
+        PropAreaAccount acc;
+
+        const size_t areaLen = propa::kHeaderBytes + used;
+        if (!accountPropertyArea(area.data(), areaLen, &acc, &scratch) ||
+            !acc.parsed || acc.unreachable != 0 || acc.nodes != 1 || acc.props != 1) {
+            LOGD("clean property area did not account exactly: parsed=%d unreachable=%u "
+                 "nodes=%u props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.nodes, acc.props);
+            failures++;
+        }
+
+        // A deletion: the property is detached from its node and its bytes are
+        // wiped, exactly as prop_area::remove leaves them.
+        std::vector<unsigned char> deleted = area;
+        unsigned char* delData = deleted.data() + propa::kHeaderBytes;
+        uint32_t zero = 0;
+        memcpy(delData + node + 4, &zero, sizeof(zero));
+        memset(delData + info, 0, infoSize);
+        if (!accountPropertyArea(deleted.data(), areaLen, &acc, &scratch) ||
+            !acc.parsed || acc.unreachable != infoSize || !acc.unreachableAllZero ||
+            acc.props != 0) {
+            LOGD("deleted property not accounted as unreachable: parsed=%d unreachable=%u "
+                 "expected=%u zero=%d", acc.parsed ? 1 : 0, acc.unreachable, infoSize,
+                 acc.unreachableAllZero ? 1 : 0);
+            failures++;
+        }
+
+        // Readings this parser must refuse rather than convict on.
+        std::vector<unsigned char> bad = area;
+        uint32_t badMagic = 0;
+        memcpy(bad.data() + 8, &badMagic, sizeof(badMagic));
+        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch) || acc.parsed) {
+            LOGD("a bad magic was accepted");
+            failures++;
+        }
+
+        bad = area;
+        const uint32_t outOfRange = used + 4096;
+        memcpy(bad.data() + propa::kHeaderBytes + node + 16, &outOfRange, sizeof(outOfRange));
+        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch) || acc.parsed) {
+            LOGD("an offset past bytes_used was accepted");
+            failures++;
+        }
+
+        bad = area;
+        memcpy(bad.data() + propa::kHeaderBytes + node + 8, &node, sizeof(node));
+        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch) || acc.parsed) {
+            LOGD("a node reachable twice was accepted");
+            failures++;
+        }
+
+        if (accountPropertyArea(area.data(), propa::kHeaderBytes - 1, &acc, &scratch) ||
+            acc.parsed) {
+            LOGD("a buffer too short for the header was accepted");
+            failures++;
+        }
+    }
+
+    /*
+     * The fixtures prove the parser. This proves it is pointed at something
+     * real: at least one area this process has mapped must parse, or the layout
+     * this build assumes does not match the one the device ships and the arm is
+     * failing closed on every area rather than reading them.
+     */
+    {
+        std::ifstream selfMaps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
+        const std::string dir = Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+        std::vector<unsigned char> scratch;
+        PropAreaAccount acc;
+        int parsed = 0, seen = 0;
+        std::string mapLine;
+        while (std::getline(selfMaps, mapLine)) {
+            bool isArea = false, isPrivate = false;
+            unsigned long long start = 0, end = 0;
+            classifyPropertyAreaLine(mapLine, dir, &isArea, &isPrivate, &start, &end);
+            if (!isArea || start == 0 || end <= start) continue;
+            seen++;
+            if (accountPropertyArea(reinterpret_cast<const unsigned char*>(start),
+                                    end - start, &acc, &scratch)) {
+                parsed++;
+            }
+        }
+        if (seen > 0 && parsed == 0) {
+            LOGD("no mapped property area parsed (%d seen), the layout does not match",
+                 seen);
+            failures++;
+        }
     }
 
     return failures;

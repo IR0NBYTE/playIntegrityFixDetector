@@ -93,6 +93,9 @@ object ReasonCodes {
         Reason(806, DetectionResult.DETECTION_PROP_SPOOF,
             "A /dev/__properties__ area is mapped private rather than shared"),
 
+        Reason(807, DetectionResult.DETECTION_PROP_SPOOF,
+            "A property area holds wiped allocations its own trie cannot reach"),
+
         Reason(1001, DetectionResult.DETECTION_CODE_INTEGRITY,
             "A libc function begins with a jump into memory that is not a " +
                 "recognised code source"),

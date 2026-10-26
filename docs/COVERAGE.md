@@ -82,7 +82,7 @@ rows that rest on them:
 | ROOT_HIDER | mountinfo source and mount-root analysis, OverlayFS on /system, anonymous rwxp count | Yes | Fires on the test device: 6 tmpfs mounts over system partitions whose source is not tmpfs, plus one /adb/ bind that leaks the module name | The app being on the denylist, and SUSFS sus_mount, which falsifies mountinfo in kernel |
 | BOOTLOADER | verifiedbootstate, flash.locked, veritymode, vbmeta.device_state, ro.debuggable, ro.secure, oem_unlock_allowed | Partly | Reads what the properties say. ro.secure is labelled userdebug_or_eng_prop and is denied to untrusted_app, so that arm silently no-ops | Any resetprop-based property sanitizer; all of these are ordinary properties |
 | SIGNATURE | signing cert SHA-256 against a build-time digest, fail-closed | Yes | Works; compiled out in debug and when no digest is supplied | Signature-spoofing frameworks that swap the PackageInfo CREATOR |
-| PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, and a `/dev/__properties__` area mapped private rather than shared | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated |
+| PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, a `/dev/__properties__` area mapped private rather than shared, and an area holding allocated space its own trie can no longer reach | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say. The accounting arm added in 3.2 is the one that reads the area's contents rather than its mapping flags, and it is the first arm in this file to ship with a positive witness as well as a negative one: it fires on an SM-A065F running Magisk 30.6 and is silent on an API 30 emulator. See the section on it below | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated. For the accounting arm, `resetprop --compact` rebuilds the area and erases the evidence, and Magisk ships it as a command, so this arm reads a module that deleted and did not tidy up |
 | CANARY_FP | global Pixel Canary build id, vendor fingerprint mismatch, brand cross-check | Yes | Only catches global fingerprint spoofing | Zygisk-scoped spoofing, which never reaches our process |
 | CODE_INTEGRITY | libc prologue inline-hook decode (arm64-v8a and x86_64 only), executable mappings from unrecognised sources, PLT GOT slots pointing outside any recognised code source, libc text against the file on disk | Yes | Reads only this process's own address space, so no privilege is involved. Measured silent on a clean API 34 emulator and on a rooted Samsung A06: Magisk's root is filesystem-level and inline-hooks nothing in our process, so silence there is the correct answer rather than a dead check. The arms are proven to fire by the native self test, which synthesises arm64 and x86_64 trampolines and maps an anonymous executable page on every device the suite runs on | A hider that hooks nothing in our address space is invisible to it, by construction. On armeabi-v7a and x86 the prologue arm does not run at all: only arm64-v8a and x86_64 have decoders, and the other two report nothing rather than guess at byte patterns nobody verified. The text comparison is corroboration only and never fires alone, because a hider that can patch a prologue can also redirect a read of the library file |
 | TREAT_WHEEL | maps needle | Yes | In-process, genuinely fires | A renamed build |
@@ -323,6 +323,115 @@ The lesson is the same one the AES size arm taught, arriving one step earlier:
 find the configuration that legitimately produces the observation before letting
 a rule judge it. The only reason it arrived earlier this time is that the
 station was down and the emulators were all that was left.
+
+## Why a deleted property is still readable
+
+The property API cannot tell a deleted property from one the device never
+shipped. `__system_property_get` returns the empty string for both. That is not
+an oversight, it is the whole reason deletion became a technique: TEESimulator
+moved from flipping `remote_provisioning.*.rkp_only` to `false` to deleting it
+outright on 2026-10-19, and its own pull request gives the reasoning. A flipped
+value "leaves an anomalous reading behind: a device that ships `true` now
+reports `false`", while a deleted one "reads back as unset, indistinguishable
+from one the device never shipped".
+
+Through the API that is exactly true. Through the area it is not.
+
+bionic's `prop_area` is a bump allocator. `allocate_obj` only ever moves
+`bytes_used_` forward, there is no free list, and AOSP has no delete at all:
+`__system_property_find`, `_get`, `_set`, `_read` and `_foreach` are the entire
+public surface, and the trie is documented as written only by init. So on a
+device running stock bionic, every byte below `bytes_used_` belongs to something
+the trie can still reach, and a walk from the root accounts for all of them.
+
+Magisk adds the delete the platform does not have. `prop_area::remove` detaches
+the property from its trie node, memsets the `prop_info`, and when `prune` is
+set, which is what `resetprop --delete` passes, walks the trie wiping any node
+left with no property and no children. Nothing reclaims that space. What is left
+is a run of zeroes below `bytes_used_` that nothing points at.
+
+The arm counts those bytes. Three gates stand between the observation and a
+finding:
+
+- **The area is walked twice.** `find_property` links a new trie node before it
+  allocates the `prop_info` that hangs off it, and `allocate_obj` moves
+  `bytes_used_` before either is written, so a reader can catch an ordinary
+  property being added and see bytes that are briefly unreachable. That window
+  closes in microseconds. A deletion does not close. An area is reported only
+  when both passes agree on `bytes_used_` and on the same unreachable count.
+- **The unreachable bytes must all be zero.** `remove` memsets what it detaches,
+  so a deletion leaves zeroes. A half written allocation does not.
+- **An area close to full is skipped.** Running out of space is the one way AOSP
+  itself can strand an allocation, because `traverse_trie` links the path nodes
+  it creates before `new_prop_info` can fail underneath them.
+
+The walk refuses rather than convicts on anything it cannot read exactly: a bad
+magic or version, an offset outside the used region, a name with no terminator,
+a `namelen` disagreeing with the string beside it, two allocations claiming one
+byte, or a trie past the node budget. A vendor that patches the layout therefore
+reads as unparseable and is never judged, and the self test asserts that at
+least one mapped area did parse, so a layout this build has wrong shows up as a
+test failure rather than as an arm quietly failing closed on every area.
+
+### What was measured
+
+893 areas across two images account to the byte, with one exception:
+
+| Image | Areas parsed | Trie nodes | Properties | Unreachable bytes |
+|---|---|---|---|---|
+| Samsung SM-A065F, Android 14, Magisk 30.6 | 723 | 3166 | 2074 | 15500, all in one area |
+| `sdk_gphone_arm64`, API 30 | 170 | 1045 | 697 | 0 |
+
+The exception is the one context a bootloader-status spoofer targets:
+`u:object_r:bootloader_prop:s0` on the SM-A065F holds 15500 unreachable bytes in
+six runs, every one of them zero, against 22316 bytes used and only 42 reachable
+properties. That phone runs Shamiko, whose `service.sh` rewrites
+`ro.boot.verifiedbootstate`, `ro.boot.flash.locked` and
+`ro.boot.vbmeta.device_state`, which is the same context. What deleted roughly a
+hundred properties' worth of space there has not been identified, and this file
+does not claim it has.
+
+The mechanism, separately, is not in doubt. A controlled `resetprop` on that
+phone moved the number exactly as the allocator predicts:
+
+| Step | `bytes_used_` | Unreachable |
+|---|---|---|
+| Baseline, `u:object_r:debug_prop:s0` | 4652 | 0 |
+| After `resetprop debug.pifd_test 12345` | 4796 | 0 |
+| After `resetprop --delete debug.pifd_test` | 4796 | 144 |
+
+144 is the sum of the two allocations that property needed: a 32 byte trie node
+and a 112 byte `prop_info`. The delete returned none of it and the trie reaches
+neither.
+
+### What defeats it, and what could falsely accuse
+
+`resetprop --compact` rebuilds the area and erases the evidence, and Magisk
+ships it as a command. This arm therefore reads a module that deleted and did
+not tidy up. A module that compacts afterwards is invisible to it, which is
+worth saying plainly rather than discovering later.
+
+The false positive vector is a vendor whose own init deletes properties. AOSP
+cannot: there is no delete in bionic at all. But the stock-bionic assumption is
+not free, and the measurement above contains a warning about it. Every property
+area on the SM-A065F is 196608 bytes, and bionic ships 131072 or, under
+`LARGE_SYSTEM_PROPERTY_NODE`, 1048576. Samsung patched that constant, which
+proves this vendor does modify the property area build. A vendor that went
+further and added a delete primitive would be reported by this arm.
+
+Two things bound that risk rather than removing it. Of the 723 areas on that
+handset, 722 account to the byte, so whatever produced the one anomaly is not a
+routine habit of that vendor's init. And the anomaly sits in
+`bootloader_prop`, the one context a bootloader-status spoofer targets, on a
+phone that is rooted and running a module which rewrites exactly those
+properties.
+
+**This arm has not been measured on a stock Samsung**, and the 15500 unreachable
+bytes on the rooted one have no identified author. Attributing them, or
+measuring a stock handset from the same family, is the open question, and it is
+recorded as the top lead in the watch state. If a stock device is ever found to
+trip this, the gate is one condition and the arm should be demoted to reported
+rather than deleted.
 
 ## Why the RKP provisioning era is not a detection
 
