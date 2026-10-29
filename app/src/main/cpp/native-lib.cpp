@@ -805,11 +805,17 @@ static bool detectPrivatePropertyArea() {
  * never shipped". Through the property API that is exactly true. Through the
  * area it is not.
  *
- * Measured. 893 areas across two images, an SM-A065F with 723 and an API 30
- * emulator with 170, account to the byte with one exception, and a controlled
- * resetprop on the SM-A065F moved the number the way this predicts: creating
- * debug.pifd_test added 144 bytes with nothing unreachable, and deleting it
- * left exactly those 144 bytes unreachable and zeroed.
+ * Measured on two images, not on a corpus. 893 areas account to the byte with
+ * one exception, but 723 of them come from the SM-A065F this was written
+ * against, which runs Magisk 30.6 with six modules installed, and the other
+ * 170 from an API 30 emulator. The emulator is the only genuine negative in
+ * there and no stock retail handset has been measured at all, which is the
+ * open question recorded in docs/COVERAGE.md rather than a settled one.
+ *
+ * What the two do establish is the mechanism. A controlled resetprop on the
+ * SM-A065F moved the number the way this predicts: creating debug.pifd_test
+ * added 144 bytes with nothing unreachable, and deleting it left exactly those
+ * 144 bytes unreachable and zeroed.
  *
  * Deliberately a pure function over a buffer so the fixtures in nativeSelfTest
  * can drive it on every device the suite runs on.

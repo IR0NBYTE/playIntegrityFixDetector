@@ -375,7 +375,11 @@ test failure rather than as an arm quietly failing closed on every area.
 
 ### What was measured
 
-893 areas across two images account to the byte, with one exception:
+893 areas across two images account to the byte, with one exception. Two images
+is what it is: 723 of those areas come from the handset this arm was written
+against, which runs Magisk with six modules installed, and the other 170 from an
+emulator, which is the only genuine negative in the set. No stock retail handset
+has been measured. The count is a check on the parser, not a survey of devices.
 
 | Image | Areas parsed | Trie nodes | Properties | Unreachable bytes |
 |---|---|---|---|---|
