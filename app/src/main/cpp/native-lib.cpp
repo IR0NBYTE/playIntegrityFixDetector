@@ -26,6 +26,7 @@
 #include <elf.h>
 #include <inttypes.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 
 #ifdef IS_DEBUG_BUILD
 #include <android/log.h>
@@ -813,6 +814,51 @@ static bool detectPrivatePropertyArea() {
  * Deliberately a pure function over a buffer so the fixtures in nativeSelfTest
  * can drive it on every device the suite runs on.
  */
+/*
+ * A read of this process's own memory that reports a bad address instead of
+ * taking the process down.
+ *
+ * detectWipedPropertyAllocations takes raw addresses out of a /proc/self/maps
+ * snapshot and then dereferences them. The arm beside it states the threat
+ * plainly: the adversary re-maps these exact ranges MAP_FIXED. An unmap, or a
+ * remap shorter or less readable than the maps line said, between the snapshot
+ * and the walk is a SIGSEGV, and a file-backed area shorter than its mapping
+ * is a SIGBUS. Crashing suits whoever is hiding better than being caught,
+ * because a process that died returns no verdict at all and the UI shows
+ * nothing found.
+ *
+ * process_vm_readv has the kernel do the copy, so a bad or unreadable address
+ * comes back as EFAULT rather than as a signal. No handler is installed here on
+ * purpose: ART owns SIGSEGV for its own implicit null and stack checks, and
+ * taking that over to guard one parser would risk more than the crash it
+ * prevents.
+ *
+ * If the call is refused or missing rather than answering, the area is skipped.
+ * That costs coverage and never costs a false finding, and the self test
+ * reports which way this device went rather than leaving it assumed.
+ */
+static bool readOwnMemory(const void* addr, size_t len,
+                          std::vector<unsigned char>* out) {
+    if (addr == nullptr || len == 0 || out == nullptr) return false;
+    out->assign(len, 0);
+
+    struct iovec local;
+    local.iov_base = out->data();
+    local.iov_len = len;
+    struct iovec remote;
+    remote.iov_base = const_cast<void*>(addr);
+    remote.iov_len = len;
+
+    errno = 0;
+    const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (got == static_cast<ssize_t>(len)) return true;
+    if (got >= 0) return false;   // A partial read is not a whole area.
+    if (errno != EFAULT) {
+        LOGD("readOwnMemory unavailable, errno %d, area skipped", errno);
+    }
+    return false;
+}
+
 namespace propa {
     constexpr uint32_t kMagic = 0x504f5250u;        // "PROP"
     constexpr uint32_t kVersion = 0xfc6ed0abu;
@@ -823,6 +869,9 @@ namespace propa {
     constexpr uint32_t kLongFlag = 1u << 16;
     constexpr size_t kLongOffsetField = 60;         // error_message[56] then the offset
     constexpr size_t kMaxNodes = 200000;
+    // Room for the 1 MiB LARGE_SYSTEM_PROPERTY_NODE build and no more, so a
+    // nonsense mapping length cannot ask for a nonsense allocation.
+    constexpr size_t kMaxAreaBytes = 16u << 20;
     constexpr uint32_t kMaxCredibleLongValue = 4096;
 }
 
@@ -969,12 +1018,18 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
  * because a genuine device must not be convicted by a race or by a reading this
  * code got wrong.
  *
- * The area is walked twice. find_property links a new trie node before it
- * allocates the prop_info that hangs off it, and allocate_obj moves bytes_used_
- * before either is written, so a reader can catch an ordinary property being
- * added and see bytes that are briefly unreachable. That window closes in
- * microseconds. A deletion does not close. An area is only reported when both
- * passes agree on bytes_used_ and on the same unreachable count.
+ * The area is snapshotted and walked twice. find_property links a new trie node
+ * before it allocates the prop_info that hangs off it, and allocate_obj moves
+ * bytes_used_ before either is written, so a reader can catch an ordinary
+ * property being added and see bytes that are briefly unreachable. That window
+ * closes in microseconds. A deletion does not close. An area is only reported
+ * when both passes agree on bytes_used_ and on the same unreachable count.
+ *
+ * Each pass copies the area through readOwnMemory before parsing it, rather
+ * than walking the live mapping. Two things follow. A range that was unmapped
+ * or made unreadable after the maps snapshot refuses instead of faulting, and
+ * each pass reads one image rather than memory that can shift under it, so the
+ * two passes compare two points in time instead of two moving targets.
  *
  * The unreachable bytes must all be zero. prop_area::remove memsets what it
  * detaches, so a deletion leaves zeroes; a half written allocation does not.
@@ -1019,11 +1074,21 @@ static bool detectWipedPropertyAllocations() {
     maps.close();
     if (ranges.empty()) return false;
 
+    std::vector<unsigned char> image;
     std::vector<unsigned char> scratch;
     std::vector<PropAreaAccount> first(ranges.size());
+    auto snapshot = [&](size_t i) -> size_t {
+        const unsigned long long len = ranges[i].second - ranges[i].first;
+        if (len == 0 || len > propa::kMaxAreaBytes) return 0;
+        const auto* at = reinterpret_cast<const void*>(ranges[i].first);
+        if (!readOwnMemory(at, static_cast<size_t>(len), &image)) return 0;
+        return static_cast<size_t>(len);
+    };
+
     for (size_t i = 0; i < ranges.size(); i++) {
-        const auto* base = reinterpret_cast<const unsigned char*>(ranges[i].first);
-        accountPropertyArea(base, ranges[i].second - ranges[i].first, &first[i], &scratch);
+        const size_t len = snapshot(i);
+        if (len == 0) continue;
+        accountPropertyArea(image.data(), len, &first[i], &scratch);
     }
 
     bool wiped = false;
@@ -1034,8 +1099,9 @@ static bool detectWipedPropertyAllocations() {
             continue;
 
         PropAreaAccount again;
-        const auto* base = reinterpret_cast<const unsigned char*>(ranges[i].first);
-        if (!accountPropertyArea(base, ranges[i].second - ranges[i].first, &again, &scratch))
+        const size_t len = snapshot(i);
+        if (len == 0) continue;
+        if (!accountPropertyArea(image.data(), len, &again, &scratch))
             continue;
         if (!again.parsed || again.couldHaveStranded || !again.unreachableAllZero)
             continue;
@@ -2939,6 +3005,57 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
      * The fourth is the same Pixel line with the sharing column flipped, which
      * is the whole observable difference a private remap leaves behind.
      */
+    /*
+     * The pointer guard, proven on the device rather than assumed, because
+     * whether process_vm_readv answers for an app is an SELinux and seccomp
+     * question that no reading of the source settles.
+     *
+     * A page that is mapped but unreadable, and an address with nothing mapped
+     * at it, are the two shapes a property area takes after someone re-maps or
+     * unmaps it underneath the walk. Both must come back false. If this test
+     * reaches its end, the guard did not fault.
+     */
+    {
+        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        std::vector<unsigned char> copy;
+
+        void* good = mmap(nullptr, page, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (good == MAP_FAILED) {
+            LOGD("could not map a page for the guard test");
+            failures++;
+        } else {
+            memset(good, 0xa5, page);
+            if (!readOwnMemory(good, page, &copy) || copy.size() != page ||
+                copy.front() != 0xa5 || copy.back() != 0xa5) {
+                LOGD("readOwnMemory could not read a readable page");
+                failures++;
+            }
+            if (mprotect(good, page, PROT_NONE) == 0 &&
+                readOwnMemory(good, page, &copy)) {
+                LOGD("readOwnMemory accepted a PROT_NONE page");
+                failures++;
+            }
+            munmap(good, page);
+        }
+
+        void* gone = mmap(nullptr, page, PROT_READ,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (gone != MAP_FAILED) {
+            munmap(gone, page);
+            if (readOwnMemory(gone, page, &copy)) {
+                LOGD("readOwnMemory accepted an unmapped address");
+                failures++;
+            }
+        }
+
+        if (readOwnMemory(nullptr, page, &copy) ||
+            readOwnMemory(reinterpret_cast<const void*>(0x10), page, &copy)) {
+            LOGD("readOwnMemory accepted a null or near-null address");
+            failures++;
+        }
+    }
+
     /*
      * The overlay rule, driven over records rather than over this device's own
      * table, because the handset it was written against has no overlay at all
