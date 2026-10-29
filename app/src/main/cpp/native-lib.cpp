@@ -657,8 +657,10 @@ static bool fingerprintContradicts(const std::string& fp, const char* brand) {
  * device happens to map.
  *
  * A line that does not parse, or whose permission field is too short to carry a
- * sharing column, sets neither flag. A genuine device must not be convicted by
- * a line this parser failed to read.
+ * sharing column, clears all four out params. A genuine device must not be
+ * convicted by a line this parser failed to read, and a caller that hoisted
+ * its locals out of its loop must not inherit the previous line's range and
+ * walk the wrong address.
  */
 static void classifyPropertyAreaLine(const std::string& line,
                                      const std::string& propertyDir,
@@ -668,6 +670,8 @@ static void classifyPropertyAreaLine(const std::string& line,
                                      unsigned long long* endOut = nullptr) {
     *isPropertyArea = false;
     *isPrivate = false;
+    if (startOut != nullptr) *startOut = 0;
+    if (endOut != nullptr) *endOut = 0;
 
     unsigned long long start = 0, end = 0, fileOffset = 0;
     char perms[8] = {0};
@@ -3021,10 +3025,22 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
     for (const auto& c : kPropertyAreaCases) {
         bool isArea = false, isPrivate = false;
-        classifyPropertyAreaLine(c.line, selfTestPropertyDir, &isArea, &isPrivate);
+        // Poisoned on purpose: a line the parser rejects has to clear these,
+        // not leave whatever the caller had there.
+        unsigned long long start = 0xdeadbeefull, end = 0xfeedfaceull;
+        classifyPropertyAreaLine(c.line, selfTestPropertyDir, &isArea, &isPrivate,
+                                 &start, &end);
         if (isArea != c.expectedArea || isPrivate != c.expectedPrivate) {
             LOGD("classifyPropertyAreaLine wrong for '%s': area=%d private=%d",
                  c.line, isArea ? 1 : 0, isPrivate ? 1 : 0);
+            failures++;
+        }
+        if (!isArea && (start != 0 || end != 0)) {
+            LOGD("a rejected line kept its range: '%s'", c.line);
+            failures++;
+        }
+        if (start != 0 && end <= start) {
+            LOGD("a range was handed back inverted: '%s'", c.line);
             failures++;
         }
     }
