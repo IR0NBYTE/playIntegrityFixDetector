@@ -411,6 +411,31 @@ ships it as a command. This arm therefore reads a module that deleted and did
 not tidy up. A module that compacts afterwards is invisible to it, which is
 worth saying plainly rather than discovering later.
 
+AOSP can produce this signature by itself in exactly one place, `new_prop_info`.
+It allocates the `prop_info` first, moving `bytes_used_`, and only then
+allocates the separate block a value of `PROP_VALUE_MAX` or more needs. If that
+second allocation fails it returns `nullptr` with the `prop_info` allocated and
+never constructed, left zeroed and unreachable. `traverse_trie` cannot do the
+same: it links every node it allocates straight away, and when it fails it
+allocated nothing.
+
+The third gate bounds that path, and the bound follows from the allocator being
+a bump pointer with no free list. The stranded `prop_info` is itself inside
+`bytes_used_`, so the free space the detector reads is strictly less than the
+value length that failed. An area with N free bytes can only hold a stranded
+allocation if some read-only property on the device carried a value longer than
+N bytes, and no other name may carry a value that long, because
+`SystemProperties::Add` rejects it before the area is touched.
+
+The gate refuses any area with 4096 or fewer bytes free, so accepting a finding
+asserts that no read-only property value on the device exceeds 4 KB. Across the
+same 893 areas exactly one property holds a long value at all,
+`ro.build.version.known_codenames` at 285 bytes, and the tightest area measured
+still had 107276 bytes free. The asserted bound therefore sits 14 times above
+the largest value observed, and the area that carries the signature had 174164
+bytes free, which would need a read-only property value of 170 KB inside a 192
+KB area.
+
 The false positive vector is a vendor whose own init deletes properties. AOSP
 cannot: there is no delete in bionic at all. But the stock-bionic assumption is
 not free, and the measurement above contains a warning about it. Every property
