@@ -760,12 +760,12 @@ namespace propa {
     constexpr uint32_t kLongFlag = 1u << 16;
     constexpr size_t kLongOffsetField = 60;         // error_message[56] then the offset
     constexpr size_t kMaxNodes = 200000;
-    constexpr uint32_t kNearFullSlack = 4096;
+    constexpr uint32_t kMaxCredibleLongValue = 4096;
 }
 
 struct PropAreaAccount {
     bool parsed = false;
-    bool nearFull = false;
+    bool couldHaveStranded = false;
     uint32_t bytesUsed = 0;
     uint32_t unreachable = 0;
     bool unreachableAllZero = false;
@@ -827,7 +827,13 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
         return true;
     };
 
-    // The root node and the dirty backup area, both reserved by the constructor.
+    /*
+     * The root node and the dirty backup area, both reserved before the first
+     * allocation. Every one of the 893 areas measured, on an API 30 emulator
+     * and on an API 34 handset, places its first allocation at offset 112, so
+     * the reservation is this size on both. An older layout carries a
+     * different version word and is refused above rather than misread.
+     */
     if (!mark(0, propa::kNodeBytes)) return false;
     if (!mark(propa::kNodeBytes, align4(propa::kValueMax))) return false;
 
@@ -886,8 +892,8 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
     out->bytesUsed = bytesUsed;
     out->unreachable = unreachable;
     out->unreachableAllZero = allZero;
-    out->nearFull =
-        static_cast<uint64_t>(bytesUsed) + propa::kNearFullSlack >= dataSize;
+    out->couldHaveStranded =
+        static_cast<uint64_t>(bytesUsed) + propa::kMaxCredibleLongValue >= dataSize;
     out->parsed = true;
     return true;
 }
@@ -910,9 +916,24 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
  * The unreachable bytes must all be zero. prop_area::remove memsets what it
  * detaches, so a deletion leaves zeroes; a half written allocation does not.
  *
- * An area close to full is skipped. Running out of space is the one way AOSP
- * itself can leave an allocation stranded, because traverse_trie links the path
- * nodes it creates before new_prop_info can fail underneath them.
+ * An area with little room left is skipped, because that is the one state in
+ * which AOSP produces this signature by itself. traverse_trie links every node
+ * it allocates straight away, and allocates nothing at all when it fails, so it
+ * strands nothing. new_prop_info does: it allocates the prop_info first, moving
+ * bytes_used_, and only then allocates the separate block a value of
+ * PROP_VALUE_MAX or more needs. If that second allocation fails it returns
+ * nullptr with the prop_info allocated and never constructed, so it is left
+ * zeroed and unreachable for the life of the area.
+ *
+ * The stranded prop_info is itself inside bytes_used_, so the free space read
+ * now is strictly less than the value length that failed. An area with N free
+ * bytes can therefore only hold one if some read-only property on this device
+ * carried a value longer than N bytes, and kMaxCredibleLongValue is where we
+ * stop believing that. Across the same 893 areas exactly one property holds a
+ * long value at all, ro.build.version.known_codenames at 285 bytes, and the
+ * tightest area measured still had 107,276 bytes free. Only a read-only
+ * property may carry a value that long; SystemProperties::Add rejects every
+ * other name outright.
  */
 static bool detectWipedPropertyAllocations() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
@@ -943,14 +964,16 @@ static bool detectWipedPropertyAllocations() {
     bool wiped = false;
     for (size_t i = 0; i < ranges.size(); i++) {
         const PropAreaAccount& a = first[i];
-        if (!a.parsed || a.nearFull || a.unreachable == 0 || !a.unreachableAllZero)
+        if (!a.parsed || a.couldHaveStranded || a.unreachable == 0 ||
+            !a.unreachableAllZero)
             continue;
 
         PropAreaAccount again;
         const auto* base = reinterpret_cast<const unsigned char*>(ranges[i].first);
         if (!accountPropertyArea(base, ranges[i].second - ranges[i].first, &again, &scratch))
             continue;
-        if (!again.parsed || again.nearFull || !again.unreachableAllZero) continue;
+        if (!again.parsed || again.couldHaveStranded || !again.unreachableAllZero)
+            continue;
         if (again.bytesUsed != a.bytesUsed || again.unreachable != a.unreachable) continue;
 
         wiped = true;
