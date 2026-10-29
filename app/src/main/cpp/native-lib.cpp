@@ -1844,17 +1844,60 @@ static bool detectCodeIntegrity() {
     return found;
 }
 
+/*
+ * True when this one mountinfo record says an overlay is mounted at /system or
+ * under it.
+ *
+ * Kept as a pure function over one line so the fixtures in nativeSelfTest can
+ * drive it, the same shape as classifyMountLine and classifyPropertyAreaLine.
+ *
+ * It replaces two unanchored strstr calls over the whole record. Those did not
+ * require the two words to be related: "overlay" in the root field and
+ * "/system" inside a mount source such as /dev/block/by-name/system were
+ * enough to convict, and reason 903 then told the user an overlay was mounted
+ * over /system when no such record had been read. Both halves now come from
+ * the field they belong to, the mount point and the filesystem type.
+ */
+static bool classifyOverlayLine(const std::string& line) {
+    const std::vector<std::string> f = splitMountFields(line);
+    if (f.size() < 10) return false;
+
+    // The optional-field count varies, so the separator is scanned for rather
+    // than indexed, exactly as classifyMountLine does.
+    std::size_t sep = 0;
+    for (std::size_t i = 6; i < f.size(); i++) {
+        if (f[i] == "-") { sep = i; break; }
+    }
+    if (sep == 0 || sep + 1 >= f.size()) return false;
+
+    const std::string& fsType = f[sep + 1];
+    if (fsType != "overlay" && fsType != "overlayfs") return false;
+
+    return pathIsUnder(f[4], "/system");
+}
+
 static bool detectOverlayFS() {
     ScopedFile mountinfo(
         Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkXy0qNSUnVjc=")).c_str(), "r");
     if (!mountinfo.isOpen()) return false;
 
-    char line[1024];
+    /*
+     * Read whole records only. The old version used a 1024 byte buffer with no
+     * join, so a longer record was split and each fragment tested on its own,
+     * which is how a field could appear to sit in a column it does not.
+     */
+    char buf[4096];
+    bool skipRemainder = false;
     procread::Budget budget;
-    while (fgets(line, sizeof(line), mountinfo)) {
-        if (!budget.take(strlen(line))) break;
-        if (strstr(line, "overlay") && strstr(line, "/system"))
-            return true;
+    while (fgets(buf, sizeof(buf), mountinfo)) {
+        if (!budget.take(strlen(buf))) break;
+        const bool complete = (std::strchr(buf, '\n') != nullptr);
+        if (skipRemainder) {
+            skipRemainder = !complete;
+            continue;
+        }
+        if (!complete) { skipRemainder = true; continue; }
+        if (classifyOverlayLine(buf)) return true;
     }
     return false;
 }
@@ -2881,6 +2924,49 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
      * The fourth is the same Pixel line with the sharing column flipped, which
      * is the whole observable difference a private remap leaves behind.
      */
+    /*
+     * The overlay rule, driven over records rather than over this device's own
+     * table, because the handset it was written against has no overlay at all
+     * and so witnesses neither answer.
+     */
+    struct OverlayCase {
+        const char* line;
+        bool expected;
+    };
+    static const OverlayCase kOverlayCases[] = {
+        {"200 40 0:60 / /system ro,relatime shared:3 - overlay overlay "
+         "ro,seclabel,lowerdir=/system,upperdir=/cache/overlay/system/upper", true},
+        {"201 40 0:61 / /system/bin ro,relatime - overlay overlay ro,seclabel", true},
+        {"202 40 0:61 / /system ro,relatime - overlayfs overlay ro,seclabel", true},
+
+        // The shape the old two-strstr version convicted on: "overlay" in the
+        // root field, "/system" inside the mount source, and no overlay mount.
+        {"123 45 253:0 /overlay /mnt/scratch ro,relatime shared:2 - erofs "
+         "/dev/block/by-name/system ro,seclabel", false},
+
+        // A sibling partition, which must not read as being under /system.
+        {"50 40 253:3 / /system_ext ro,relatime shared:9 - overlay overlay "
+         "ro,seclabel", false},
+
+        // Both real records off the SM-A065F: the stock system mount, and the
+        // tmpfs a module laid over a system path, which is rule 901 and not
+        // this one.
+        {"50 40 253:3 / /system_ext ro,relatime shared:9 - erofs "
+         "/dev/block/dm-3 ro,seclabel,user_xattr,acl", false},
+        {"488 40 0:22 /system/etc/security/cacerts /system/etc/security/cacerts "
+         "ro,relatime shared:16 - tmpfs magisk rw,seclabel,mode=755", false},
+
+        {"35 1 253:0 / / ro,relatime shared:1 - erofs /dev/block/dm-0 ro", false},
+        {"a mountinfo line this is not", false},
+        {"", false},
+    };
+    for (const auto& c : kOverlayCases) {
+        if (classifyOverlayLine(c.line) != c.expected) {
+            LOGD("classifyOverlayLine wrong for '%s'", c.line);
+            failures++;
+        }
+    }
+
     struct PropertyAreaCase {
         const char* line;
         bool expectedArea;
