@@ -285,6 +285,50 @@ namespace reason {
     inline void begin() { g_sink.clear(); }
 }
 
+/*
+ * Bounded reads of the files these checks walk.
+ *
+ * Every one of them lives under /proc or /dev, and anything holding root can
+ * bind mount something else over such a path. A fifo, or a file that never
+ * reaches EOF, would otherwise stop a scan here for good, and a scan that never
+ * returns shows no verdict at all, which a user reads as nothing found. A hang
+ * is a worse outcome than a miss, so every read carries a budget.
+ *
+ * The caps sit far above what the real files reach. On the bench the largest
+ * /proc/self/maps is a few thousand lines, mountinfo under a thousand and
+ * cpuinfo under a hundred, so nothing legitimate comes close. A read that
+ * trips a cap is abandoned where it stands and the check reports nothing,
+ * which is already what an unreadable file does here: a reading this code
+ * could not finish must not convict.
+ */
+namespace procread {
+    constexpr size_t kMaxLines = 100000;
+    constexpr size_t kMaxBytes = 8u << 20;
+
+    struct Budget {
+        size_t maxLines = kMaxLines;
+        size_t maxBytes = kMaxBytes;
+        size_t lines = 0;
+        size_t bytes = 0;
+        bool spent = false;
+
+        /*
+         * False once either cap is reached, and false for every call after, so
+         * a caller that keeps asking still stops.
+         */
+        bool take(size_t n) {
+            if (spent) return false;
+            lines++;
+            bytes += n;
+            if (lines > maxLines || bytes > maxBytes) {
+                spent = true;
+                return false;
+            }
+            return true;
+        }
+    };
+}
+
 __attribute__((always_inline))
 static inline int isTraced() {
     ScopedFile f(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2M6RDkwND8=")).c_str(), "r");
@@ -292,7 +336,9 @@ static inline int isTraced() {
         return -1;
 
     char line[512];
+    procread::Budget budget;
     while (fgets(line, sizeof(line), f)) {
+        if (!budget.take(strlen(line))) break;
         if (strncmp(line, "TracerPid:", 10) == 0)
             return atoi(line + 10) != 0 ? 1 : 0;
     }
@@ -307,7 +353,9 @@ static inline int detectSuspiciousParent() {
 
     char line[512];
     pid_t ppid = -1;
+    procread::Budget budget;
     while (fgets(line, sizeof(line), fp)) {
+        if (!budget.take(strlen(line))) break;
         if (strncmp(line, "PPid:", 5) == 0) {
             ppid = atoi(line + 5);
             break;
@@ -344,7 +392,9 @@ static inline bool isZygiskActiveEnhanced() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             if (line.find("libandroid_runtime.so") != std::string::npos &&
                 line.find("rwxp") != std::string::npos) {
                 libraryMapped = true;
@@ -412,7 +462,9 @@ static inline bool detectPIFSideEffects() {
         const std::string dexAnon    = Deobfuscate(base64_decode("azkqLiJzVDkoNyUiHRwBGQ=="));
 
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             std::string lower = line;
             std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
             if (lower.find(modulePif) != std::string::npos ||
@@ -487,7 +539,9 @@ static bool detectTrickyStore() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             if (line.find("tricky_store") != std::string::npos ||
                 line.find("TrickyStore") != std::string::npos ||
                 line.find("keybox") != std::string::npos ||
@@ -657,7 +711,9 @@ static int countPropertyAreaMappings() {
         Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
     int areas = 0;
     std::string line;
+    procread::Budget budget;
     while (std::getline(maps, line)) {
+        if (!budget.take(line.size() + 1)) break;
         bool isArea = false, isPrivate = false;
         classifyPropertyAreaLine(line, propertyDir, &isArea, &isPrivate);
         if (isArea) areas++;
@@ -702,7 +758,9 @@ static bool detectPrivatePropertyArea() {
     bool sawPropertyArea = false;
     bool privateArea = false;
     std::string line;
+    procread::Budget budget;
     while (std::getline(maps, line)) {
+        if (!budget.take(line.size() + 1)) break;
         bool isArea = false, isPrivate = false;
         classifyPropertyAreaLine(line, propertyDir, &isArea, &isPrivate);
         if (!isArea) continue;
@@ -945,7 +1003,9 @@ static bool detectWipedPropertyAllocations() {
 
     std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
     std::string line;
+    procread::Budget budget;
     while (std::getline(maps, line)) {
+        if (!budget.take(line.size() + 1)) break;
         bool isArea = false, isPrivate = false;
         unsigned long long start = 0, end = 0;
         classifyPropertyAreaLine(line, propertyDir, &isArea, &isPrivate, &start, &end);
@@ -1035,7 +1095,9 @@ static bool detectPropertyInconsistencies() {
         if (cpuinfo.isOpen()) {
             char cpuLine[512];
             std::string cpuHardware;
+            procread::Budget budget;
             while (fgets(cpuLine, sizeof(cpuLine), cpuinfo)) {
+                if (!budget.take(strlen(cpuLine))) break;
                 if (strncmp(cpuLine, "Hardware", 8) == 0) {
                     char* colon = strchr(cpuLine, ':');
                     if (colon) {
@@ -1177,7 +1239,9 @@ static jint detectMountArtifacts() {
     std::vector<std::string> lines;
     char buf[4096];
     bool skipRemainder = false;
+    procread::Budget budget;
     while (fgets(buf, sizeof(buf), mountinfo)) {
+        if (!budget.take(strlen(buf))) break;
         const bool complete = (std::strchr(buf, '\n') != nullptr);
         if (skipRemainder) {
             // Still draining an over-long record; discard it rather than
@@ -1251,7 +1315,9 @@ static std::vector<Mapping> readMappings() {
     if (!maps.is_open()) return out;
 
     std::string line;
+    procread::Budget budget;
     while (std::getline(maps, line)) {
+        if (!budget.take(line.size() + 1)) break;
         unsigned long long start = 0, end = 0, fileOffset = 0;
         char perms[8] = {0};
         int pathOffset = 0;
@@ -1784,7 +1850,9 @@ static bool detectOverlayFS() {
     if (!mountinfo.isOpen()) return false;
 
     char line[1024];
+    procread::Budget budget;
     while (fgets(line, sizeof(line), mountinfo)) {
+        if (!budget.take(strlen(line))) break;
         if (strstr(line, "overlay") && strstr(line, "/system"))
             return true;
     }
@@ -1797,7 +1865,9 @@ static bool detectRWXMappings() {
 
     int rwxCount = 0;
     std::string line;
+    procread::Budget budget;
     while (std::getline(maps, line)) {
+        if (!budget.take(line.size() + 1)) break;
         if (line.find("rwxp") == std::string::npos ||
             line.find("[anon:") == std::string::npos)
             continue;
@@ -1879,7 +1949,9 @@ static bool detectFridaPort() {
         if (!fp.isOpen()) continue;
 
         char line[512];
+        procread::Budget budget;
         while (fgets(line, sizeof(line), fp)) {
+            if (!budget.take(strlen(line))) break;
             if (strstr(line, ":69A2") || strstr(line, ":69a2") ||
                 strstr(line, ":69A3") || strstr(line, ":69a3")) {
                 socketInTable = true;
@@ -1905,7 +1977,9 @@ static bool detectFridaThreads() {
     DIR* taskDir = opendir("/proc/self/task");
     if (taskDir) {
         struct dirent* entry;
+        procread::Budget budget;
         while ((entry = readdir(taskDir)) != nullptr) {
+            if (!budget.take(1)) break;
             if (entry->d_name[0] == '.') continue;
 
             char commPath[256];
@@ -1930,7 +2004,9 @@ static bool detectFridaThreads() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             if (line.find("frida-agent") != std::string::npos ||
                 line.find("frida-gadget") != std::string::npos ||
                 line.find("libgadget") != std::string::npos) {
@@ -1955,7 +2031,9 @@ static bool detectCompanionStreaming() {
         if (!fp.isOpen()) continue;
 
         char line[1024];
+        procread::Budget budget;
         while (fgets(line, sizeof(line), fp)) {
+            if (!budget.take(strlen(line))) break;
             if (strstr(line, "zygisk_companion") ||
                 strstr(line, "zygisk-comp") ||
                 strstr(line, "pif_companion") ||
@@ -1969,7 +2047,9 @@ static bool detectCompanionStreaming() {
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (maps.is_open()) {
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             if (line.find("memfd:") == std::string::npos) continue;
             if (line.find("rwxp") == std::string::npos) continue;
 
@@ -2095,7 +2175,9 @@ static bool detectTSEnhancerExtreme() {
             Deobfuscate(base64_decode("ZAsBLyQoXjshMwkxRCohLCk=")),
         };
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             for (const auto& n : needles) {
                 if (line.find(n) != std::string::npos) {
                     maps.close();
@@ -2116,7 +2198,11 @@ static bool detectRustPIF() {
     if (mp.isOpen()) {
         std::string content;
         char buf[256];
-        while (fgets(buf, sizeof(buf), mp)) content += buf;
+        procread::Budget budget{procread::kMaxLines, 1u << 20};
+        while (fgets(buf, sizeof(buf), mp)) {
+            if (!budget.take(strlen(buf))) break;
+            content += buf;
+        }
 
         const std::string markers[] = {
             Deobfuscate(base64_decode("YC02JGwbRSswYQktWSwtLiI=")),
@@ -2135,7 +2221,9 @@ static bool detectRustPIF() {
             Deobfuscate(base64_decode("XDEmMSUvbzUrJTklVXY3Lg==")),
         };
         std::string line;
+        procread::Budget budget;
         while (std::getline(maps, line)) {
+            if (!budget.take(line.size() + 1)) break;
             for (const auto& l : libs) {
                 if (line.find(l) != std::string::npos) {
                     maps.close();
@@ -2155,7 +2243,9 @@ static bool detectTreatWheel() {
 
     const std::string needle = Deobfuscate(base64_decode("RCohIDgWRzAhJCA="));
     std::string line;
+    procread::Budget budget;
     while (std::getline(maps, line)) {
+        if (!budget.take(line.size() + 1)) break;
         if (line.find(needle) != std::string::npos) {
             maps.close();
             return true;
@@ -2964,7 +3054,9 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         PropAreaAccount acc;
         int parsed = 0, seen = 0;
         std::string mapLine;
+        procread::Budget budget;
         while (std::getline(selfMaps, mapLine)) {
+            if (!budget.take(mapLine.size() + 1)) break;
             bool isArea = false, isPrivate = false;
             unsigned long long start = 0, end = 0;
             classifyPropertyAreaLine(mapLine, dir, &isArea, &isPrivate, &start, &end);
