@@ -61,6 +61,8 @@ object ReasonCodes {
             "A legacy SuperUser or SuperSU artefact is present in /system"),
         Reason(308, DetectionResult.DETECTION_ZYGISK,
             "A known root manager package is installed"),
+        Reason(309, DetectionResult.DETECTION_ZYGISK,
+            "A Zygisk module is bind mounted into this process"),
 
         Reason(501, DetectionResult.DETECTION_BOOTLOADER,
             "ro.boot.verifiedbootstate is not green"),
@@ -165,6 +167,16 @@ object ReasonCodes {
 
     /** Every code this build knows how to explain. */
     val knownCodes: Set<Int> get() = BY_CODE.keys
+
+    /**
+     * Every flag some code in this table can put a line under. A flag missing
+     * from this set can still be set by a run, and would render as a red row
+     * with nothing beneath it to read.
+     */
+    val flagsWithText: Set<Int> get() = BY_CODE.values.mapTo(HashSet()) { it.flag }
+
+    /** Which flag a code explains, or null if this build has no text for it. */
+    fun flagOf(code: Int): Int? = BY_CODE[code]?.flag
 
     /**
      * Reason text per flag, for the codes this run returned. An unknown code is

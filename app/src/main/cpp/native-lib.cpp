@@ -245,6 +245,7 @@ namespace reason {
     constexpr jint kBusyBoxPresent        = 306;
     constexpr jint kLegacyRootArtifact    = 307;
     constexpr jint kRootManagerInstalled  = 308;
+    constexpr jint kZygiskModuleMounted   = 309;
 
     constexpr jint kInlineHookPrologue    = 1001;
     constexpr jint kForeignExecMapping    = 1002;
@@ -1216,13 +1217,18 @@ static jint detectMountArtifacts() {
         "SiEjKD8ibzYhOTg=",       // zygisk_next
         "Qj0+OCsgQzM=",           // rezygisk
     };
+    bool moduleMounted = false;
     for (std::string name : moduleNames) {
         std::transform(name.begin(), name.end(), name.begin(), ::tolower);
         for (const char* encoded : kModuleNeedles) {
             if (name.find(Deobfuscate(base64_decode(encoded))) != std::string::npos) {
-                result |= DETECTION_ZYGISK;
+                moduleMounted = true;
             }
         }
+    }
+    if (moduleMounted) {
+        reason::note(reason::kZygiskModuleMounted);
+        result |= DETECTION_ZYGISK;
     }
 
     return result;
