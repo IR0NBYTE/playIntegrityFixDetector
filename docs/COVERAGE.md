@@ -411,6 +411,19 @@ ships it as a command. This arm therefore reads a module that deleted and did
 not tidy up. A module that compacts afterwards is invisible to it, which is
 worth saying plainly rather than discovering later.
 
+Two cheaper counters exist and neither needs a rebuild. The all-zero gate is one
+character from being defeated: `prop_area::remove` memsets what it detaches, and
+a fork that memsets `0xFF` instead leaves the same unreachable hole with this
+arm refusing it, while nothing else about the area reads differently. The second
+is backfilling. A hole left by a delete is the right size to hold a trie node,
+so writing a plausible node into it and linking it anywhere in the trie makes
+the bytes reachable and the accounting balance again.
+
+Both are recorded here before anyone has been seen using them. The second is
+also the argument against leaning harder on all-zero than this arm already does:
+the gate exists to keep a half-written allocation from convicting, not because
+zeroes are hard to avoid.
+
 AOSP can produce this signature by itself in exactly one place, `new_prop_info`.
 It allocates the `prop_info` first, moving `bytes_used_`, and only then
 allocates the separate block a value of `PROP_VALUE_MAX` or more needs. If that
