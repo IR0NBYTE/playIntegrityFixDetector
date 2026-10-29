@@ -1136,15 +1136,18 @@ static bool detectPropertyInconsistencies() {
 // but /proc is mounted hidepid=invisible and the app is not in gid 3009, so the
 // init table is unreadable and that check always failed open. These rules read
 // only the caller's own table, which is always available.
-static constexpr jint MOUNT_RULE_NONE = 0;
-
 /*
  * Which rule matched, kept apart from the detection bits the classifier
  * returns so the classifier stays a pure function the self test can drive.
  * The caller turns these into reason codes.
+ *
+ * Its own type rather than more jint constants. As plain jints the rules were
+ * 0, 1 and 2 sitting beside DETECTION_DEBUGGER 0x1 and DETECTION_FRIDA 0x2, so
+ * a rule compared against a flag, or ored into a mask, would compile quietly
+ * and be wrong. The classifier below returned the no-rule constant to mean no
+ * bits at all, which is how close the two already were.
  */
-static constexpr jint MOUNT_RULE_TMPFS_SHADOW = 1;
-static constexpr jint MOUNT_RULE_ADB_BIND = 2;
+enum class MountRule { None, TmpfsShadow, AdbBind };
 
 static std::vector<std::string> splitMountFields(const std::string& line) {
     std::vector<std::string> fields;
@@ -1168,9 +1171,9 @@ static bool pathIsUnder(const std::string& path, const std::string& prefix) {
 static jint classifyMountLine(const std::string& line,
                               const std::string& dataDev,
                               std::string* moduleNameOut,
-                              jint* ruleOut = nullptr) {
+                              MountRule* ruleOut = nullptr) {
     const std::vector<std::string> f = splitMountFields(line);
-    if (f.size() < 10) return MOUNT_RULE_NONE;
+    if (f.size() < 10) return 0;
 
     // The optional-field count varies (shared, master, propagate_from), so the
     // separator must be scanned for rather than indexed at a fixed offset.
@@ -1178,7 +1181,7 @@ static jint classifyMountLine(const std::string& line,
     for (std::size_t i = 6; i < f.size(); i++) {
         if (f[i] == "-") { sep = i; break; }
     }
-    if (sep == 0 || sep + 2 >= f.size()) return MOUNT_RULE_NONE;
+    if (sep == 0 || sep + 2 >= f.size()) return 0;
 
     const std::string& mountRoot = f[3];
     const std::string& mountPoint = f[4];
@@ -1203,7 +1206,7 @@ static jint classifyMountLine(const std::string& line,
         };
         for (const char* encoded : kSystemPartitions) {
             if (pathIsUnder(mountPoint, Deobfuscate(base64_decode(encoded)))) {
-                if (ruleOut != nullptr) *ruleOut = MOUNT_RULE_TMPFS_SHADOW;
+                if (ruleOut != nullptr) *ruleOut = MountRule::TmpfsShadow;
                 return DETECTION_ROOT_HIDER;
             }
         }
@@ -1223,18 +1226,18 @@ static jint classifyMountLine(const std::string& line,
                     ? mountRoot.substr(start)
                     : mountRoot.substr(start, end - start);
             }
-            if (ruleOut != nullptr) *ruleOut = MOUNT_RULE_ADB_BIND;
+            if (ruleOut != nullptr) *ruleOut = MountRule::AdbBind;
             return DETECTION_ROOT_HIDER;
         }
     }
 
-    return MOUNT_RULE_NONE;
+    return 0;
 }
 
 static jint detectMountArtifacts() {
     ScopedFile mountinfo(
         Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkXy0qNSUnVjc=")).c_str(), "r");
-    if (!mountinfo.isOpen()) return MOUNT_RULE_NONE;
+    if (!mountinfo.isOpen()) return 0;
 
     std::vector<std::string> lines;
     char buf[4096];
@@ -1260,16 +1263,16 @@ static jint detectMountArtifacts() {
         if (f.size() >= 5 && f[4] == dataMount) { dataDev = f[2]; break; }
     }
 
-    jint result = MOUNT_RULE_NONE;
+    jint result = 0;
     bool tmpfsShadow = false;
     bool adbBind = false;
     std::vector<std::string> moduleNames;
     for (const std::string& line : lines) {
         std::string moduleName;
-        jint rule = MOUNT_RULE_NONE;
+        MountRule rule = MountRule::None;
         result |= classifyMountLine(line, dataDev, &moduleName, &rule);
-        if (rule == MOUNT_RULE_TMPFS_SHADOW) tmpfsShadow = true;
-        if (rule == MOUNT_RULE_ADB_BIND) adbBind = true;
+        if (rule == MountRule::TmpfsShadow) tmpfsShadow = true;
+        if (rule == MountRule::AdbBind) adbBind = true;
         if (!moduleName.empty()) moduleNames.push_back(moduleName);
     }
     if (tmpfsShadow) reason::note(reason::kMountTmpfsShadow);
