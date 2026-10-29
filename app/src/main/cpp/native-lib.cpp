@@ -2357,6 +2357,15 @@ static bool detectRootManagerApp(JNIEnv *env, jobject context) {
     return false;
 }
 
+/*
+ * Every path here is one only root can create. /data/local/tmp was removed on
+ * 2026-10-29 for failing that test: it is shell:shell drwxrwx--x, so adb push
+ * writes an su named file there on any device with developer options on, and
+ * anything left behind by unrelated work stays. Finding one said somebody once
+ * copied a file, not that the device was rooted. /data/local itself is
+ * root:root drwxr-x--x and stays, which is why the busybox list below keeps
+ * its two entries under it.
+ */
 static bool detectSuBinary() {
     static const std::string paths[] = {
         Deobfuscate(base64_decode("Hys9MjgsXXcmKCJmQy0=")),
@@ -2367,7 +2376,6 @@ static bool detectSuBinary() {
         Deobfuscate(base64_decode("HzcgLGMrWTZrMjk=")),
         Deobfuscate(base64_decode("Hyg2Lig8UyxrIyUnHysx")),
         Deobfuscate(base64_decode("HzUlJiU6W3dqIiM7VXcmKCJmQy0=")),
-        Deobfuscate(base64_decode("HzwlNS1mXDcnICBmRDU0bj88")),
     };
     for (const auto& p : paths) {
         if (access(p.c_str(), F_OK) == 0) {
