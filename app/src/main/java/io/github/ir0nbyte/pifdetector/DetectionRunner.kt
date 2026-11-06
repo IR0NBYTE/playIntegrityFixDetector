@@ -75,8 +75,8 @@ class DetectionRunner {
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
                 companionAlgorithm = companionAlgorithm.verdict,
-                reasons = reasons + boundary.reasons + identity.reasons +
-                    strongBox.reasons + companionAlgorithm.reasons,
+                reasons = reasons + passive.reasons + boundary.reasons +
+                    identity.reasons + strongBox.reasons + companionAlgorithm.reasons,
                 presentation = presentation,
             )
             mainHandler.post {

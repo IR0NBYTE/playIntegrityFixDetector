@@ -401,7 +401,6 @@ class ReasonCodesSyncTest {
             DetectionResult.DETECTION_TSEE,
             DetectionResult.DETECTION_PIF_RUST,
             DetectionResult.DETECTION_TREAT_WHEEL,
-            DetectionResult.DETECTION_ATTEST_ANOMALY,
             DetectionResult.DETECTION_ATTEST_REVOKED,
             DetectionResult.DETECTION_ATTEST_CROSS_SOURCE,
             DetectionResult.DETECTION_ATTEST_SOFTWARE,
@@ -441,6 +440,7 @@ class ReasonCodesSyncTest {
             "the attested identity probe" to AttestedIdentity.REASON_CODES,
             "the StrongBox probe" to StrongBoxCheck.REASON_CODES,
             "the companion algorithm probe" to CompanionAlgorithmCheck.REASON_CODES,
+            "the key attestation probe" to KeyAttestationProbe.REASON_CODES,
         )
     }
 
