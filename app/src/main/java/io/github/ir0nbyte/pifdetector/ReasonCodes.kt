@@ -158,6 +158,9 @@ object ReasonCodes {
             "The same keystore served a Google-rooted hardware chain for one " +
                 "key algorithm and the AOSP software fallback for the other"),
 
+        Reason(905, DetectionResult.DETECTION_ROOT_HIDER,
+            "A tmpfs is mounted from a source named after a root solution"),
+
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),
         Reason(902, DetectionResult.DETECTION_ROOT_HIDER,
