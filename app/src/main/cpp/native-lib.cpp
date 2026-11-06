@@ -918,9 +918,12 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
     if (rdAbs(8) != propa::kMagic || rdAbs(12) != propa::kVersion) return false;
 
     const size_t dataSize = len - propa::kHeaderBytes;
-    const uint64_t minimum =
-        propa::kNodeBytes + ((propa::kValueMax + 3u) & ~static_cast<uint64_t>(3));
-    if (bytesUsed < minimum || bytesUsed > dataSize) return false;
+    /*
+     * The floor is the root node alone, not the root plus the dirty backup
+     * area. A layout without that block reports bytes_used_ of 20 when it holds
+     * nothing, and the reservation below is what decides which layout this is.
+     */
+    if (bytesUsed < propa::kNodeBytes || bytesUsed > dataSize) return false;
 
     const unsigned char* data = base + propa::kHeaderBytes;
     auto rd = [&](uint64_t off) -> uint32_t {
@@ -949,35 +952,64 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
     };
 
     /*
-     * The root node and the dirty backup area, both reserved before the first
-     * allocation. Every one of the 1499 areas measured, across API 30 and API
-     * 34, places its first allocation at offset 112, so the reservation is
-     * this size on all of them.
+     * The root node, and the dirty backup area when the area has one.
      *
-     * It is NOT this size on an older layout, and the version word does not
-     * say so. An API 23 image carries magic 0x504f5250 and version 0xfc6ed0ab,
-     * byte for byte what a modern area carries, in one 131072 byte
-     * /dev/__properties__ rather than a directory of per-context files, and its
-     * root node's children offset is 20: the first real node sits directly
-     * after the root with no dirty backup area at all. So the version check
-     * above does not separate the two layouts, and an earlier version of this
-     * comment claiming it did was wrong.
+     * bionic's prop_area constructor reserves the root node and then a
+     * PROP_VALUE_MAX block beside it, the dirty backup area a reader copies
+     * from while a value is being rewritten, so the first real allocation
+     * lands at 20 + align4(92) = 112. Every one of the 1499 areas measured on
+     * API 30 and API 34 does exactly that.
      *
-     * What actually happens on that layout is that this reservation claims
-     * bytes 20 to 111, the walk then reaches the real node at offset 20, two
-     * allocations claim one byte, and mark refuses the area. That is the safe
-     * direction, and it is why the arms are silent rather than wrong there, but
-     * it is an overlap doing the work rather than a version check.
+     * An older layout has no such block, and the version word does not say so.
+     * An API 23 image carries magic 0x504f5250 and version 0xfc6ed0ab, byte for
+     * byte what a modern area carries, in one 131072 byte /dev/__properties__
+     * rather than a directory of per-context files, and its root node's
+     * children offset is 20: the first real node sits directly after the root.
+     * So the version check above cannot separate the two layouts.
      *
-     * The consequence is a coverage hole, not a false finding: on any image
-     * whose areas have no dirty backup area, every area refuses and the three
-     * arms built on this walk say nothing. minSdk is 24, so API 24 and 25 are
-     * installable and are almost certainly in that hole. Which release added
-     * the reservation has not been measured; API 23 is without it and API 30 is
-     * with it.
+     * Reserving unconditionally refused that layout, because the reservation
+     * claimed bytes 20 to 111 and then collided with the real node at 20. Safe,
+     * but it meant every area refused and the three arms built on this walk
+     * said nothing at all. minSdk is 24, so API 24 and 25 are installable and
+     * are in that hole.
+     *
+     * The root's children offset is what settles it, because it is the first
+     * allocation the area ever made: find_property writes it when the first
+     * segment is created, and new_prop_trie_node allocates at bytes_used_,
+     * which is still the constructor's value at that moment. A rebuild through
+     * resetprop -c preserves it, reproducing the block only when the original
+     * had one.
+     *
+     * Anything other than the two known prefixes is refused rather than
+     * guessed at. Note which way each mistake would fall: reading 112 on an
+     * area that uses 20 collides with the first node and refuses, and reading
+     * 20 on an area that uses 112 leaves the real backup block unreachable and
+     * all zero, which is a finding. So the prefix is taken from the layout
+     * rather than tried and retried, and an area that claims a prefix its own
+     * contents contradict still refuses on the collision.
      */
+    const uint32_t firstAlloc = rd(16);     // the root node's children offset
+    const uint64_t withBackup = propa::kNodeBytes + align4(propa::kValueMax);
+    uint64_t prefix = 0;
+    if (firstAlloc == withBackup || firstAlloc == propa::kNodeBytes) {
+        prefix = firstAlloc;
+    } else if (firstAlloc == 0) {
+        // An area holding no properties at all. Its bytes_used_ is still the
+        // constructor's, so it names the layout on its own.
+        if (bytesUsed == withBackup || bytesUsed == propa::kNodeBytes) {
+            prefix = bytesUsed;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
     if (!mark(0, propa::kNodeBytes)) return false;
-    if (!mark(propa::kNodeBytes, align4(propa::kValueMax))) return false;
+    if (prefix > propa::kNodeBytes &&
+        !mark(propa::kNodeBytes, prefix - propa::kNodeBytes)) {
+        return false;
+    }
 
     std::vector<uint32_t> stack;
     stack.push_back(0);
@@ -3737,6 +3769,71 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
                 !acc.parsed || acc.unreachable != 0 || acc.props != 1) {
                 LOGD("a read-only long value was not accounted: parsed=%d unreachable=%u "
                      "props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.props);
+                failures++;
+            }
+        }
+
+        /*
+         * The older layout, with no dirty backup area: the first node sits
+         * directly after the root and the root's children offset is 20. Built
+         * the same way as the fixture above but without the reserved block,
+         * which is what an API 23 image carries under a version word identical
+         * to a modern one.
+         */
+        {
+            std::vector<unsigned char> old(propa::kHeaderBytes + 1024, 0);
+            unsigned char* od = old.data() + propa::kHeaderBytes;
+            uint32_t oused = 0;
+            auto oalloc = [&](uint32_t size) -> uint32_t {
+                const uint32_t off = oused;
+                oused += (size + 3u) & ~3u;
+                return off;
+            };
+            memcpy(old.data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+            memcpy(old.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+            const uint32_t oroot = oalloc(propa::kNodeBytes);   // no kValueMax block
+            const uint32_t onode = oalloc(propa::kNodeBytes + 5);
+            memcpy(od + onode + propa::kNodeBytes, "test", 5);
+            const uint32_t four = 4;
+            memcpy(od + onode, &four, sizeof(four));
+            const uint32_t oinfo = oalloc(propa::kInfoBytes + 5);
+            memcpy(od + oinfo + propa::kInfoBytes, "test", 5);
+            memcpy(od + oinfo + 4, "1", 2);
+            memcpy(od + onode + 4, &oinfo, sizeof(oinfo));
+            memcpy(od + oroot + 16, &onode, sizeof(onode));
+            memcpy(old.data(), &oused, sizeof(oused));
+
+            const size_t oldLen = propa::kHeaderBytes + oused;
+            if (!accountPropertyArea(old.data(), oldLen, &acc, &scratch) ||
+                !acc.parsed || acc.unreachable != 0 || acc.nodes != 1 || acc.props != 1) {
+                LOGD("the layout without a dirty backup area did not account: parsed=%d "
+                     "unreachable=%u nodes=%u props=%u", acc.parsed ? 1 : 0,
+                     acc.unreachable, acc.nodes, acc.props);
+                failures++;
+            }
+
+            // The same layout holding nothing at all, where bytes_used_ is the
+            // only thing that names it.
+            std::vector<unsigned char> empty(propa::kHeaderBytes + 256, 0);
+            memcpy(empty.data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+            memcpy(empty.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+            const uint32_t justRoot = propa::kNodeBytes;
+            memcpy(empty.data(), &justRoot, sizeof(justRoot));
+            if (!accountPropertyArea(empty.data(), propa::kHeaderBytes + 256, &acc,
+                                     &scratch) ||
+                !acc.parsed || acc.unreachable != 0 || acc.props != 0) {
+                LOGD("an empty area without a dirty backup area was refused");
+                failures++;
+            }
+
+            // A first allocation at neither known offset is refused rather
+            // than guessed at.
+            std::vector<unsigned char> odd = old;
+            const uint32_t nonsense = 64;
+            memcpy(odd.data() + propa::kHeaderBytes + oroot + 16, &nonsense,
+                   sizeof(nonsense));
+            if (accountPropertyArea(odd.data(), oldLen, &acc, &scratch) || acc.parsed) {
+                LOGD("a first allocation at an unknown offset was accepted");
                 failures++;
             }
         }
