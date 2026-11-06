@@ -79,7 +79,7 @@ rows that rest on them:
 | DEBUGGER | TracerPid, FLAG_DEBUGGABLE (release only) | Yes | Both work in-process | Any debugger that clears TracerPid |
 | FRIDA | TCP connect to 27042/27043, thread names, maps scan, parent cmdline, legacy /proc/net/tcp | Partly | Port, thread and maps checks work in-process. Two arms fail open: the parent-cmdline read needs /proc/<ppid>/cmdline, which hidepid denies, and the /proc/net/tcp scan is filtered empty for untrusted_app on Android 10+ | A gadget on a non-default port with renamed threads |
 | ZYGISK | maps needles, env vars, ro.magisk.zygisk, /data/adb probes, root-manager packages, su and busybox paths, module names from mountinfo | Yes | Fires on the test device via maps and the new mountinfo module-name harvest | Trace-cleaning Zygisk implementations, denylist, a renamed manager package |
-| ROOT_HIDER | mountinfo source and mount-root analysis, OverlayFS on /system, anonymous rwxp count | Yes | Fires on the test device: 6 tmpfs mounts over system partitions whose source is not tmpfs, plus one /adb/ bind that leaks the module name. Reason 905 adds the case where a root tmpfs shadows nothing at all, which is what a module-less install looks like and what returned a mask of zero on a live Magisk 31.1 emulator. See the section on it below | The app being on the denylist, and SUSFS sus_mount, which falsifies mountinfo in kernel. 905 specifically is defeated by renaming the mount source, which is one line for whoever ships it |
+| ROOT_HIDER | mountinfo source and mount-root analysis, OverlayFS on /system, anonymous rwxp count | Yes | Fires on the test device: 6 tmpfs mounts over system partitions whose source is not tmpfs, plus one /adb/ bind that leaks the module name. Reason 905 adds the case where a root tmpfs shadows nothing at all, which is what a module-less install looks like and what returned a mask of zero on a live Magisk 31.1 emulator. It matches the mount source against a needle rather than reporting any non-`tmpfs` source, because an unrooted API 23 image mounts `/sys/fs/cgroup` as `- tmpfs none` and the general rule would have convicted it. See the section on it below | The app being on the denylist, and SUSFS sus_mount, which falsifies mountinfo in kernel. 905 specifically is defeated by renaming the mount source, which is one line for whoever ships it |
 | BOOTLOADER | verifiedbootstate, flash.locked, veritymode, vbmeta.device_state, ro.debuggable, ro.secure, oem_unlock_allowed | Partly | Reads what the properties say. ro.secure is labelled userdebug_or_eng_prop and is denied to untrusted_app, so that arm silently no-ops | Any resetprop-based property sanitizer; all of these are ordinary properties |
 | SIGNATURE | signing cert SHA-256 against a build-time digest, fail-closed | Yes | Works; compiled out in debug and when no digest is supplied | Signature-spoofing frameworks that swap the PackageInfo CREATOR |
 | PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, a `/dev/__properties__` area mapped private rather than shared, an area holding allocated space its own trie can no longer reach, a property name out of order in the trie level that indexes it, and a property name that disagrees with the trie path reaching it | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say. The accounting arm added in 3.2 is the one that reads the area's contents rather than its mapping flags, and it is the first arm in this file to ship with a positive witness as well as a negative one: it fires on an SM-A065F running Magisk 30.6 and is silent on an API 30 emulator. See the section on it below | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated. For the accounting arm, `resetprop --compact` rebuilds the area and erases the evidence completely: a compacted area is byte for byte identical to one where the property was never set, so that arm now reads only a stack on Magisk v30.7 or older, or one without PlayIntegrityFork, and no contents-reading arm can replace it. The two trie-invariant arms are the part compaction does not hide, and they are bounded in the other direction: 808 needs a same-length neighbour to pin the edited node's slot, which only 48.3% of properties have, and 809 is defeated by rewriting both copies of the name consistently. See the two sections on them below |
@@ -545,23 +545,41 @@ which is this rule and 902, written by the other side.
 
 ### Why it is a needle and not the general rule
 
-"Any tmpfs whose source is not `tmpfs`" would also have caught this, and it is
-tempting because the measurement supports it: on all three devices every
-genuine tmpfs carries source `tmpfs`, ten of them per device, and the only
-exceptions are the Magisk ones.
+"Any tmpfs whose source is not `tmpfs`" would also have caught this, and it was
+tempting because the first measurement supported it: on all three rooted devices
+every genuine tmpfs carries source `tmpfs`, ten of them per device, and the only
+exceptions were the Magisk ones.
 
-It is not shipped that way, because all three devices are rooted. A measurement
-on three rooted devices cannot establish what a stock device does, and "no OEM
-ever names a tmpfs anything else" is the same shape of assumption that convicted
-a retail SM-G780G once already. A needle asserts nothing about stock and so
-cannot be wrong about it.
+It is not shipped that way, because a measurement on three rooted devices cannot
+establish what a stock device does, and "no OEM ever names a tmpfs anything
+else" is the same shape of assumption that convicted a retail SM-G780G once
+already. A needle asserts nothing about stock and so cannot be wrong about it.
+
+**That caution was not hypothetical, and two unrooted images settled it.** An
+API 30 userdebug emulator carries source `tmpfs` for all nine of its tmpfs
+mounts, as the rooted devices do. An API 23 userdebug emulator does not:
+
+| Device | Root | tmpfs mounts | Sources seen |
+|---|---|---|---|
+| SM-A065F, API 34 | Magisk 30.6 | 15 | `tmpfs` x10, `magisk` x5 |
+| Emulator, API 34 | Magisk 29.0 | 12 | `tmpfs` x10, `magisk` x2 |
+| Emulator, API 34 | Magisk 31.1 | 12 | `tmpfs` x10, `magisk` x2 |
+| Emulator, API 30 | none | 9 | `tmpfs` x9 |
+| Emulator, API 23 | none | 4 | `tmpfs` x3, **`none` x1** |
+
+That last one is `/sys/fs/cgroup`, mounted `- tmpfs none` on an image with no
+root solution on it at all. The general rule would have reported it. So "any
+tmpfs whose source is not tmpfs" is not a safe rule, it is a false positive with
+a witness, and 905 is a needle because of this row rather than out of caution.
 
 The cost is that renaming the mount source defeats 905 for one line of work, and
 that only Magisk's string has been read from source. The KernelSU and APatch
 equivalents are unread and are not guessed at in the needle list, which is
-append-only. Widening to the general rule is a candidate, and what it needs
-first is a stock witness: the phone station's Pixel 7a, SM-G780G and moto g04,
-tabulated the same way.
+append-only.
+
+Widening to the general rule is no longer a candidate. The API 23 row closes it,
+and the right way to extend this arm is to read the next root solution's mount
+source out of its own code and add it to the needle list.
 
 ## Two invariants on the property trie, and what they cost to break
 
@@ -616,7 +634,7 @@ already does and because their false positive risk is not a judgement call.
 
 ### What was measured
 
-Every `/dev/__properties__` area on three devices, read as files and walked by
+Every `/dev/__properties__` area on four devices, read as files and walked by
 the engine's own `accountPropertyArea` and `auditPropertyTrie` compiled for the
 host under `-fsanitize=undefined -fno-sanitize-recover=all`:
 
@@ -625,13 +643,43 @@ host under `-fsanitize=undefined -fno-sanitize-recover=all`:
 | SM-A065F, API 34 | Magisk 30.6, ZygiskSU, Shamiko | 723 | 3196 | 2099 | 0 | 0 |
 | Emulator, API 34 | Magisk 29.0, no modules | 303 | 1414 | 929 | 0 | 0 |
 | Emulator, API 34 | Magisk 31.1 | 303 | 1409 | 924 | 0 | 0 |
+| Emulator, API 30 | none, userdebug image | 170 | 1047 | 699 | 0 | 0 |
 
-1329 areas, 6019 nodes, 3952 properties, not one violation of either invariant.
-None of the three is a stock device, which is worth saying plainly: all three
-are rooted, and both emulators had Magisk installed on 2026-11-05. That is the
-wrong direction to be wrong in for a false positive measurement, since a rooted
-device is the one more likely to trip an invariant, but a stock witness is still
-owed and is recorded in the watch state.
+1499 areas, 7066 nodes, 4651 properties, not one violation of either invariant.
+
+The API 30 row is the one that carries the negative weight: no root solution
+installed, no `magiskd`, no `/debug_ramdisk`, `/data/adb` absent. It is a
+userdebug AOSP image rather than a retail handset, so it is not the last word,
+but it is an unmodified image and the three rooted rows are not. Running the
+engine on it returns `MASK=0x14 REASONS=[305, 506]` and neither 808, 809 nor 905
+is among them. The two codes it does return predate this work and are the image
+being userdebug: it ships an `su` binary and reports an unlocked bootloader.
+
+A retail stock witness is still owed and is recorded in the watch state. The
+phone station's Pixel 7a, SM-G780G and moto g04 are where it comes from.
+
+### The layout this walk does not read
+
+An API 23 image was measured alongside the others and refuses outright, which is
+worth recording because the reason is not the one the code used to claim.
+
+It carries magic `0x504f5250` and version `0xfc6ed0ab`, byte for byte what a
+modern area carries, in a single 131072 byte `/dev/__properties__` rather than a
+directory of per-context files. Its root node's `children` offset is 20, so the
+first real node sits directly after the root with **no dirty backup area at
+all**. The version word therefore does not separate the two layouts, and the
+comment in `accountPropertyArea` that said it did has been corrected.
+
+What refuses the area is the reservation: the walk claims bytes 20 to 111 for a
+dirty backup area that is not there, reaches the real node at offset 20, finds
+two allocations claiming one byte, and refuses. Safe direction, but an overlap
+is doing the work rather than a version check.
+
+The consequence is a coverage hole and not a false finding. On any image whose
+areas have no dirty backup area, every area refuses and all three arms built on
+this walk say nothing. `minSdk` is 24, so API 24 and 25 are installable and are
+almost certainly in that hole. Which release added the reservation has not been
+measured: API 23 is without it, API 30 is with it.
 
 ### A coverage bug this measurement found
 
