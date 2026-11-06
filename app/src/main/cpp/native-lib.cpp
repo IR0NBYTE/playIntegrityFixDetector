@@ -985,7 +985,30 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
             if (!mark(prop, align4(propa::kInfoBytes + propNameLen + 1))) return false;
             out->props++;
 
-            if ((rd(prop) & propa::kLongFlag) != 0) {
+            /*
+             * kLongFlag is bit 16, and for a mutable property that bit belongs
+             * to the change counter: Update writes
+             * (len << 24) | ((serial + 1) & 0xffffff), so the counter spans bits
+             * 0 to 23 and crosses bit 16 every 65536 writes. The flag only means
+             * what it says on a read-only property, which prop_info.h states
+             * ("Read only properties will not set anything but the bottom most
+             * bit of serial and the top byte") and which holds because
+             * SystemProperties::Add refuses a value of PROP_VALUE_MAX or more
+             * for any name that is not ro.*. bionic guards its own use the same
+             * way, in system_properties.cpp: is_read_only(pi->name) &&
+             * pi->is_long().
+             *
+             * Reading the flag unguarded cost real coverage rather than causing
+             * a false finding. ril.signal.disprssi0 on an SM-A065F has been
+             * written about 1.9 million times, its counter happens to have bit
+             * 16 set, and its offset field is 0, so the walk took the prop_info
+             * for its own long value, saw two allocations claim one byte, and
+             * refused the whole u:object_r:radio_prop:s0 area.
+             */
+            const bool readOnly =
+                propNameLen >= 3 &&
+                memcmp(data + prop + propa::kInfoBytes, "ro.", 3) == 0;
+            if (readOnly && (rd(prop) & propa::kLongFlag) != 0) {
                 const uint64_t longOff =
                     static_cast<uint64_t>(prop) + rd(prop + propa::kLongOffsetField);
                 uint64_t valueLen = 0;
@@ -3228,6 +3251,76 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             LOGD("clean property area did not account exactly: parsed=%d unreachable=%u "
                  "nodes=%u props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.nodes, acc.props);
             failures++;
+        }
+
+        /*
+         * A mutable property whose change counter has reached bit 16, which is
+         * where kLongFlag lives. The name is "test", not ro.*, so the flag is
+         * counter bits and nothing else, and the offset field beside it is 0.
+         * Reading the flag here would point the long value at the prop_info
+         * itself and refuse the area. Measured on an SM-A065F, where
+         * ril.signal.disprssi0 does this and cost the whole radio_prop area.
+         */
+        {
+            std::vector<unsigned char> busy = area;
+            const uint32_t busySerial = propa::kLongFlag | (5u << 24) | 0x1d5b66u;
+            memcpy(busy.data() + propa::kHeaderBytes + info, &busySerial,
+                   sizeof(busySerial));
+            uint32_t zeroOffset = 0;
+            memcpy(busy.data() + propa::kHeaderBytes + info + propa::kLongOffsetField,
+                   &zeroOffset, sizeof(zeroOffset));
+            if (!accountPropertyArea(busy.data(), areaLen, &acc, &scratch) ||
+                !acc.parsed || acc.unreachable != 0 || acc.props != 1) {
+                LOGD("a mutable property with bit 16 in its counter was read as a long "
+                     "value: parsed=%d unreachable=%u props=%u", acc.parsed ? 1 : 0,
+                     acc.unreachable, acc.props);
+                failures++;
+            }
+        }
+
+        /*
+         * The same bit on a read-only name, where it does mean long, and with a
+         * real offset. The flag must still be honoured there.
+         */
+        {
+            std::vector<unsigned char> longArea(propa::kHeaderBytes + 1024, 0);
+            unsigned char* ld = longArea.data() + propa::kHeaderBytes;
+            uint32_t lused = 0;
+            auto lalloc = [&](uint32_t size) -> uint32_t {
+                const uint32_t off = lused;
+                lused += (size + 3u) & ~3u;
+                return off;
+            };
+            memcpy(longArea.data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+            memcpy(longArea.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+            const uint32_t lroot = lalloc(propa::kNodeBytes);
+            lalloc(propa::kValueMax);
+            const char* lseg = "ro";
+            const uint32_t lnode = lalloc(propa::kNodeBytes + 3);
+            memcpy(ld + lnode + propa::kNodeBytes, lseg, 3);
+            const uint32_t two = 2;
+            memcpy(ld + lnode, &two, sizeof(two));
+            const char* lname = "ro.a";
+            const uint32_t linfo = lalloc(propa::kInfoBytes + 5);
+            memcpy(ld + linfo + propa::kInfoBytes, lname, 5);
+            memcpy(ld + lnode + 4, &linfo, sizeof(linfo));
+            memcpy(ld + lroot + 16, &lnode, sizeof(lnode));
+            // The long value itself, and the self relative offset that reaches it.
+            const uint32_t lvalue = lalloc(8);
+            memcpy(ld + lvalue, "longval", 8);
+            const uint32_t rel = lvalue - linfo;
+            memcpy(ld + linfo + propa::kLongOffsetField, &rel, sizeof(rel));
+            const uint32_t lserial = propa::kLongFlag;
+            memcpy(ld + linfo, &lserial, sizeof(lserial));
+            memcpy(longArea.data(), &lused, sizeof(lused));
+
+            const size_t longLen = propa::kHeaderBytes + lused;
+            if (!accountPropertyArea(longArea.data(), longLen, &acc, &scratch) ||
+                !acc.parsed || acc.unreachable != 0 || acc.props != 1) {
+                LOGD("a read-only long value was not accounted: parsed=%d unreachable=%u "
+                     "props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.props);
+                failures++;
+            }
         }
 
         // A deletion: the property is detached from its node and its bytes are
