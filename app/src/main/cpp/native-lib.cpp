@@ -274,6 +274,8 @@ namespace reason {
     constexpr jint kBoardSocMismatch      = 805;
     constexpr jint kPropertyAreaPrivate   = 806;
     constexpr jint kPropertyAreaWiped     = 807;
+    constexpr jint kPropertyNameOutOfOrder = 808;
+    constexpr jint kPropertyNameOffPath   = 809;
 
     /*
      * Collected for the duration of one engine run. The engine is entered from
@@ -1040,6 +1042,202 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
 }
 
 /*
+ * Two things bionic's property trie holds by construction, and what breaking
+ * them means.
+ *
+ * A property name is stored twice. find_property splits the name on '.' and
+ * walks one trie node per segment, creating each missing one through
+ * find_prop_trie_node, and the node it ends on points at a prop_info that
+ * carries the WHOLE name. So for any property the trie can reach, the dotted
+ * join of the segments along its path equals the name in its prop_info. That is
+ * the first invariant.
+ *
+ * Each level of the trie is a binary search tree keyed by one segment.
+ * find_prop_trie_node compares with cmp_prop_name and descends left on a
+ * negative answer and right on a positive one, and it only ever creates a node
+ * at the position that walk arrives at. There is no rebalancing, and AOSP has
+ * no delete, so an in-order walk of one level yields its segments in strictly
+ * increasing cmp_prop_name order. That is the second.
+ *
+ * Neither invariant is a fact about any particular device, so neither needs a
+ * corpus of known-good values to judge against: they follow from the only code
+ * that ever builds this structure. That is what makes them safe to act on,
+ * where comparing a value against what some device ought to report is not.
+ *
+ * What breaks them is editing a name where it lies instead of going through
+ * find_property. A tool that overwrites a name with a same-length replacement
+ * leaves the allocation sizes and the serial counters intact, so the area still
+ * accounts to the byte and reason 807 has nothing to say; Enginex0/resetprop-rs
+ * documents exactly this as its hexpatch delete, "overwrites property name
+ * bytes with realistic dictionary words instead of detaching trie nodes".
+ * Rewriting only the prop_info copy leaves the trie path spelling the old name,
+ * which is the first invariant. Rewriting the segment too moves the node out of
+ * the order its level is sorted in, which is the second, though only when a
+ * same-length neighbour pins its slot: across 1329 areas 51.7% of properties
+ * had no such neighbour, so this reads a careless edit rather than every edit,
+ * and the file beside it says so.
+ *
+ * Measured silent where it must be: 1329 areas, 6019 trie nodes and 3952
+ * properties on an SM-A065F running Magisk 30.6 with ZygiskSU and Shamiko, an
+ * emulator on Magisk 29.0 and one on Magisk 31.1. Not one violation of either.
+ */
+static int cmpPropName(const unsigned char* one, uint32_t oneLen,
+                       const unsigned char* two, uint32_t twoLen) {
+    // bionic's cmp_prop_name: length first, then strncmp, which compares as
+    // unsigned char whatever the platform's plain char is.
+    if (oneLen < twoLen) return -1;
+    if (oneLen > twoLen) return 1;
+    for (uint32_t i = 0; i < oneLen; i++) {
+        if (one[i] != two[i]) return one[i] < two[i] ? -1 : 1;
+    }
+    return 0;
+}
+
+struct PropTrieAudit {
+    bool parsed = false;
+    uint32_t nodes = 0;
+    uint32_t props = 0;
+    bool nameOutOfOrder = false;
+    bool nameOffPath = false;
+};
+
+/*
+ * Returns false and judges nothing for anything it cannot read exactly, on the
+ * same terms as accountPropertyArea: a wrong magic or version, an offset or a
+ * name that does not fit inside bytes_used_, a namelen that disagrees with the
+ * string beside it, a cycle, or a structure past the node budget. A reading
+ * this code got wrong must not convict.
+ */
+static bool auditPropertyTrie(const unsigned char* base, size_t len,
+                              PropTrieAudit* out,
+                              std::vector<unsigned char>* scratch) {
+    *out = PropTrieAudit{};
+    if (base == nullptr || scratch == nullptr || len < propa::kHeaderBytes) return false;
+
+    auto rdAbs = [&](size_t off) -> uint32_t {
+        uint32_t v = 0;
+        memcpy(&v, base + off, sizeof(v));
+        return v;
+    };
+    const uint32_t bytesUsed = rdAbs(0);
+    if (rdAbs(8) != propa::kMagic || rdAbs(12) != propa::kVersion) return false;
+
+    const size_t dataSize = len - propa::kHeaderBytes;
+    if (bytesUsed < propa::kNodeBytes || bytesUsed > dataSize) return false;
+
+    const unsigned char* data = base + propa::kHeaderBytes;
+    auto rd = [&](uint64_t off) -> uint32_t {
+        uint32_t v = 0;
+        memcpy(&v, data + off, sizeof(v));
+        return v;
+    };
+    // The segment a node carries, or false if it does not sit inside the used
+    // region with the terminator its namelen claims.
+    auto segment = [&](uint32_t off, const unsigned char** name,
+                       uint32_t* nameLen) -> bool {
+        if (static_cast<uint64_t>(off) + propa::kNodeBytes > bytesUsed) return false;
+        const uint32_t declared = rd(off);
+        const uint64_t at = static_cast<uint64_t>(off) + propa::kNodeBytes;
+        if (at + declared + 1 > bytesUsed) return false;
+        if (data[at + declared] != '\0') return false;
+        for (uint32_t i = 0; i < declared; i++) {
+            if (data[at + i] == '\0') return false;
+        }
+        *name = data + at;
+        *nameLen = declared;
+        return true;
+    };
+
+    // One entry per level still to walk: the BST root and the dotted path that
+    // reaches it. Breadth over levels keeps the recursion off the stack.
+    struct Level {
+        uint32_t root;
+        std::string prefix;
+    };
+    std::vector<Level> levels;
+    const uint32_t firstLevel = rd(16);
+    if (firstLevel != 0) levels.push_back({firstLevel, std::string()});
+
+    // One byte per offset in the used region, so a node reached twice, by a
+    // cycle or by two parents, is refused rather than walked forever.
+    scratch->assign(bytesUsed, 0);
+    auto claim = [&](uint32_t off) -> bool {
+        if (static_cast<uint64_t>(off) + propa::kNodeBytes > bytesUsed) return false;
+        if ((*scratch)[off] != 0) return false;
+        (*scratch)[off] = 1;
+        return true;
+    };
+
+    size_t visited = 0;
+    std::vector<uint32_t> stack;
+
+    while (!levels.empty()) {
+        const Level level = levels.back();
+        levels.pop_back();
+
+        // In-order walk of this level: push the left spine, take a node off,
+        // then do the same for its right subtree. Iterative so a long spine
+        // costs heap rather than stack.
+        stack.clear();
+        const unsigned char* prevName = nullptr;
+        uint32_t prevLen = 0;
+        uint32_t cursor = level.root;
+
+        while (cursor != 0 || !stack.empty()) {
+            while (cursor != 0) {
+                if (++visited > propa::kMaxNodes) return false;
+                if (!claim(cursor)) return false;
+                stack.push_back(cursor);
+                cursor = rd(cursor + 8);                 // left
+            }
+
+            const uint32_t off = stack.back();
+            stack.pop_back();
+
+            const unsigned char* name = nullptr;
+            uint32_t nameLen = 0;
+            if (!segment(off, &name, &nameLen)) return false;
+            out->nodes++;
+
+            if (prevName != nullptr &&
+                cmpPropName(prevName, prevLen, name, nameLen) >= 0) {
+                out->nameOutOfOrder = true;
+            }
+            prevName = name;
+            prevLen = nameLen;
+
+            std::string path = level.prefix;
+            if (!path.empty()) path.push_back('.');
+            path.append(reinterpret_cast<const char*>(name), nameLen);
+
+            const uint32_t prop = rd(off + 4);
+            if (prop != 0) {
+                if (static_cast<uint64_t>(prop) + propa::kInfoBytes > bytesUsed)
+                    return false;
+                const uint64_t at = static_cast<uint64_t>(prop) + propa::kInfoBytes;
+                uint64_t i = at;
+                while (i < bytesUsed && data[i] != '\0') i++;
+                if (i >= bytesUsed) return false;
+                const size_t storedLen = static_cast<size_t>(i - at);
+                out->props++;
+                if (storedLen != path.size() ||
+                    memcmp(data + at, path.data(), storedLen) != 0) {
+                    out->nameOffPath = true;
+                }
+            }
+
+            const uint32_t children = rd(off + 16);
+            if (children != 0) levels.push_back({children, path});
+
+            cursor = rd(off + 12);                       // right
+        }
+    }
+
+    out->parsed = true;
+    return true;
+}
+
+/*
  * Walks every property area this process has mapped and asks whether any of
  * them holds allocated space the trie can no longer reach.
  *
@@ -1082,14 +1280,21 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
  * property may carry a value that long; SystemProperties::Add rejects every
  * other name outright.
  */
-static bool detectWipedPropertyAllocations() {
+/*
+ * The readable, header-bearing /dev/__properties__ ranges this process has
+ * mapped. Shared by the two arms below so both read the same surface, and so
+ * the maps walk has one implementation to get right.
+ */
+static std::vector<std::pair<unsigned long long, unsigned long long>>
+collectPropertyAreaRanges() {
+    std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
+
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
-    if (!maps.is_open()) return false;
+    if (!maps.is_open()) return ranges;
 
     const std::string propertyDir =
         Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
 
-    std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
     std::string line;
     procread::Budget budget;
     while (std::getline(maps, line)) {
@@ -1100,7 +1305,70 @@ static bool detectWipedPropertyAllocations() {
         if (!isArea || start == 0 || end <= start) continue;
         ranges.emplace_back(start, end);
     }
-    maps.close();
+    return ranges;
+}
+
+/*
+ * Asks the two trie invariants of every area this process has mapped.
+ *
+ * Same discipline as the arm below it, and for the same reasons. Each area is
+ * copied out through readOwnMemory rather than walked in place, so a range that
+ * went away after the maps snapshot refuses instead of faulting. Each area is
+ * read twice and only a violation both passes agree on is reported, so a
+ * property being added while the walk is in progress cannot convict: a name is
+ * written before its node is linked, and the window closes in microseconds
+ * while an edited name does not.
+ *
+ * accountPropertyArea has to agree the area is well formed before either
+ * invariant is allowed to speak. It is the stricter reader of the two, and it
+ * refuses overlapping allocations and offsets outside the used region, so
+ * requiring it to parse keeps a violation that is really a misread from being
+ * reported as a violation.
+ */
+static bool detectPropertyTrieTampering(bool* offPath, bool* outOfOrder) {
+    *offPath = false;
+    *outOfOrder = false;
+
+    const auto ranges = collectPropertyAreaRanges();
+    if (ranges.empty()) return false;
+
+    std::vector<unsigned char> image;
+    std::vector<unsigned char> scratch;
+
+    auto read = [&](size_t i, PropTrieAudit* audit) -> bool {
+        const unsigned long long len = ranges[i].second - ranges[i].first;
+        if (len == 0 || len > propa::kMaxAreaBytes) return false;
+        const auto* at = reinterpret_cast<const void*>(ranges[i].first);
+        if (!readOwnMemory(at, static_cast<size_t>(len), &image)) return false;
+
+        PropAreaAccount account;
+        if (!accountPropertyArea(image.data(), static_cast<size_t>(len), &account,
+                                 &scratch) ||
+            !account.parsed) {
+            return false;
+        }
+        return auditPropertyTrie(image.data(), static_cast<size_t>(len), audit,
+                                 &scratch) && audit->parsed;
+    };
+
+    for (size_t i = 0; i < ranges.size(); i++) {
+        PropTrieAudit first;
+        if (!read(i, &first)) continue;
+        if (!first.nameOffPath && !first.nameOutOfOrder) continue;
+
+        PropTrieAudit again;
+        if (!read(i, &again)) continue;
+        if (again.nodes != first.nodes || again.props != first.props) continue;
+
+        if (first.nameOffPath && again.nameOffPath) *offPath = true;
+        if (first.nameOutOfOrder && again.nameOutOfOrder) *outOfOrder = true;
+    }
+
+    return *offPath || *outOfOrder;
+}
+
+static bool detectWipedPropertyAllocations() {
+    const auto ranges = collectPropertyAreaRanges();
     if (ranges.empty()) return false;
 
     std::vector<unsigned char> image;
@@ -1223,6 +1491,13 @@ static bool detectPropertyInconsistencies() {
 
     if (detectWipedPropertyAllocations()) {
         reason::note(reason::kPropertyAreaWiped);
+        spoofed = true;
+    }
+
+    bool nameOffPath = false, nameOutOfOrder = false;
+    if (detectPropertyTrieTampering(&nameOffPath, &nameOutOfOrder)) {
+        if (nameOffPath) reason::note(reason::kPropertyNameOffPath);
+        if (nameOutOfOrder) reason::note(reason::kPropertyNameOutOfOrder);
         spoofed = true;
     }
 
@@ -3367,6 +3642,183 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             acc.parsed) {
             LOGD("a buffer too short for the header was accepted");
             failures++;
+        }
+    }
+
+    /*
+     * Fixtures for auditPropertyTrie. Two sibling segments at one level and a
+     * property hanging off each, so both invariants have something to hold and
+     * the edits below have somewhere to break them. "aa" and "bb" are the same
+     * length on purpose: cmp_prop_name settles equal lengths by byte, which is
+     * the only case an in-place rename can get wrong.
+     */
+    {
+        std::vector<unsigned char> area(propa::kHeaderBytes + 2048, 0);
+        unsigned char* data = area.data() + propa::kHeaderBytes;
+        uint32_t used = 0;
+        auto alloc = [&](uint32_t size) -> uint32_t {
+            const uint32_t off = used;
+            used += (size + 3u) & ~3u;
+            return off;
+        };
+        auto wr = [&](uint32_t off, uint32_t v) { memcpy(data + off, &v, sizeof(v)); };
+        auto wrHdr = [&](size_t off, uint32_t v) { memcpy(area.data() + off, &v, sizeof(v)); };
+
+        wrHdr(8, propa::kMagic);
+        wrHdr(12, propa::kVersion);
+
+        const uint32_t root = alloc(propa::kNodeBytes);
+        alloc(propa::kValueMax);
+
+        // A node carrying one property, named two characters, with the
+        // prop_info holding the whole dotted name.
+        auto addNode = [&](const char* seg, const char* fullName) -> uint32_t {
+            const uint32_t segLen = static_cast<uint32_t>(strlen(seg));
+            const uint32_t node = alloc(propa::kNodeBytes + segLen + 1);
+            memcpy(data + node + propa::kNodeBytes, seg, segLen + 1);
+            wr(node, segLen);
+
+            const uint32_t nameLen = static_cast<uint32_t>(strlen(fullName));
+            const uint32_t info = alloc(propa::kInfoBytes + nameLen + 1);
+            memcpy(data + info + propa::kInfoBytes, fullName, nameLen + 1);
+            memcpy(data + info + 4, "1", 2);
+            wr(node + 4, info);
+            return node;
+        };
+
+        const uint32_t nodeA = addNode("aa", "aa");
+        const uint32_t nodeB = addNode("bb", "bb");
+        wr(root + 16, nodeA);        // first level starts at "aa"
+        wr(nodeA + 12, nodeB);       // "bb" to its right, which is the order
+        wrHdr(0, used);
+
+        const size_t areaLen = propa::kHeaderBytes + used;
+        std::vector<unsigned char> scratch;
+        PropTrieAudit audit;
+
+        if (!auditPropertyTrie(area.data(), areaLen, &audit, &scratch) ||
+            !audit.parsed || audit.nodes != 2 || audit.props != 2 ||
+            audit.nameOffPath || audit.nameOutOfOrder) {
+            LOGD("a well formed trie was not read clean: parsed=%d nodes=%u props=%u "
+                 "offPath=%d outOfOrder=%d", audit.parsed ? 1 : 0, audit.nodes,
+                 audit.props, audit.nameOffPath ? 1 : 0, audit.nameOutOfOrder ? 1 : 0);
+            failures++;
+        }
+
+        // The segments swapped where they lie, so the level reads "bb" then
+        // "aa". This is the rename that keeps every allocation size intact.
+        {
+            std::vector<unsigned char> bad = area;
+            unsigned char* badData = bad.data() + propa::kHeaderBytes;
+            memcpy(badData + nodeA + propa::kNodeBytes, "bb", 3);
+            memcpy(badData + nodeB + propa::kNodeBytes, "aa", 3);
+            if (!auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) ||
+                !audit.nameOutOfOrder) {
+                LOGD("a level out of cmp_prop_name order was not reported");
+                failures++;
+            }
+        }
+
+        // Only the prop_info copy of the name rewritten, so the trie path still
+        // spells the old one.
+        {
+            std::vector<unsigned char> bad = area;
+            unsigned char* badData = bad.data() + propa::kHeaderBytes;
+            uint32_t info = 0;
+            memcpy(&info, badData + nodeA + 4, sizeof(info));
+            memcpy(badData + info + propa::kInfoBytes, "zz", 3);
+            if (!auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) ||
+                !audit.nameOffPath) {
+                LOGD("a prop_info name off its trie path was not reported");
+                failures++;
+            }
+            if (audit.nameOutOfOrder) {
+                LOGD("rewriting a prop_info name moved a segment out of order");
+                failures++;
+            }
+        }
+
+        // A deeper path, to prove the dotted join is what is compared and not
+        // just the last segment.
+        {
+            std::vector<unsigned char> nested(propa::kHeaderBytes + 2048, 0);
+            unsigned char* nd = nested.data() + propa::kHeaderBytes;
+            uint32_t nused = 0;
+            auto nalloc = [&](uint32_t size) -> uint32_t {
+                const uint32_t off = nused;
+                nused += (size + 3u) & ~3u;
+                return off;
+            };
+            auto nwr = [&](uint32_t off, uint32_t v) { memcpy(nd + off, &v, sizeof(v)); };
+            memcpy(nested.data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+            memcpy(nested.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+            const uint32_t nroot = nalloc(propa::kNodeBytes);
+            nalloc(propa::kValueMax);
+
+            const uint32_t outer = nalloc(propa::kNodeBytes + 3);
+            memcpy(nd + outer + propa::kNodeBytes, "ro", 3);
+            nwr(outer, 2);
+            const uint32_t inner = nalloc(propa::kNodeBytes + 6);
+            memcpy(nd + inner + propa::kNodeBytes, "build", 6);
+            nwr(inner, 5);
+            const uint32_t info = nalloc(propa::kInfoBytes + 9);
+            memcpy(nd + info + propa::kInfoBytes, "ro.build", 9);
+            memcpy(nd + info + 4, "1", 2);
+            nwr(inner + 4, info);
+            nwr(outer + 16, inner);
+            nwr(nroot + 16, outer);
+            memcpy(nested.data(), &nused, sizeof(nused));
+
+            const size_t nestedLen = propa::kHeaderBytes + nused;
+            if (!auditPropertyTrie(nested.data(), nestedLen, &audit, &scratch) ||
+                !audit.parsed || audit.props != 1 || audit.nameOffPath) {
+                LOGD("a two segment path was not joined to its prop_info name");
+                failures++;
+            }
+
+            // Same tree, prop_info renamed to the last segment alone.
+            memcpy(nd + info + propa::kInfoBytes, "build\0\0\0", 9);
+            if (!auditPropertyTrie(nested.data(), nestedLen, &audit, &scratch) ||
+                !audit.nameOffPath) {
+                LOGD("a prop_info holding only its last segment was accepted");
+                failures++;
+            }
+        }
+
+        // Readings this walk must refuse rather than report.
+        {
+            std::vector<unsigned char> bad = area;
+            uint32_t badMagic = 0;
+            memcpy(bad.data() + 8, &badMagic, sizeof(badMagic));
+            if (auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) || audit.parsed) {
+                LOGD("the trie walk accepted a bad magic");
+                failures++;
+            }
+
+            bad = area;
+            memcpy(bad.data() + propa::kHeaderBytes + nodeA + 12, &nodeA, sizeof(nodeA));
+            if (auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) || audit.parsed) {
+                LOGD("the trie walk accepted a node that is its own right child");
+                failures++;
+            }
+
+            bad = area;
+            const uint32_t outOfRange = used + 4096;
+            memcpy(bad.data() + propa::kHeaderBytes + nodeA + 16, &outOfRange,
+                   sizeof(outOfRange));
+            if (auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) || audit.parsed) {
+                LOGD("the trie walk accepted a child offset past bytes_used");
+                failures++;
+            }
+
+            bad = area;
+            // A namelen that disagrees with the string beside it.
+            const uint32_t wrongLen = 7;
+            memcpy(bad.data() + propa::kHeaderBytes + nodeA, &wrongLen, sizeof(wrongLen));
+            if (auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) || audit.parsed) {
+                LOGD("the trie walk accepted a namelen that does not match its string");
+                failures++;
+            }
         }
     }
 
