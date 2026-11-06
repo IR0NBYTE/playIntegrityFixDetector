@@ -257,6 +257,7 @@ namespace reason {
     constexpr jint kMountAdbBind          = 902;
     constexpr jint kOverlayOnSystem       = 903;
     constexpr jint kExcessRwxMappings     = 904;
+    constexpr jint kMountRootTmpfsSource  = 905;
 
     constexpr jint kBootStateNotGreen     = 501;
     constexpr jint kBootloaderUnlocked    = 502;
@@ -1521,7 +1522,7 @@ static bool detectPropertyInconsistencies() {
  * and be wrong. The classifier below returned the no-rule constant to mean no
  * bits at all, which is how close the two already were.
  */
-enum class MountRule { None, TmpfsShadow, AdbBind };
+enum class MountRule { None, TmpfsShadow, AdbBind, TmpfsRootSource };
 
 static std::vector<std::string> splitMountFields(const std::string& line) {
     std::vector<std::string> fields;
@@ -1586,6 +1587,48 @@ static jint classifyMountLine(const std::string& line,
         }
     }
 
+    /*
+     * M1b: a tmpfs whose source names a root solution, wherever it sits.
+     *
+     * M1a only looks where a tmpfs shadows a read-only system partition, and
+     * that left the plainest case unread. A Magisk install with no modules
+     * mounts its tmpfs at /debug_ramdisk, which shadows nothing, so an API 34
+     * emulator running Magisk 31.1 with magiskd live returned a mask of zero
+     * while the app's own /proc/self/mountinfo held
+     *   / /debug_ramdisk rw,relatime master:13 - tmpfs magisk rw,seclabel,mode=755
+     *
+     * The source is the mounter's own choice and Magisk's own choice is this
+     * string: native/src/init/mount.rs passes Some(cstr!("magisk")). It is also
+     * how Magisk finds its own mounts again when it unmounts them for a
+     * denylisted app, in native/src/core/mount.rs:
+     *   if info.source == "magisk" || info.root.starts_with("/adb/modules")
+     * which is this rule and M2 below, written by the other side.
+     *
+     * Deliberately a needle and not "any tmpfs whose source is not tmpfs",
+     * though the broader rule would also have caught this. Every genuine tmpfs
+     * on the three devices measured carries source tmpfs, 10 of them per
+     * device, but all three are rooted, so that measurement cannot stand in for
+     * a stock one, and "no OEM ever names a tmpfs" is the shape of the
+     * assumption that convicted a retail SM-G780G. A needle asserts nothing
+     * about stock and so cannot be wrong about it. The cost is that renaming
+     * the source defeats it, which is one line for whoever ships it, and the
+     * coverage file says so.
+     *
+     * Append-only. Only Magisk's string has been read from its source; the
+     * KernelSU and APatch equivalents are unread and are not guessed at here.
+     */
+    if (fsType == tmpfsLit) {
+        static const char* kRootTmpfsSources[] = {
+            "XTkjKD8i",   // magisk
+        };
+        for (const char* encoded : kRootTmpfsSources) {
+            if (source == Deobfuscate(base64_decode(encoded))) {
+                if (ruleOut != nullptr) *ruleOut = MountRule::TmpfsRootSource;
+                return DETECTION_ROOT_HIDER;
+            }
+        }
+    }
+
     // M2: a bind whose source lives under /adb on the userdata device. The
     // module directory name leaks in the mount root.
     if (!dataDev.empty() && devId == dataDev) {
@@ -1640,6 +1683,7 @@ static jint detectMountArtifacts() {
     jint result = 0;
     bool tmpfsShadow = false;
     bool adbBind = false;
+    bool rootTmpfsSource = false;
     std::vector<std::string> moduleNames;
     for (const std::string& line : lines) {
         std::string moduleName;
@@ -1647,10 +1691,12 @@ static jint detectMountArtifacts() {
         result |= classifyMountLine(line, dataDev, &moduleName, &rule);
         if (rule == MountRule::TmpfsShadow) tmpfsShadow = true;
         if (rule == MountRule::AdbBind) adbBind = true;
+        if (rule == MountRule::TmpfsRootSource) rootTmpfsSource = true;
         if (!moduleName.empty()) moduleNames.push_back(moduleName);
     }
     if (tmpfsShadow) reason::note(reason::kMountTmpfsShadow);
     if (adbBind) reason::note(reason::kMountAdbBind);
+    if (rootTmpfsSource) reason::note(reason::kMountRootTmpfsSource);
 
     static const char* kModuleNeedles[] = {
         "SiEjKD8iby4hIjgmQg==",   // zygisk_vector
@@ -3400,6 +3446,82 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         if (classifyOverlayLine(c.line) != c.expected) {
             LOGD("classifyOverlayLine wrong for '%s'", c.line);
             failures++;
+        }
+    }
+
+    /*
+     * Mount rules, driven from real /proc/self/mountinfo lines. The lines with
+     * source "magisk" were read out of an app process on an SM-A065F and on an
+     * API 34 emulator running Magisk 31.1; the ones with source "tmpfs" are
+     * what the same devices carry for every genuine tmpfs, and the stock
+     * /debug_ramdisk case is the one that must stay silent, because AOSP mounts
+     * that path on a userdebug build with source "tmpfs".
+     */
+    {
+        struct MountCase {
+            const char* line;
+            jint expectedBits;
+            MountRule expectedRule;
+        };
+        static const MountCase kMountCases[] = {
+            // A Magisk install with no modules: shadows nothing, so only M1b.
+            {"2926 2898 0:19 / /debug_ramdisk rw,relatime master:13 - tmpfs magisk "
+             "rw,seclabel,mode=755", DETECTION_ROOT_HIDER, MountRule::TmpfsRootSource},
+            {"55 54 0:25 / /debug_ramdisk/.magisk/worker rw,relatime shared:14 - tmpfs "
+             "magisk rw,seclabel,mode=755", DETECTION_ROOT_HIDER,
+             MountRule::TmpfsRootSource},
+            // Shadowing a system partition, where M1a answers first and keeps
+            // reporting the rule it always reported.
+            {"6904 6903 0:22 /system_ext/bin /system_ext/bin ro,relatime master:16 - "
+             "tmpfs magisk rw,seclabel,size=1872244k,nr_inodes=468061,mode=755",
+             DETECTION_ROOT_HIDER, MountRule::TmpfsShadow},
+            {"7024 5985 0:22 /system/etc/security/cacerts /system/etc/security/cacerts "
+             "ro,relatime master:16 - tmpfs magisk rw,seclabel,mode=755",
+             DETECTION_ROOT_HIDER, MountRule::TmpfsShadow},
+            // Genuine tmpfs mounts, including the stock debug ramdisk.
+            {"54 40 0:19 / /debug_ramdisk rw,relatime shared:13 - tmpfs tmpfs "
+             "rw,seclabel,mode=755", 0, MountRule::None},
+            {"18 25 0:5 / /dev rw,nosuid,relatime shared:2 - tmpfs tmpfs "
+             "rw,seclabel,size=1872244k,nr_inodes=468061,mode=755", 0, MountRule::None},
+            {"24 18 0:21 / /dev/shm rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs "
+             "tmpfs rw,seclabel", 0, MountRule::None},
+            {"31 25 0:24 / /mnt rw,nosuid,nodev,noexec,relatime shared:9 - tmpfs tmpfs "
+             "rw,seclabel,mode=755,gid=1000", 0, MountRule::None},
+            {"32 25 0:26 / /apex rw,nosuid,nodev,noexec,relatime shared:10 - tmpfs "
+             "tmpfs rw,seclabel,mode=755", 0, MountRule::None},
+            {"33 25 0:27 / /linkerconfig rw,nosuid,nodev,noexec,relatime shared:11 - "
+             "tmpfs tmpfs rw,seclabel,mode=755", 0, MountRule::None},
+            // No optional fields at all, so the separator sits earlier.
+            {"56 40 0:16 / /debug_ramdisk rw,relatime - tmpfs magisk rw,seclabel,"
+             "mode=755", DETECTION_ROOT_HIDER, MountRule::TmpfsRootSource},
+            // A source that merely contains the needle is not the needle. The
+            // rule compares the whole field, as Magisk's own unmount does.
+            {"60 40 0:30 / /debug_ramdisk rw,relatime shared:20 - tmpfs magiskx "
+             "rw,seclabel,mode=755", 0, MountRule::None},
+            {"61 40 0:31 / /debug_ramdisk rw,relatime shared:21 - tmpfs notmagisk "
+             "rw,seclabel,mode=755", 0, MountRule::None},
+            // A different filesystem that happens to carry the name.
+            {"62 40 0:32 / /debug_ramdisk rw,relatime shared:22 - ext4 magisk "
+             "rw,seclabel", 0, MountRule::None},
+            // Truncated and malformed lines must classify as nothing.
+            {"62 40 0:32 / /debug_ramdisk rw,relatime shared:22 - tmpfs", 0,
+             MountRule::None},
+            {"", 0, MountRule::None},
+            {"- tmpfs magisk", 0, MountRule::None},
+        };
+
+        // An empty dataDev so the M2 arm cannot answer for any of these.
+        const std::string noDataDev;
+        for (const auto& c : kMountCases) {
+            std::string moduleName;
+            MountRule rule = MountRule::None;
+            const jint bits = classifyMountLine(c.line, noDataDev, &moduleName, &rule);
+            if (bits != c.expectedBits || rule != c.expectedRule) {
+                LOGD("classifyMountLine wrong for '%s': bits=%d want=%d rule=%d want=%d",
+                     c.line, bits, c.expectedBits, static_cast<int>(rule),
+                     static_cast<int>(c.expectedRule));
+                failures++;
+            }
         }
     }
 
