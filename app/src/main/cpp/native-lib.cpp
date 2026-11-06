@@ -950,10 +950,31 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
 
     /*
      * The root node and the dirty backup area, both reserved before the first
-     * allocation. Every one of the 893 areas measured, on an API 30 emulator
-     * and on an API 34 handset, places its first allocation at offset 112, so
-     * the reservation is this size on both. An older layout carries a
-     * different version word and is refused above rather than misread.
+     * allocation. Every one of the 1499 areas measured, across API 30 and API
+     * 34, places its first allocation at offset 112, so the reservation is
+     * this size on all of them.
+     *
+     * It is NOT this size on an older layout, and the version word does not
+     * say so. An API 23 image carries magic 0x504f5250 and version 0xfc6ed0ab,
+     * byte for byte what a modern area carries, in one 131072 byte
+     * /dev/__properties__ rather than a directory of per-context files, and its
+     * root node's children offset is 20: the first real node sits directly
+     * after the root with no dirty backup area at all. So the version check
+     * above does not separate the two layouts, and an earlier version of this
+     * comment claiming it did was wrong.
+     *
+     * What actually happens on that layout is that this reservation claims
+     * bytes 20 to 111, the walk then reaches the real node at offset 20, two
+     * allocations claim one byte, and mark refuses the area. That is the safe
+     * direction, and it is why the arms are silent rather than wrong there, but
+     * it is an overlap doing the work rather than a version check.
+     *
+     * The consequence is a coverage hole, not a false finding: on any image
+     * whose areas have no dirty backup area, every area refuses and the three
+     * arms built on this walk say nothing. minSdk is 24, so API 24 and 25 are
+     * installable and are almost certainly in that hole. Which release added
+     * the reservation has not been measured; API 23 is without it and API 30 is
+     * with it.
      */
     if (!mark(0, propa::kNodeBytes)) return false;
     if (!mark(propa::kNodeBytes, align4(propa::kValueMax))) return false;
