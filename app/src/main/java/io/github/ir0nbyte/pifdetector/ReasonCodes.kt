@@ -158,6 +158,24 @@ object ReasonCodes {
             "The same keystore served a Google-rooted hardware chain for one " +
                 "key algorithm and the AOSP software fallback for the other"),
 
+        Reason(1201, DetectionResult.DETECTION_ATTEST_ANOMALY,
+            "A certificate in the attestation chain does not verify against " +
+                "the one that issued it"),
+        Reason(1202, DetectionResult.DETECTION_ATTEST_ANOMALY,
+            "A certificate in the attestation chain was issued by something " +
+                "that is not a certificate authority"),
+        Reason(1203, DetectionResult.DETECTION_ATTEST_ANOMALY,
+            "The attestation chain is neither software backed nor anchored to " +
+                "a published Google root"),
+        Reason(1204, DetectionResult.DETECTION_ATTEST_ANOMALY,
+            "The attested challenge is not the one that was asked for"),
+        Reason(1205, DetectionResult.DETECTION_ATTEST_ANOMALY,
+            "The attested root of trust claims a verified boot while the " +
+                "device shows root hiding"),
+        Reason(1206, DetectionResult.DETECTION_ATTEST_ANOMALY,
+            "The boot properties claim a locked device while the attested " +
+                "root of trust disagrees"),
+
         Reason(905, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs is mounted from a source named after a root solution"),
 

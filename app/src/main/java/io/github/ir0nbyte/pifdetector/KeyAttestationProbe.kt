@@ -23,6 +23,15 @@ class KeyAttestationProbe {
         val versions: VersionBounds.Verdict = VersionBounds.Verdict.NOT_EVALUATED,
         val shape: RecordShape.Verdict = RecordShape.Verdict.NOT_EVALUATED,
         val moduleHash: ModuleHash.Status = ModuleHash.Status.NOT_APPLICABLE,
+        /**
+         * Which arm set [DetectionResult.DETECTION_ATTEST_ANOMALY]. Every other
+         * bit this probe can set already names itself through the verdict
+         * objects above, which the row renders in full; the anomaly bit had
+         * nothing, so it lit the Key Attestation row with no line under it.
+         * Measured on an SM-A065F whose bootloader properties are spoofed
+         * green: the probe set the bit and the report could not say why.
+         */
+        val reasons: List<Int> = emptyList(),
     )
 
     /**
@@ -49,8 +58,10 @@ class KeyAttestationProbe {
             if (chain.isEmpty()) return clean()
 
             // Trust gates. These stay hard early returns.
-            if (AttestationAnalysis.chainSignaturesBroken(chain)) return anomaly()
-            if (AttestationAnalysis.chainHasNonCaIssuer(chain)) return anomaly()
+            if (AttestationAnalysis.chainSignaturesBroken(chain))
+                return anomaly(REASON_CHAIN_SIGNATURE_BROKEN)
+            if (AttestationAnalysis.chainHasNonCaIssuer(chain))
+                return anomaly(REASON_CHAIN_NON_CA_ISSUER)
 
             val extValue = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID)
                 ?: return clean()
@@ -63,17 +74,19 @@ class KeyAttestationProbe {
 
             val googleAnchored =
                 AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
-            if (!softwareBacked && !googleAnchored) return anomaly()
+            if (!softwareBacked && !googleAnchored)
+                return anomaly(REASON_NEITHER_SOFTWARE_NOR_ANCHORED)
 
             val challenge = AttestationAnalysis.parseAttestationChallenge(extValue)
             if (AttestationAnalysis.challengeMismatch(challenge, attested.challenge)) {
-                return anomaly()
+                return anomaly(REASON_CHALLENGE_MISMATCH)
             }
 
             val rot = AttestationAnalysis.parseRootOfTrust(extValue)
 
             // Accumulate phase. Every check below runs regardless of the others.
             var mask = 0
+            val anomalyReasons = mutableListOf<Int>()
 
             // A software-level chain is legitimate on an emulator, a GSI or an
             // AOSP build. It is not legitimate on something presenting as
@@ -202,6 +215,7 @@ class KeyAttestationProbe {
 
             if (AttestationAnalysis.isBootContradiction(rot, deviceTampered(nativeBitmask))) {
                 mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
+                anomalyReasons.add(REASON_ROT_CONTRADICTS_TAMPERING)
             }
 
             val propertiesClaimLocked =
@@ -210,10 +224,12 @@ class KeyAttestationProbe {
                 AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked)
             ) {
                 mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
+                anomalyReasons.add(REASON_BOOT_PROPERTIES_CONTRADICT_ROT)
             }
 
             ProbeOutcome(
-                mask, revocation, crossSource, validity, versions, shape, moduleHash
+                mask, revocation, crossSource, validity, versions, shape, moduleHash,
+                reasons = anomalyReasons,
             )
         } catch (e: Throwable) {
             Log.w(TAG, "attestation probe failed; failing safe", e)
@@ -248,8 +264,11 @@ class KeyAttestationProbe {
      * A trust gate failed. Revocation was not looked at, which is not the same
      * as knowing the chain had no Google anchor, so the row must not claim it.
      */
-    private fun anomaly() =
-        ProbeOutcome(DetectionResult.DETECTION_ATTEST_ANOMALY, RevocationStatus.NOT_EVALUATED)
+    private fun anomaly(reason: Int) = ProbeOutcome(
+        DetectionResult.DETECTION_ATTEST_ANOMALY,
+        RevocationStatus.NOT_EVALUATED,
+        reasons = listOf(reason),
+    )
 
     private fun deviceTampered(nativeBitmask: Int): Boolean {
         return (nativeBitmask and DetectionResult.DETECTION_ROOT_HIDER) != 0
@@ -285,9 +304,30 @@ class KeyAttestationProbe {
         }
     }
 
-    private companion object {
-        const val TAG = "KeyAttestationProbe"
-        const val ANDROID_KEYSTORE = "AndroidKeyStore"
-        const val KEY_ALIAS = "pifd_attest_probe"
+    companion object {
+        private const val TAG = "KeyAttestationProbe"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val KEY_ALIAS = "pifd_attest_probe"
+
+        /**
+         * The six arms that set DETECTION_ATTEST_ANOMALY. Four are trust gates
+         * that return before anything else is read, and two are contradictions
+         * found during the accumulate phase. Append-only.
+         */
+        const val REASON_CHAIN_SIGNATURE_BROKEN = 1201
+        const val REASON_CHAIN_NON_CA_ISSUER = 1202
+        const val REASON_NEITHER_SOFTWARE_NOR_ANCHORED = 1203
+        const val REASON_CHALLENGE_MISMATCH = 1204
+        const val REASON_ROT_CONTRADICTS_TAMPERING = 1205
+        const val REASON_BOOT_PROPERTIES_CONTRADICT_ROT = 1206
+
+        val REASON_CODES: Set<Int> = setOf(
+            REASON_CHAIN_SIGNATURE_BROKEN,
+            REASON_CHAIN_NON_CA_ISSUER,
+            REASON_NEITHER_SOFTWARE_NOR_ANCHORED,
+            REASON_CHALLENGE_MISMATCH,
+            REASON_ROT_CONTRADICTS_TAMPERING,
+            REASON_BOOT_PROPERTIES_CONTRADICT_ROT,
+        )
     }
 }
