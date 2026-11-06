@@ -79,10 +79,10 @@ rows that rest on them:
 | DEBUGGER | TracerPid, FLAG_DEBUGGABLE (release only) | Yes | Both work in-process | Any debugger that clears TracerPid |
 | FRIDA | TCP connect to 27042/27043, thread names, maps scan, parent cmdline, legacy /proc/net/tcp | Partly | Port, thread and maps checks work in-process. Two arms fail open: the parent-cmdline read needs /proc/<ppid>/cmdline, which hidepid denies, and the /proc/net/tcp scan is filtered empty for untrusted_app on Android 10+ | A gadget on a non-default port with renamed threads |
 | ZYGISK | maps needles, env vars, ro.magisk.zygisk, /data/adb probes, root-manager packages, su and busybox paths, module names from mountinfo | Yes | Fires on the test device via maps and the new mountinfo module-name harvest | Trace-cleaning Zygisk implementations, denylist, a renamed manager package |
-| ROOT_HIDER | mountinfo source and mount-root analysis, OverlayFS on /system, anonymous rwxp count | Yes | Fires on the test device: 6 tmpfs mounts over system partitions whose source is not tmpfs, plus one /adb/ bind that leaks the module name | The app being on the denylist, and SUSFS sus_mount, which falsifies mountinfo in kernel |
+| ROOT_HIDER | mountinfo source and mount-root analysis, OverlayFS on /system, anonymous rwxp count | Yes | Fires on the test device: 6 tmpfs mounts over system partitions whose source is not tmpfs, plus one /adb/ bind that leaks the module name. Reason 905 adds the case where a root tmpfs shadows nothing at all, which is what a module-less install looks like and what returned a mask of zero on a live Magisk 31.1 emulator. See the section on it below | The app being on the denylist, and SUSFS sus_mount, which falsifies mountinfo in kernel. 905 specifically is defeated by renaming the mount source, which is one line for whoever ships it |
 | BOOTLOADER | verifiedbootstate, flash.locked, veritymode, vbmeta.device_state, ro.debuggable, ro.secure, oem_unlock_allowed | Partly | Reads what the properties say. ro.secure is labelled userdebug_or_eng_prop and is denied to untrusted_app, so that arm silently no-ops | Any resetprop-based property sanitizer; all of these are ordinary properties |
 | SIGNATURE | signing cert SHA-256 against a build-time digest, fail-closed | Yes | Works; compiled out in debug and when no digest is supplied | Signature-spoofing frameworks that swap the PackageInfo CREATOR |
-| PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, a `/dev/__properties__` area mapped private rather than shared, and an area holding allocated space its own trie can no longer reach | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say. The accounting arm added in 3.2 is the one that reads the area's contents rather than its mapping flags, and it is the first arm in this file to ship with a positive witness as well as a negative one: it fires on an SM-A065F running Magisk 30.6 and is silent on an API 30 emulator. See the section on it below | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated. For the accounting arm, `resetprop --compact` rebuilds the area and erases the evidence, and Magisk ships it as a command, so this arm reads a module that deleted and did not tidy up |
+| PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, a `/dev/__properties__` area mapped private rather than shared, an area holding allocated space its own trie can no longer reach, a property name out of order in the trie level that indexes it, and a property name that disagrees with the trie path reaching it | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say. The accounting arm added in 3.2 is the one that reads the area's contents rather than its mapping flags, and it is the first arm in this file to ship with a positive witness as well as a negative one: it fires on an SM-A065F running Magisk 30.6 and is silent on an API 30 emulator. See the section on it below | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated. For the accounting arm, `resetprop --compact` rebuilds the area and erases the evidence completely: a compacted area is byte for byte identical to one where the property was never set, so that arm now reads only a stack on Magisk v30.7 or older, or one without PlayIntegrityFork, and no contents-reading arm can replace it. The two trie-invariant arms are the part compaction does not hide, and they are bounded in the other direction: 808 needs a same-length neighbour to pin the edited node's slot, which only 48.3% of properties have, and 809 is defeated by rewriting both copies of the name consistently. See the two sections on them below |
 | CANARY_FP | global Pixel Canary build id, vendor fingerprint mismatch, brand cross-check | Yes | Only catches global fingerprint spoofing | Zygisk-scoped spoofing, which never reaches our process |
 | CODE_INTEGRITY | libc prologue inline-hook decode (arm64-v8a and x86_64 only), executable mappings from unrecognised sources, PLT GOT slots pointing outside any recognised code source, libc text against the file on disk | Yes | Reads only this process's own address space, so no privilege is involved. Measured silent on a clean API 34 emulator and on a rooted Samsung A06: Magisk's root is filesystem-level and inline-hooks nothing in our process, so silence there is the correct answer rather than a dead check. The arms are proven to fire by the native self test, which synthesises arm64 and x86_64 trampolines and maps an anonymous executable page on every device the suite runs on | A hider that hooks nothing in our address space is invisible to it, by construction. On armeabi-v7a and x86 the prologue arm does not run at all: only arm64-v8a and x86_64 have decoders, and the other two report nothing rather than guess at byte patterns nobody verified. The text comparison is corroboration only and never fires alone, because a hider that can patch a prologue can also redirect a read of the library file |
 | TREAT_WHEEL | maps needle | Yes | In-process, genuinely fires | A renamed build |
@@ -410,10 +410,48 @@ neither.
 
 ### What defeats it, and what could falsely accuse
 
-`resetprop --compact` rebuilds the area and erases the evidence, and Magisk
-ships it as a command. This arm therefore reads a module that deleted and did
-not tidy up. A module that compacts afterwards is invisible to it, which is
-worth saying plainly rather than discovering later.
+`resetprop --compact` rebuilds the area and erases the evidence. This arm
+therefore reads a module that deleted and did not tidy up. A module that
+compacts afterwards is invisible to it, which is worth saying plainly rather
+than discovering later.
+
+That sentence was written when compaction was a command someone might run. It
+is now the default on the mainstream stack, so the scope is worth stating
+exactly. Magisk gained `-c, --compact` in `2c98b6ccf` on 2026-03-14: absent from
+v30.6 and v30.7, present in v31.0 and in v31.1, which became the current stable
+on 2026-10-25, one day before this arm shipped. KernelSU and APatch had it
+earlier, through `5ec1cff/resetprop-rs`, whose `-c`/`--rebuild` is the same
+operation. PlayIntegrityFork has called it on every boot since `28c69e63c` on
+2026-06-12, whose message records that Magisk was then the only root solution
+without it, and since `3a727098b` on 2026-06-25 it also compacts the one context
+a property lived in immediately after deleting it, as
+`resetprop -c $(resetprop -Z "$NAME")`.
+
+So this arm now reads either a stack on Magisk v30.7 or older, or one without
+PlayIntegrityFork. The SM-A065F it fires on is the first: Magisk 30.6, and no
+playintegrityfix module.
+
+There is nothing left behind to find, and that is measured rather than assumed.
+On an API 34 emulator running Magisk 31.1, a property was created, deleted and
+the area compacted, with the area dumped at each step:
+
+| Step | `bytes_used_` | Unreachable | This arm |
+|---|---|---|---|
+| Pristine `u:object_r:debug_prop:s0` | 4944 | 0 | silent |
+| After `resetprop -n debug.pifwatch.two SOMEVALUE123456` | 5116 | 0 | silent |
+| After `resetprop --delete debug.pifwatch.two` | 5116 | 172 | fires |
+| After `resetprop -c u:object_r:debug_prop:s0` | 4944 | 0 | silent |
+
+The compacted area is byte for byte identical to the pristine one. Not merely
+accounted the same: `cmp` reports no difference across all 131072 bytes. The
+rebuild in `resetprop-rs` is careful about exactly the things that would
+otherwise give it away. It collects the survivors into a `BTreeMap` keyed by
+their old offsets, so they are re-inserted in the order they already had rather
+than in name order; it passes each property's existing serial counter through to
+the new area; and it reproduces the dirty backup area when the original had one,
+which is why the 112 byte prefix is still 112. No arm that reads the area's
+contents can separate that result from a device where the property was never
+set, so this file does not propose one.
 
 Two cheaper counters exist and neither needs a rebuild. The all-zero gate is one
 character from being defeated: `prop_area::remove` memsets what it detaches, and
@@ -474,6 +512,149 @@ measuring a stock handset from the same family, is the open question, and it is
 recorded as the top lead in the watch state. If a stock device is ever found to
 trip this, the gate is one condition and the arm should be demoted to reported
 rather than deleted.
+
+## A root tmpfs that shadows nothing
+
+Reason 905, added after the detector returned a mask of zero on a device that
+was plainly rooted.
+
+The mount arm had one tmpfs rule, 901: a tmpfs whose source is not `tmpfs`,
+mounted over a read-only system partition. The second half of that is what a
+module does, not what a root solution does. A Magisk install with no modules
+mounts its own tmpfs at `/debug_ramdisk`, which shadows nothing, so 901 has
+nothing to match. Measured from inside the app process on an API 34 emulator
+running Magisk 31.1 with `magiskd` live:
+
+```
+MASK=0x0 REASONS=[]
+2926 2898 0:19 / /debug_ramdisk rw,relatime master:13 - tmpfs magisk rw,seclabel,mode=755
+2927 2926 0:25 / /debug_ramdisk/.magisk/worker rw,relatime master:14 - tmpfs magisk rw,seclabel,mode=755
+```
+
+The engine read those two lines and reported nothing. 905 reads the source
+field, which is the mounter's own choice, and Magisk's choice is this string:
+`native/src/init/mount.rs` passes `Some(cstr!("magisk"))`. It is also how Magisk
+finds its own mounts again when it unmounts them for a denylisted app, in
+`native/src/core/mount.rs`:
+
+```rust
+if info.source == "magisk" || info.root.starts_with("/adb/modules") {
+```
+
+which is this rule and 902, written by the other side.
+
+### Why it is a needle and not the general rule
+
+"Any tmpfs whose source is not `tmpfs`" would also have caught this, and it is
+tempting because the measurement supports it: on all three devices every
+genuine tmpfs carries source `tmpfs`, ten of them per device, and the only
+exceptions are the Magisk ones.
+
+It is not shipped that way, because all three devices are rooted. A measurement
+on three rooted devices cannot establish what a stock device does, and "no OEM
+ever names a tmpfs anything else" is the same shape of assumption that convicted
+a retail SM-G780G once already. A needle asserts nothing about stock and so
+cannot be wrong about it.
+
+The cost is that renaming the mount source defeats 905 for one line of work, and
+that only Magisk's string has been read from source. The KernelSU and APatch
+equivalents are unread and are not guessed at in the needle list, which is
+append-only. Widening to the general rule is a candidate, and what it needs
+first is a stock witness: the phone station's Pixel 7a, SM-G780G and moto g04,
+tabulated the same way.
+
+## Two invariants on the property trie, and what they cost to break
+
+Reasons 808 and 809, added after the arm above was found to be fully evadable by
+compaction. They read the same areas and the same bytes, and they are the part
+compaction does not hide, because they do not depend on any byte being left
+over.
+
+A property name is stored twice. `prop_area::find_property` splits the name on
+`.` and walks one trie node per segment, creating each missing one through
+`find_prop_trie_node`, and the node it ends on points at a `prop_info` carrying
+the whole name. So the dotted join of the segments along a property's path
+equals the name in its `prop_info`. That is reason 809.
+
+Each level of the trie is a binary search tree keyed by one segment.
+`find_prop_trie_node` compares with `cmp_prop_name`, which orders by length
+first and then `strncmp`, descends left on a negative answer and right on a
+positive one, and only ever creates a node where that walk arrives. There is no
+rebalancing and AOSP has no delete, so an in-order walk of one level yields its
+segments in strictly increasing order. That is reason 808.
+
+Neither is a fact about any particular device, which is the point. They follow
+from the only code that ever builds the structure, so acting on them needs no
+corpus of values some device ought to report, and it is a corpus that made a
+genuine SM-G780G look guilty once already.
+
+What breaks them is editing a name where it lies rather than going through
+`find_property`. `Enginex0/resetprop-rs` documents exactly that as its hexpatch
+delete: "overwrites property name bytes with realistic dictionary words instead
+of detaching trie nodes. Trie structure stays intact. Serial counters
+preserved." A same-length replacement leaves every allocation size and every
+counter untouched, so the area still accounts to the byte and reason 807 has
+nothing to say. Rewriting only the `prop_info` copy leaves the path spelling the
+old name, which 809 reads. Rewriting the segment too moves the node out of the
+order its level is sorted in, which 808 reads.
+
+### What they do not catch
+
+808 only speaks when a same-length neighbour pins the node's slot. Across the
+1329 areas measured below, 51.7% of properties had no such neighbour at their
+level, because 1965 of the levels hold a single node. Of the properties whose
+slot is pinned, a random same-length replacement lands wrong 60.3% of the time,
+which is 29.1% of all properties. So 808 reads a careless edit, not every edit.
+
+809 is defeated by rewriting both copies consistently, which costs the
+implementer one extra write. A rebuild through `resetprop -c` also satisfies
+both invariants, because it re-inserts every survivor through the normal path.
+
+These are therefore cheap invariants that raise the cost of in-place editing,
+not a wall. They are worth their keep because they share the walk the arm above
+already does and because their false positive risk is not a judgement call.
+
+### What was measured
+
+Every `/dev/__properties__` area on three devices, read as files and walked by
+the engine's own `accountPropertyArea` and `auditPropertyTrie` compiled for the
+host under `-fsanitize=undefined -fno-sanitize-recover=all`:
+
+| Device | Root stack | Areas | Trie nodes | Properties | 808 | 809 |
+|---|---|---|---|---|---|---|
+| SM-A065F, API 34 | Magisk 30.6, ZygiskSU, Shamiko | 723 | 3196 | 2099 | 0 | 0 |
+| Emulator, API 34 | Magisk 29.0, no modules | 303 | 1414 | 929 | 0 | 0 |
+| Emulator, API 34 | Magisk 31.1 | 303 | 1409 | 924 | 0 | 0 |
+
+1329 areas, 6019 nodes, 3952 properties, not one violation of either invariant.
+None of the three is a stock device, which is worth saying plainly: all three
+are rooted, and both emulators had Magisk installed on 2026-11-05. That is the
+wrong direction to be wrong in for a false positive measurement, since a rooted
+device is the one more likely to trip an invariant, but a stock witness is still
+owed and is recorded in the watch state.
+
+### A coverage bug this measurement found
+
+Running the shipped parser over those files refused one real area outright:
+`u:object_r:radio_prop:s0` on the SM-A065F. Two properties there,
+`ril.signal.disprssi0` and `ril.signal.disprssi1`, have `kLongFlag` set in their
+serial with a long-offset field of 0, so the walk took each `prop_info` for its
+own long value, saw two allocations claim one byte, and refused the area.
+
+Neither is a long value. `kLongFlag` is bit 16, and for a mutable property that
+bit belongs to the change counter: `Update` writes
+`(len << 24) | ((serial + 1) & 0xffffff)`, so the counter spans bits 0 to 23 and
+crosses bit 16 every 65536 writes. `ril.signal.disprssi0` has been written about
+1.9 million times. The flag only means what it says on a read-only property,
+which `prop_info.h` states in a comment and which holds because
+`SystemProperties::Add` refuses a value of `PROP_VALUE_MAX` or more for any name
+that is not `ro.*`. bionic guards its own use the same way:
+`is_read_only(pi->name) && pi->is_long()`.
+
+The parser now does too. This cost coverage rather than causing a false finding:
+the arm above was silent on that area when it should have been reading it. With
+the guard in place all 1329 areas parse, and the host walk's node and property
+counts match an independent Python implementation exactly.
 
 ## Why the RKP provisioning era is not a detection
 
