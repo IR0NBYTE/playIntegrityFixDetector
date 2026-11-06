@@ -658,28 +658,48 @@ being userdebug: it ships an `su` binary and reports an unlocked bootloader.
 A retail stock witness is still owed and is recorded in the watch state. The
 phone station's Pixel 7a, SM-G780G and moto g04 are where it comes from.
 
-### The layout this walk does not read
+### The layout that used to refuse, and why it no longer does
 
-An API 23 image was measured alongside the others and refuses outright, which is
-worth recording because the reason is not the one the code used to claim.
+An API 23 image measured alongside the others refused every area outright, and
+the reason was not the one the code claimed.
 
 It carries magic `0x504f5250` and version `0xfc6ed0ab`, byte for byte what a
 modern area carries, in a single 131072 byte `/dev/__properties__` rather than a
 directory of per-context files. Its root node's `children` offset is 20, so the
 first real node sits directly after the root with **no dirty backup area at
 all**. The version word therefore does not separate the two layouts, and the
-comment in `accountPropertyArea` that said it did has been corrected.
+comment in `accountPropertyArea` claiming it did was wrong.
 
-What refuses the area is the reservation: the walk claims bytes 20 to 111 for a
-dirty backup area that is not there, reaches the real node at offset 20, finds
-two allocations claiming one byte, and refuses. Safe direction, but an overlap
-is doing the work rather than a version check.
+What refused the area was the reservation itself: the walk claimed bytes 20 to
+111 for a dirty backup area that is not there, reached the real node at offset
+20, found two allocations claiming one byte, and refused. Safe direction, but an
+overlap was doing the work rather than a version check, and the cost was that
+every area on such an image refused and all three arms built on this walk said
+nothing. `minSdk` is 24, so API 24 and 25 are installable and were in that hole.
 
-The consequence is a coverage hole and not a false finding. On any image whose
-areas have no dirty backup area, every area refuses and all three arms built on
-this walk say nothing. `minSdk` is 24, so API 24 and 25 are installable and are
-almost certainly in that hole. Which release added the reservation has not been
-measured: API 23 is without it, API 30 is with it.
+The prefix is now read from the area instead of assumed. The root's `children`
+offset is the first allocation the area ever made, because `find_property`
+writes it when the first segment is created and `new_prop_trie_node` allocates
+at `bytes_used_`, which is still the constructor's value at that moment. So 112
+means the block is there and 20 means it is not. An area holding no properties
+at all has `children` of 0, and then its `bytes_used_` names the layout on its
+own. Anything else is refused rather than guessed at.
+
+Which way each possible mistake falls is worth stating, because one of them
+would be a false positive rather than a refusal. Reading 112 on an area that
+uses 20 collides with the first node and refuses, which is harmless. Reading 20
+on an area that uses 112 would leave the real backup block unreachable and all
+zero, which is a finding. That is why the prefix is taken from the layout rather
+than tried and retried until something parses.
+
+With that in place the API 23 area parses: 269 trie nodes, 185 properties,
+`unreachable` of 0, reason 807 silent, and both trie invariants satisfied. The
+A06's `bootloader_prop` still reports its 15500 unreachable bytes, so the one
+positive witness is unaffected. Totals across five devices: 1500 areas, 7335
+trie nodes, 4836 properties, zero invariant violations.
+
+Which release added the reservation is still unmeasured, and no longer matters
+much: both layouts are read.
 
 ### A coverage bug this measurement found
 
