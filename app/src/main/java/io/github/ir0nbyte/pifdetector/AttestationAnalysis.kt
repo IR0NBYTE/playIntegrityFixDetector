@@ -753,7 +753,7 @@ object AttestationAnalysis {
                 attestedVendorPatchLevel = vendorRaw,
             )
         } catch (_: Throwable) {
-            CrossSourceVerdict.NONE
+            CrossSourceVerdict.NOT_EVALUATED
         }
     }
 
