@@ -822,7 +822,29 @@ writes it when the first segment is created and `new_prop_trie_node` allocates
 at `bytes_used_`, which is still the constructor's value at that moment. So 112
 means the block is there and 20 means it is not. An area holding no properties
 at all has `children` of 0, and then its `bytes_used_` names the layout on its
-own. Anything else is refused rather than guessed at.
+own.
+
+One state names neither, and it is the state a deletion leaves. When
+`resetprop --delete` removes the last property of an area, Magisk's prune wipes
+the first-level node and stores 0 into the root's `children` while
+`bytes_used_` stays where it was. If a property is added afterwards, `children`
+becomes that old `bytes_used_`, which is neither 20 nor 112. Reading the layout
+from the area alone refused both, so the area with the plainest scar on the
+device was silent for 807, 808 and 809, and stayed silent for good once it was
+refilled.
+
+The layout belongs to the device's bionic, not to the area, so every area on one
+device has the same prefix. Before any area is judged, each mapped area votes:
+a root `children` of 20 or 112 votes for that value, and a `children` of 0
+with a `bytes_used_` of 20 or 112 votes for that. When every voter agrees, that
+value is the device-wide layout hint, and an area that cannot name its own
+layout takes it, provided its `bytes_used_` is at least the prefix and its
+`children` is 0 or lies between the prefix and `bytes_used_`. The bytes between
+the prefix and whatever the trie reaches then count as unreachable in the normal
+way, so an emptied area reports everything past the prefix and a refilled one
+reports the wiped gap. When voters disagree, or none can vote, there is no hint
+and such an area is refused as before. The 807 arm and the trie arm use the
+same hint for a scan. Anything else is refused rather than guessed at.
 
 Which way each possible mistake falls is worth stating, because one of them
 would be a false positive rather than a refusal. Reading 112 on an area that

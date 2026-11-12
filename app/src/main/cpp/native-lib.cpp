@@ -971,16 +971,91 @@ struct PropAreaAccount {
 };
 
 /*
+ * Which data prefix one area says this device's bionic uses, or 0 when the area
+ * does not say.
+ *
+ * The prefix is the root node alone (20) or the root plus the dirty backup area
+ * (112), and it is a property of the bionic that built the areas, so every area
+ * on one device has the same one. An area says which only while its own state
+ * still records it: a root children offset of 20 or 112, which is the first
+ * allocation the area made, or an area that never held a property, whose
+ * children is 0 and whose bytes_used_ is still the constructor's value.
+ *
+ * An area emptied by resetprop --delete with prune says nothing. Magisk's
+ * prune stores 0 into the root's children and leaves bytes_used_ where it was,
+ * and if a property is added afterwards children becomes that old bytes_used_.
+ * Neither is a prefix, which is exactly why such an area needs the others to
+ * name its layout for it.
+ *
+ * Only the header and the root node are read, so base needs to hold no more
+ * than those; len is the length of the whole area, which bytes_used_ is checked
+ * against.
+ *
+ * The vote records which of the two it came from. An area that never held a
+ * property names its layout only through the constructor's bytes_used_, which
+ * is the field an emptied area also leaves behind, so agreedPropertyLayout
+ * gives no hint unless at least one area voted through its root's children.
+ */
+struct PropLayoutVote {
+    uint32_t layout = 0;
+    bool viaChildren = false;
+};
+
+static PropLayoutVote propertyLayoutVote(const unsigned char* base, size_t len) {
+    if (base == nullptr || len < propa::kHeaderBytes + propa::kNodeBytes) return {};
+    uint32_t bytesUsed = 0, magic = 0, version = 0, children = 0;
+    memcpy(&bytesUsed, base, sizeof(bytesUsed));
+    memcpy(&magic, base + 8, sizeof(magic));
+    memcpy(&version, base + 12, sizeof(version));
+    memcpy(&children, base + propa::kHeaderBytes + 16, sizeof(children));
+    if (magic != propa::kMagic || version != propa::kVersion) return {};
+    if (bytesUsed < propa::kNodeBytes || bytesUsed > len - propa::kHeaderBytes) return {};
+
+    const uint32_t withBackup =
+        static_cast<uint32_t>(propa::kNodeBytes + ((propa::kValueMax + 3u) & ~3u));
+    if (children == withBackup || children == propa::kNodeBytes) return {children, true};
+    if (children == 0 && (bytesUsed == withBackup || bytesUsed == propa::kNodeBytes)) {
+        return {bytesUsed, false};
+    }
+    return {};
+}
+
+/*
+ * The prefix every voting area agrees on, or 0 when none voted, any two
+ * disagree, or no voter named it through its root's children. A disagreement
+ * means at least one area is not what it seems, and then no area gets a
+ * layout it cannot name for itself. Empty areas alone are not enough: what
+ * they vote with is bytes_used_, the one field an emptied area keeps, so a
+ * hint must rest on at least one area that holds properties.
+ */
+static uint32_t agreedPropertyLayout(const std::vector<PropLayoutVote>& votes) {
+    uint32_t agreed = 0;
+    bool anchored = false;
+    for (const PropLayoutVote& vote : votes) {
+        if (vote.layout == 0) continue;
+        if (agreed != 0 && agreed != vote.layout) return 0;
+        agreed = vote.layout;
+        anchored = anchored || vote.viaChildren;
+    }
+    return anchored ? agreed : 0;
+}
+
+/*
  * Returns false, and judges nothing, for anything it cannot read exactly: a bad
  * magic or version, a header that does not fit, an offset outside the used
  * region, a name with no terminator, a namelen that disagrees with the string
  * beside it, two allocations claiming one byte, or a trie deeper than the node
  * budget. Every one of those is a reading this parser got wrong rather than a
  * device that did something wrong, and a wrong reading must not convict.
+ *
+ * layoutHint is the prefix agreedPropertyLayout found across every area this
+ * process mapped, or 0 for none. It is only consulted when the area cannot name
+ * its own layout.
  */
 static bool accountPropertyArea(const unsigned char* base, size_t len,
                                 PropAreaAccount* out,
-                                std::vector<unsigned char>* scratch) {
+                                std::vector<unsigned char>* scratch,
+                                uint32_t layoutHint) {
     *out = PropAreaAccount{};
     if (base == nullptr || scratch == nullptr || len < propa::kHeaderBytes) return false;
 
@@ -1063,20 +1138,34 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
      * all zero, which is a finding. So the prefix is taken from the layout
      * rather than tried and retried, and an area that claims a prefix its own
      * contents contradict still refuses on the collision.
+     *
+     * An area emptied by delete with prune cannot name its layout: Magisk's
+     * prune stores 0 into the root's children and leaves bytes_used_ large,
+     * and a property added afterwards makes children that old bytes_used_.
+     * Refusing it silenced 807, 808 and 809 on exactly the area carrying the
+     * plainest scar. The layout is the same for every area on the device, so
+     * such an area takes it from layoutHint, the prefix the areas that can
+     * name theirs all agree on. The bytes between that prefix and whatever the
+     * trie reaches are then unreachable in the ordinary way. With no hint it
+     * is refused as before.
      */
     const uint32_t firstAlloc = rd(16);     // the root node's children offset
     const uint64_t withBackup = propa::kNodeBytes + align4(propa::kValueMax);
+    auto isPrefix = [&](uint64_t p) { return p == withBackup || p == propa::kNodeBytes; };
     uint64_t prefix = 0;
-    if (firstAlloc == withBackup || firstAlloc == propa::kNodeBytes) {
+    if (isPrefix(firstAlloc)) {
         prefix = firstAlloc;
-    } else if (firstAlloc == 0) {
+    } else if (isPrefix(layoutHint)) {
+        // An empty area whose own bytes_used_ names a different layout from
+        // the hint contradicts it, and a contradiction is not read.
+        if (firstAlloc == 0 && isPrefix(bytesUsed) && bytesUsed != layoutHint) return false;
+        prefix = layoutHint;
+        if (bytesUsed < prefix) return false;
+        if (firstAlloc != 0 && (firstAlloc < prefix || firstAlloc >= bytesUsed)) return false;
+    } else if (firstAlloc == 0 && isPrefix(bytesUsed)) {
         // An area holding no properties at all. Its bytes_used_ is still the
         // constructor's, so it names the layout on its own.
-        if (bytesUsed == withBackup || bytesUsed == propa::kNodeBytes) {
-            prefix = bytesUsed;
-        } else {
-            return false;
-        }
+        prefix = bytesUsed;
     } else {
         return false;
     }
@@ -1415,9 +1504,10 @@ static bool auditPropertyTrie(const unsigned char* base, size_t len,
  * mapped. Shared by the two arms below so both read the same surface, and so
  * the maps walk has one implementation to get right.
  */
-static std::vector<std::pair<unsigned long long, unsigned long long>>
-collectPropertyAreaRanges() {
-    std::vector<std::pair<unsigned long long, unsigned long long>> ranges;
+using PropertyAreaRanges = std::vector<std::pair<unsigned long long, unsigned long long>>;
+
+static PropertyAreaRanges collectPropertyAreaRanges() {
+    PropertyAreaRanges ranges;
 
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
     if (!maps.is_open()) return ranges;
@@ -1439,6 +1529,25 @@ collectPropertyAreaRanges() {
 }
 
 /*
+ * The data prefix the mapped areas agree on, read once per scan so the arms
+ * that walk them judge every area against the same layout. Only the header and
+ * the root node of each area are read, through readOwnMemory, so a range that
+ * went away refuses instead of faulting and simply does not vote.
+ */
+static uint32_t propertyLayoutHint(const PropertyAreaRanges& ranges) {
+    std::vector<PropLayoutVote> votes;
+    std::vector<unsigned char> head;
+    const size_t want = propa::kHeaderBytes + propa::kNodeBytes;
+    for (const auto& range : ranges) {
+        const unsigned long long len = range.second - range.first;
+        if (len < want || len > propa::kMaxAreaBytes) continue;
+        if (!readOwnMemory(reinterpret_cast<const void*>(range.first), want, &head)) continue;
+        votes.push_back(propertyLayoutVote(head.data(), static_cast<size_t>(len)));
+    }
+    return agreedPropertyLayout(votes);
+}
+
+/*
  * Asks the two trie invariants of every area this process has mapped.
  *
  * Same discipline as the arm below it, and for the same reasons. Each area is
@@ -1455,11 +1564,12 @@ collectPropertyAreaRanges() {
  * requiring it to parse keeps a violation that is really a misread from being
  * reported as a violation.
  */
-static bool detectPropertyTrieTampering(bool* offPath, bool* outOfOrder) {
+static bool detectPropertyTrieTampering(const PropertyAreaRanges& ranges,
+                                        uint32_t layoutHint,
+                                        bool* offPath, bool* outOfOrder) {
     *offPath = false;
     *outOfOrder = false;
 
-    const auto ranges = collectPropertyAreaRanges();
     if (ranges.empty()) return false;
 
     std::vector<unsigned char> image;
@@ -1473,7 +1583,7 @@ static bool detectPropertyTrieTampering(bool* offPath, bool* outOfOrder) {
 
         PropAreaAccount account;
         if (!accountPropertyArea(image.data(), static_cast<size_t>(len), &account,
-                                 &scratch) ||
+                                 &scratch, layoutHint) ||
             !account.parsed) {
             return false;
         }
@@ -1497,8 +1607,8 @@ static bool detectPropertyTrieTampering(bool* offPath, bool* outOfOrder) {
     return *offPath || *outOfOrder;
 }
 
-static bool detectWipedPropertyAllocations() {
-    const auto ranges = collectPropertyAreaRanges();
+static bool detectWipedPropertyAllocations(const PropertyAreaRanges& ranges,
+                                           uint32_t layoutHint) {
     if (ranges.empty()) return false;
 
     std::vector<unsigned char> image;
@@ -1515,7 +1625,7 @@ static bool detectWipedPropertyAllocations() {
     for (size_t i = 0; i < ranges.size(); i++) {
         const size_t len = snapshot(i);
         if (len == 0) continue;
-        accountPropertyArea(image.data(), len, &first[i], &scratch);
+        accountPropertyArea(image.data(), len, &first[i], &scratch, layoutHint);
     }
 
     bool wiped = false;
@@ -1528,7 +1638,7 @@ static bool detectWipedPropertyAllocations() {
         PropAreaAccount again;
         const size_t len = snapshot(i);
         if (len == 0) continue;
-        if (!accountPropertyArea(image.data(), len, &again, &scratch))
+        if (!accountPropertyArea(image.data(), len, &again, &scratch, layoutHint))
             continue;
         if (!again.parsed || again.couldHaveStranded || !again.unreachableAllZero)
             continue;
@@ -1619,13 +1729,17 @@ static bool detectPropertyInconsistencies() {
         spoofed = true;
     }
 
-    if (detectWipedPropertyAllocations()) {
+    const PropertyAreaRanges propertyAreas = collectPropertyAreaRanges();
+    const uint32_t layoutHint = propertyLayoutHint(propertyAreas);
+
+    if (detectWipedPropertyAllocations(propertyAreas, layoutHint)) {
         reason::note(reason::kPropertyAreaWiped);
         spoofed = true;
     }
 
     bool nameOffPath = false, nameOutOfOrder = false;
-    if (detectPropertyTrieTampering(&nameOffPath, &nameOutOfOrder)) {
+    if (detectPropertyTrieTampering(propertyAreas, layoutHint, &nameOffPath,
+                                    &nameOutOfOrder)) {
         if (nameOffPath) reason::note(reason::kPropertyNameOffPath);
         if (nameOutOfOrder) reason::note(reason::kPropertyNameOutOfOrder);
         spoofed = true;
@@ -4090,7 +4204,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         PropAreaAccount acc;
 
         const size_t areaLen = propa::kHeaderBytes + used;
-        if (!accountPropertyArea(area.data(), areaLen, &acc, &scratch) ||
+        if (!accountPropertyArea(area.data(), areaLen, &acc, &scratch, 0) ||
             !acc.parsed || acc.unreachable != 0 || acc.nodes != 1 || acc.props != 1) {
             LOGD("clean property area did not account exactly: parsed=%d unreachable=%u "
                  "nodes=%u props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.nodes, acc.props);
@@ -4113,7 +4227,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             uint32_t zeroOffset = 0;
             memcpy(busy.data() + propa::kHeaderBytes + info + propa::kLongOffsetField,
                    &zeroOffset, sizeof(zeroOffset));
-            if (!accountPropertyArea(busy.data(), areaLen, &acc, &scratch) ||
+            if (!accountPropertyArea(busy.data(), areaLen, &acc, &scratch, 0) ||
                 !acc.parsed || acc.unreachable != 0 || acc.props != 1) {
                 LOGD("a mutable property with bit 16 in its counter was read as a long "
                      "value: parsed=%d unreachable=%u props=%u", acc.parsed ? 1 : 0,
@@ -4159,7 +4273,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             memcpy(longArea.data(), &lused, sizeof(lused));
 
             const size_t longLen = propa::kHeaderBytes + lused;
-            if (!accountPropertyArea(longArea.data(), longLen, &acc, &scratch) ||
+            if (!accountPropertyArea(longArea.data(), longLen, &acc, &scratch, 0) ||
                 !acc.parsed || acc.unreachable != 0 || acc.props != 1) {
                 LOGD("a read-only long value was not accounted: parsed=%d unreachable=%u "
                      "props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.props);
@@ -4198,7 +4312,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             memcpy(old.data(), &oused, sizeof(oused));
 
             const size_t oldLen = propa::kHeaderBytes + oused;
-            if (!accountPropertyArea(old.data(), oldLen, &acc, &scratch) ||
+            if (!accountPropertyArea(old.data(), oldLen, &acc, &scratch, 0) ||
                 !acc.parsed || acc.unreachable != 0 || acc.nodes != 1 || acc.props != 1) {
                 LOGD("the layout without a dirty backup area did not account: parsed=%d "
                      "unreachable=%u nodes=%u props=%u", acc.parsed ? 1 : 0,
@@ -4214,7 +4328,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             const uint32_t justRoot = propa::kNodeBytes;
             memcpy(empty.data(), &justRoot, sizeof(justRoot));
             if (!accountPropertyArea(empty.data(), propa::kHeaderBytes + 256, &acc,
-                                     &scratch) ||
+                                     &scratch, 0) ||
                 !acc.parsed || acc.unreachable != 0 || acc.props != 0) {
                 LOGD("an empty area without a dirty backup area was refused");
                 failures++;
@@ -4226,7 +4340,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             const uint32_t nonsense = 64;
             memcpy(odd.data() + propa::kHeaderBytes + oroot + 16, &nonsense,
                    sizeof(nonsense));
-            if (accountPropertyArea(odd.data(), oldLen, &acc, &scratch) || acc.parsed) {
+            if (accountPropertyArea(odd.data(), oldLen, &acc, &scratch, 0) || acc.parsed) {
                 LOGD("a first allocation at an unknown offset was accepted");
                 failures++;
             }
@@ -4239,7 +4353,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         uint32_t zero = 0;
         memcpy(delData + node + 4, &zero, sizeof(zero));
         memset(delData + info, 0, infoSize);
-        if (!accountPropertyArea(deleted.data(), areaLen, &acc, &scratch) ||
+        if (!accountPropertyArea(deleted.data(), areaLen, &acc, &scratch, 0) ||
             !acc.parsed || acc.unreachable != infoSize || !acc.unreachableAllZero ||
             acc.props != 0) {
             LOGD("deleted property not accounted as unreachable: parsed=%d unreachable=%u "
@@ -4248,11 +4362,123 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             failures++;
         }
 
+        /*
+         * The same area emptied, as Magisk's prune leaves it when the deleted
+         * property was the last one: the node and the prop_info wiped, 0 stored
+         * into the root's children, bytes_used_ untouched. Only the layout hint
+         * can name its prefix, and then everything past the prefix is
+         * unreachable and zero.
+         */
+        const uint32_t withBackup = propa::kNodeBytes + ((propa::kValueMax + 3u) & ~3u);
+        std::vector<unsigned char> emptied = area;
+        unsigned char* emData = emptied.data() + propa::kHeaderBytes;
+        memset(emData + withBackup, 0, used - withBackup);
+        memcpy(emData + root + 16, &zero, sizeof(zero));
+        if (!accountPropertyArea(emptied.data(), areaLen, &acc, &scratch, withBackup) ||
+            !acc.parsed || acc.unreachable != used - withBackup || !acc.unreachableAllZero ||
+            acc.nodes != 0 || acc.props != 0) {
+            LOGD("an emptied area was not read with the layout hint: parsed=%d "
+                 "unreachable=%u expected=%u zero=%d", acc.parsed ? 1 : 0, acc.unreachable,
+                 used - withBackup, acc.unreachableAllZero ? 1 : 0);
+            failures++;
+        }
+        if (accountPropertyArea(emptied.data(), areaLen, &acc, &scratch, 0) || acc.parsed) {
+            LOGD("an emptied area was read without a layout hint");
+            failures++;
+        }
+        if (propertyLayoutVote(emptied.data(), areaLen).layout != 0 ||
+            propertyLayoutVote(area.data(), areaLen).layout != withBackup ||
+            !propertyLayoutVote(area.data(), areaLen).viaChildren) {
+            LOGD("an area voted for a layout it cannot name, or not for one it can");
+            failures++;
+        }
+
+        /*
+         * Emptied and then refilled: the next property lands at the old
+         * bytes_used_, so the root's children points past a wiped gap and names
+         * no prefix. With the hint the gap is reported.
+         */
+        {
+            std::vector<unsigned char> refilled = emptied;
+            unsigned char* rd = refilled.data() + propa::kHeaderBytes;
+            uint32_t rused = used;
+            const uint32_t rnode = rused;
+            rused += (propa::kNodeBytes + 5 + 3u) & ~3u;
+            const uint32_t rinfo = rused;
+            rused += (propa::kInfoBytes + 5 + 3u) & ~3u;
+            const uint32_t four = 4;
+            memcpy(rd + rnode, &four, sizeof(four));
+            memcpy(rd + rnode + propa::kNodeBytes, "next", 5);
+            memcpy(rd + rnode + 4, &rinfo, sizeof(rinfo));
+            memcpy(rd + rinfo + propa::kInfoBytes, "next", 5);
+            memcpy(rd + rinfo + 4, "1", 2);
+            memcpy(rd + root + 16, &rnode, sizeof(rnode));
+            memcpy(refilled.data(), &rused, sizeof(rused));
+            const size_t refilledLen = propa::kHeaderBytes + rused;
+            if (!accountPropertyArea(refilled.data(), refilledLen, &acc, &scratch,
+                                     withBackup) ||
+                !acc.parsed || acc.unreachable != used - withBackup ||
+                !acc.unreachableAllZero || acc.nodes != 1 || acc.props != 1) {
+                LOGD("a refilled area did not report its gap: parsed=%d unreachable=%u "
+                     "expected=%u", acc.parsed ? 1 : 0, acc.unreachable, used - withBackup);
+                failures++;
+            }
+            if (accountPropertyArea(refilled.data(), refilledLen, &acc, &scratch, 0) ||
+                acc.parsed) {
+                LOGD("a refilled area was read without a layout hint");
+                failures++;
+            }
+        }
+
+        /*
+         * A modern area that never held a property names its own layout, so it
+         * reads clean with or without the hint, and refuses a hint its own
+         * bytes_used_ contradicts.
+         */
+        {
+            std::vector<unsigned char> fresh(propa::kHeaderBytes + 256, 0);
+            memcpy(fresh.data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+            memcpy(fresh.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+            memcpy(fresh.data(), &withBackup, sizeof(withBackup));
+            const uint32_t hints[] = {0, withBackup};
+            for (uint32_t hint : hints) {
+                if (!accountPropertyArea(fresh.data(), fresh.size(), &acc, &scratch, hint) ||
+                    !acc.parsed || acc.unreachable != 0) {
+                    LOGD("a modern empty area did not read clean with hint %u", hint);
+                    failures++;
+                }
+            }
+            if (accountPropertyArea(fresh.data(), fresh.size(), &acc, &scratch,
+                                    propa::kNodeBytes) || acc.parsed) {
+                LOGD("an empty area was read against a hint it contradicts");
+                failures++;
+            }
+            const PropLayoutVote freshVote = propertyLayoutVote(fresh.data(), fresh.size());
+            if (freshVote.layout != withBackup || freshVote.viaChildren) {
+                LOGD("a modern empty area did not vote for its layout");
+                failures++;
+            }
+        }
+
+        // Areas that disagree, or none that can say, give no hint at all, and
+        // neither do empty areas on their own.
+        const PropLayoutVote full{withBackup, true}, empty{withBackup, false}, none{};
+        if (agreedPropertyLayout({full, none, empty}) != withBackup ||
+            agreedPropertyLayout({empty, none, full}) != withBackup ||
+            agreedPropertyLayout({full, {propa::kNodeBytes, true}}) != 0 ||
+            agreedPropertyLayout({full, {propa::kNodeBytes, false}}) != 0 ||
+            agreedPropertyLayout({empty, empty}) != 0 ||
+            agreedPropertyLayout({empty}) != 0 ||
+            agreedPropertyLayout({none, none}) != 0 || agreedPropertyLayout({}) != 0) {
+            LOGD("the layout hint did not follow the votes");
+            failures++;
+        }
+
         // Readings this parser must refuse rather than convict on.
         std::vector<unsigned char> bad = area;
         uint32_t badMagic = 0;
         memcpy(bad.data() + 8, &badMagic, sizeof(badMagic));
-        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch) || acc.parsed) {
+        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch, 0) || acc.parsed) {
             LOGD("a bad magic was accepted");
             failures++;
         }
@@ -4260,19 +4486,19 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         bad = area;
         const uint32_t outOfRange = used + 4096;
         memcpy(bad.data() + propa::kHeaderBytes + node + 16, &outOfRange, sizeof(outOfRange));
-        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch) || acc.parsed) {
+        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch, 0) || acc.parsed) {
             LOGD("an offset past bytes_used was accepted");
             failures++;
         }
 
         bad = area;
         memcpy(bad.data() + propa::kHeaderBytes + node + 8, &node, sizeof(node));
-        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch) || acc.parsed) {
+        if (accountPropertyArea(bad.data(), areaLen, &acc, &scratch, 0) || acc.parsed) {
             LOGD("a node reachable twice was accepted");
             failures++;
         }
 
-        if (accountPropertyArea(area.data(), propa::kHeaderBytes - 1, &acc, &scratch) ||
+        if (accountPropertyArea(area.data(), propa::kHeaderBytes - 1, &acc, &scratch, 0) ||
             acc.parsed) {
             LOGD("a buffer too short for the header was accepted");
             failures++;
@@ -4478,7 +4704,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             if (!isArea || start == 0 || end <= start) continue;
             seen++;
             if (accountPropertyArea(reinterpret_cast<const unsigned char*>(start),
-                                    end - start, &acc, &scratch)) {
+                                    end - start, &acc, &scratch, 0)) {
                 parsed++;
             }
         }
