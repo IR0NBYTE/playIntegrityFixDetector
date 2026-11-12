@@ -285,7 +285,7 @@ object AttestationAnalysis {
         val bootHashMismatch: Boolean,
         val osPatchDisagrees: Boolean = false,
         val vendorPatchCopiedFromSystemProperty: Boolean = false,
-        val malformedDayPrecisionPatchLevel: Boolean = false,
+        val dayZeroPatchLevel: Boolean = false,
         val bootPatchLevelMissing: Boolean = false,
         val attestedBootHashUnusable: Boolean = false,
         val monthPrecisionDayLevel: Boolean = false,
@@ -295,12 +295,12 @@ object AttestationAnalysis {
         val evaluated: Boolean = true,
     ) {
         /**
-         * Four arms drive the verdict: the OS patch level being newer than the
-         * property, the two levels disagreeing behind the strict gate, the boot
-         * hash differing when both sides are real digests, and a day-00 patch
-         * level. Five arms deliberately do not: the two vendor arms, the absent boot patch
-         * level, a month-precision day field, and an attested boot hash that
-         * carries no usable digest.
+         * Three arms drive the verdict: the OS patch level being newer than the
+         * property, the two levels disagreeing behind the strict gate, and the
+         * boot hash differing when both sides are real digests. Six arms
+         * deliberately do not: the two vendor arms, the absent boot patch
+         * level, a month-precision day field, a day-zero patch level, and an
+         * attested boot hash that carries no usable digest.
          *
          * The two VENDOR arms cannot evaluate on a normal install:
          * ro.vendor.build.security_patch is vendor_security_patch_level_prop,
@@ -317,8 +317,13 @@ object AttestationAnalysis {
          *
          * monthPrecisionDayLevel is excluded because an OEM TA that tracks the
          * vendor or boot partition at month granularity is sloppy, not a
-         * spoofer. Only a value that is neither a valid YYYYMMDD nor a valid
-         * YYYYMM reaches malformedDayPrecisionPatchLevel.
+         * spoofer.
+         *
+         * dayZeroPatchLevel is excluded because the HAL permits it. Keymaster
+         * 4.0 types.hal and KeyMint Tag.aidl both say of BOOT_PATCHLEVEL, in the
+         * same words: "If the day is not known, 00 may be substituted." A
+         * bootloader that hands the TA the boot image header's os_patch_level,
+         * which carries only a year and a month, produces exactly that.
          *
          * The boot-hash arm does drive the verdict. VTS verify_root_of_trust
          * asserts the attested hash equals ro.boot.vbmeta.digest whenever AVB
@@ -326,8 +331,7 @@ object AttestationAnalysis {
          * own digest is usable and the algorithm really is sha256.
          */
         val anyMismatch: Boolean get() =
-            osPatchAhead || osPatchDisagrees || bootHashMismatch ||
-                malformedDayPrecisionPatchLevel
+            osPatchAhead || osPatchDisagrees || bootHashMismatch
 
         companion object {
             val NONE = CrossSourceVerdict(false, false, false)
@@ -555,20 +559,25 @@ object AttestationAnalysis {
 
     /**
      * Narrow on purpose: an 8-digit value carrying a real year and a real month
-     * but a day of 00, and nothing else.
+     * but a day of 00, and nothing else. Reported, never a finding.
      *
-     * That exact shape has a named emitter on the bypass side, where a
-     * month-granular config value is multiplied out to the long form, and
-     * AOSP's own GetPatchlevel cannot produce it because its regex requires a
-     * two-digit day drawn from a real date.
+     * This used to be a finding, on the argument that AOSP's GetPatchlevel
+     * cannot produce it because its property regex requires a two-digit day
+     * drawn from a real date. That argument covers the property path only. The
+     * boot and vendor levels can also reach the TA from the bootloader, which
+     * is vendor code, and the HAL itself permits the shape: Keymaster 4.0
+     * types.hal and KeyMint Tag.aidl both say of BOOT_PATCHLEVEL "If the day
+     * is not known, 00 may be substituted." A boot image header's
+     * os_patch_level carries only a year and a month, so a bootloader that
+     * passes it on yields this value on a genuine device. A bypass that
+     * multiplies a month-granular config value out to the long form produces
+     * it too, which is why it is still worth showing.
      *
-     * Every other non-date shape is forgiven and reported instead: a bare
-     * YYYYMM, a zero-padded year like 20250000, and anything else unparseable.
-     * An OEM that tracks a partition at coarser than day granularity is
-     * non-conforming rather than dishonest, and no measurement was available to
-     * show which forms genuine vendors emit.
+     * Every other non-date shape is reported under [dayPrecisionPatchIsMonthOnly]
+     * instead: a bare YYYYMM, a zero-padded year like 20250000, and anything
+     * else unparseable.
      */
-    fun dayPrecisionPatchIsImpossible(raw: Long?): Boolean {
+    fun dayPrecisionPatchHasDayZero(raw: Long?): Boolean {
         if (raw == null || raw <= 0L) return false
         if (normalizeAttestedPatchToYearMonthDay(raw) != null) return false
         if (raw !in 20080000L..20991299L) return false
@@ -580,13 +589,13 @@ object AttestationAnalysis {
 
     /**
      * A day-precision tag carrying something coarser than a day: a bare YYYYMM,
-     * or an 8-digit form that is not a date and is not the day-00 shape above.
+     * or an 8-digit form that is not a date and is not the day-zero shape above.
      * Reported, never a finding.
      */
     fun dayPrecisionPatchIsMonthOnly(raw: Long?): Boolean {
         if (raw == null || raw <= 0L) return false
         if (normalizeAttestedPatchToYearMonthDay(raw) != null) return false
-        return !dayPrecisionPatchIsImpossible(raw)
+        return !dayPrecisionPatchHasDayZero(raw)
     }
 
     /**
@@ -717,9 +726,9 @@ object AttestationAnalysis {
                 vendorPatchCopiedFromSystemProperty =
                     sysPropYmd != null && venPropYmd != null && sysPropYmd != venPropYmd &&
                         vendorYmd != null && vendorYmd == sysPropYmd,
-                malformedDayPrecisionPatchLevel =
-                    dayPrecisionPatchIsImpossible(vendorRaw) ||
-                        dayPrecisionPatchIsImpossible(bootRaw),
+                dayZeroPatchLevel =
+                    dayPrecisionPatchHasDayZero(vendorRaw) ||
+                        dayPrecisionPatchHasDayZero(bootRaw),
                 monthPrecisionDayLevel =
                     dayPrecisionPatchIsMonthOnly(vendorRaw) ||
                         dayPrecisionPatchIsMonthOnly(bootRaw),
