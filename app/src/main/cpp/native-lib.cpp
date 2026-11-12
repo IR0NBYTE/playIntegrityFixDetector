@@ -1878,14 +1878,37 @@ static std::vector<Mapping> readMappings() {
         if (!parseMappingLine(line, &m)) continue;
         out.push_back(std::move(m));
     }
+    // The kernel already lists mappings in address order and they never
+    // overlap; the stable sort only makes that a guarantee findMapping can
+    // rely on, and leaves the kernel's order untouched.
+    std::stable_sort(out.begin(), out.end(),
+                     [](const Mapping& a, const Mapping& b) { return a.start < b.start; });
     return out;
 }
 
-static const Mapping* findMapping(const std::vector<Mapping>& maps, uintptr_t addr) {
+// The first mapping that holds addr, by a linear walk. Kept only so the self
+// test can hold the binary search below to the same answer.
+static const Mapping* findMappingLinear(const std::vector<Mapping>& maps, uintptr_t addr) {
     for (const auto& m : maps) {
         if (addr >= m.start && addr < m.end) return &m;
     }
     return nullptr;
+}
+
+/*
+ * The mapping that holds addr. A binary search over mappings sorted by start
+ * address, which readMappings guarantees: the candidate is the last mapping
+ * starting at or below addr. Mappings from the kernel never overlap, so that
+ * candidate is the only mapping that can hold addr and the answer is the one
+ * the linear walk gives. The GOT scan calls this three times per slot, up to
+ * 250000 slots, so a linear walk over thousands of mappings is not affordable.
+ */
+static const Mapping* findMapping(const std::vector<Mapping>& maps, uintptr_t addr) {
+    auto it = std::upper_bound(maps.begin(), maps.end(), addr,
+                               [](uintptr_t a, const Mapping& m) { return a < m.start; });
+    if (it == maps.begin()) return nullptr;
+    --it;
+    return (addr >= it->start && addr < it->end) ? &*it : nullptr;
 }
 
 static bool readableAt(const std::vector<Mapping>& maps, uintptr_t addr, size_t len) {
@@ -2106,11 +2129,27 @@ static bool inlineHookDetected(const std::vector<Mapping>&, std::string*) { retu
 
 namespace codeint {
 
+/*
+ * The slot budget is per object, with a ceiling over the whole walk. A single
+ * budget of 8000 across the walk was spent on the first few system libraries
+ * in load order (libandroid_runtime, libhwui, libgui and libart alone exceed
+ * it), so this app's own library and anything loaded later were never read.
+ * The ceiling only bounds a pathological process; the debug log of the slots
+ * and objects actually seen is there so it can be sized on a device.
+ */
+constexpr size_t kGotSlotsPerObject = 8000;
+constexpr size_t kGotSlotsTotal = 250000;
+
 struct GotScanState {
     const std::vector<Mapping>* maps;
     std::string offender;
-    int slotsExamined;
+    size_t slotsExamined;
+    int objectsVisited;
     bool found;
+    // The maps snapshot re-read on the first candidate hit, and whether that
+    // has happened. See gotScanCallback.
+    std::vector<Mapping> fresh;
+    bool refreshed;
 };
 
 /*
@@ -2123,7 +2162,8 @@ struct GotScanState {
  */
 static int gotScanCallback(struct dl_phdr_info* info, size_t, void* data) {
     GotScanState* st = static_cast<GotScanState*>(data);
-    if (st->found || st->slotsExamined > 8000) return 1;
+    if (st->found || st->slotsExamined >= kGotSlotsTotal) return 1;
+    st->objectsVisited++;
 
     const ElfW(Dyn)* dyn = nullptr;
     for (int i = 0; i < info->dlpi_phnum; i++) {
@@ -2155,8 +2195,9 @@ static int gotScanCallback(struct dl_phdr_info* info, size_t, void* data) {
     const size_t entSize = (pltrel == DT_RELA) ? sizeof(ElfW(Rela)) : sizeof(ElfW(Rel));
     const size_t count = pltrelsz / entSize;
 
-    for (size_t i = 0; i < count; i++) {
-        if (++st->slotsExamined > 8000) break;
+    for (size_t i = 0; i < count && i < kGotSlotsPerObject; i++) {
+        if (st->slotsExamined >= kGotSlotsTotal) break;
+        st->slotsExamined++;
 
         uintptr_t rOffset;
         if (pltrel == DT_RELA) {
@@ -2181,6 +2222,20 @@ static int gotScanCallback(struct dl_phdr_info* info, size_t, void* data) {
         // An address in no mapping at all is a torn read, not evidence.
         if (!dest) continue;
 
+        // The walk reaches libraries another thread may have loaded after the
+        // maps snapshot was taken, so a slot can point into a mapping the
+        // snapshot lists as anonymous or not at all. On the first candidate
+        // hit the maps are read again, once, and the slot is judged against
+        // that: it is a hit only if it still is one. Every later slot is
+        // judged against the fresh snapshot as well.
+        if (!st->refreshed) {
+            st->refreshed = true;
+            st->fresh = readMappings();
+            st->maps = &st->fresh;
+            dest = findMapping(*st->maps, value);
+            if (!dest || isLegitimateCodeSource(dest->path)) continue;
+        }
+
         const char* owner = (info->dlpi_name && *info->dlpi_name) ? info->dlpi_name : "<main>";
         st->offender = std::string(owner) + " -> " +
             (dest->path.empty() ? "<anonymous>" : dest->path);
@@ -2191,8 +2246,10 @@ static int gotScanCallback(struct dl_phdr_info* info, size_t, void* data) {
 }
 
 static bool gotEntryForeign(const std::vector<Mapping>& maps, std::string* offender) {
-    GotScanState st{&maps, "", 0, false};
+    GotScanState st{&maps, "", 0, 0, false, {}, false};
     dl_iterate_phdr(gotScanCallback, &st);
+    LOGD("GOT scan examined %zu slots across %d objects%s", st.slotsExamined,
+         st.objectsVisited, st.slotsExamined >= kGotSlotsTotal ? " (ceiling reached)" : "");
     if (st.found && offender) *offender = st.offender;
     return st.found;
 }
@@ -2309,6 +2366,22 @@ static int selfTestFailures() {
     if (branchTargetAt(maps, base, &target)) failures++;
 #endif
 #endif  // PIFD_PROLOGUE_SCAN_SUPPORTED
+
+    // The binary search must give the linear walk's answer at both ends of
+    // every live mapping and just outside it.
+    {
+        const std::vector<Mapping> live = readMappings();
+        for (const auto& m : live) {
+            bool same = true;
+            for (uintptr_t a : {m.start, m.end - 1, m.end, m.start - 1})
+                same = same && findMapping(live, a) == findMappingLinear(live, a);
+            if (!same) {
+                LOGD("mapping lookup disagrees with the linear walk");
+                failures++;
+                break;
+            }
+        }
+    }
 
     /*
      * An anonymous executable page is exactly the shape the mapping arm looks
