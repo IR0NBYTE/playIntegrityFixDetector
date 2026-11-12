@@ -348,7 +348,15 @@ data class DetectionResult(
             row: DetectionResult,
             status: ValidityStatus,
         ): DetectionResult {
-            val offender = status.offenderSubject?.let { " ($it)" } ?: ""
+            // A position in the chain, never a name: certificate names carry
+            // the batch serial. See ValidityStatus.offenderPosition.
+            val position = status.offenderPosition
+            val length = status.chainLength
+            val offender = if (position != null && length != null) {
+                " (certificate $position of $length in the chain)"
+            } else {
+                ""
+            }
             return when (status.outcome) {
                 ValidityOutcome.IMPOSSIBLE_WINDOW -> row.copy(
                     detail = "An issuer certificate's validity window starts at or after it " +

@@ -33,7 +33,8 @@ class ChainValidityTest {
         val s = evaluate(chain)
         assertEquals(ValidityOutcome.IMPOSSIBLE_WINDOW, s.outcome)
         assertTrue(s.isFinding)
-        assertTrue(s.offenderSubject!!.contains("intermediate"))
+        assertEquals(2, s.offenderPosition)
+        assertEquals(2, s.chainLength)
     }
 
     @Test
@@ -280,7 +281,7 @@ class ChainValidityTest {
         selfSigned: Boolean = false,
     ): X509Certificate = StubCert(subject, notBefore, notAfter, key, selfSigned)
 
-    private class StubKey(private val id: String) : PublicKey {
+    internal class StubKey(private val id: String) : PublicKey {
         override fun getAlgorithm() = "EC"
         override fun getFormat() = "X.509"
         override fun getEncoded(): ByteArray = id.toByteArray()
@@ -291,7 +292,7 @@ class ChainValidityTest {
      * key and the two principals, so everything else refuses to be called and
      * would surface immediately if the analyser started depending on it.
      */
-    private class StubCert(
+    internal class StubCert(
         private val subject: String,
         private val notBeforeMillis: Long,
         private val notAfterMillis: Long,

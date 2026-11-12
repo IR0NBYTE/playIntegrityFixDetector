@@ -73,8 +73,20 @@ enum class ValidityOutcome {
 
 data class ValidityStatus(
     val outcome: ValidityOutcome,
-    /** Subject of the certificate the outcome refers to, for the row detail. */
-    val offenderSubject: String? = null,
+    /**
+     * Where the certificate the outcome refers to sits in the served chain,
+     * 1-based from the leaf, for the row detail. Null when it could not be
+     * located.
+     *
+     * A position and never a name. Google attestation CA and batch
+     * certificates name themselves by a serialNumber attribute, and
+     * X500Principal.getName() has no keyword for OID 2.5.4.5, so it renders
+     * that value as DER hex. That identifies a provisioning batch or keybox,
+     * and the row detail reaches the exported report.
+     */
+    val offenderPosition: Int? = null,
+    /** Length of the served chain [offenderPosition] counts within. */
+    val chainLength: Int? = null,
     /** How far past the floor the offender lapsed, in days. */
     val daysPastFloor: Long? = null,
 ) {
