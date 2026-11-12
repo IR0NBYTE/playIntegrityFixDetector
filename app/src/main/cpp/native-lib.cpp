@@ -1940,7 +1940,10 @@ static bool isLegitimateCodeSource(const std::string& path) {
         "/data/app/", "/data/data/", "/data/user/", "/data/user_de/",
         "/data/misc/apexdata/", "/data/dalvik-cache/",
         "/mnt/expand/",
-        "/data/local/tmp/", "/data/preloads/",
+        // /data/local/tmp/ is not here: it is shell writable, no platform
+        // loader maps code from it into an app, and it is where frida-server
+        // and its agent are usually pushed.
+        "/data/preloads/",
     };
     for (const char* root : kRoots) {
         if (startsWith(path, root)) return true;
@@ -2450,6 +2453,19 @@ static int selfTestFailures() {
             if (!foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
         }
         if (isLegitimateCodeSource("/memfd:[uprobes] (deleted)")) failures++;
+    }
+
+    // Code mapped from /data/local/tmp/ is foreign.
+    {
+        Mapping m;
+        if (!parseMappingLine(
+                "7b2c400000-7b2c9c0000 r-xp 00000000 fd:30 9012  "
+                "/data/local/tmp/re.frida.server/frida-agent-64.so", &m)) {
+            failures++;
+        } else {
+            std::string offender;
+            if (!foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
+        }
     }
 
     return failures;
