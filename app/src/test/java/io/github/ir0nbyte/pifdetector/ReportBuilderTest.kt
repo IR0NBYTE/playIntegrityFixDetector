@@ -162,4 +162,68 @@ class ReportBuilderTest {
             }
         }
     }
+
+    /**
+     * The one path from a certificate into the report. Google attestation CA
+     * and batch certificates name themselves by a serialNumber attribute, which
+     * X500Principal.getName() renders as DER hex (2.5.4.5=#1310...), so a
+     * banned-word check on "serial" cannot see it. This drives a chain whose
+     * expired batch certificate carries one through the real ChainValidity path
+     * and asserts nothing of its name reaches the text.
+     */
+    @Test
+    fun anExpiredIssuerIsLocatedByPositionAndNeverNamed() {
+        val year2024 = 1_704_067_200_000L
+        val year2026 = 1_767_225_600_000L
+        val year2030 = 1_893_456_000_000L
+        val batch = ChainValidityTest.StubCert(
+            "CN=Droid CA2, O=Google LLC, SERIALNUMBER=e18c4f2ca699739a, T=TEE",
+            year2024 - 1, year2024, ChainValidityTest.StubKey("batch"), false,
+        )
+        val leaf = ChainValidityTest.StubCert(
+            "CN=Android Keystore Key", 0L, year2030, ChainValidityTest.StubKey("leaf"), false,
+        )
+        val root = ChainValidityTest.StubCert(
+            "SERIALNUMBER=f92009e853b6b045", year2024, year2030,
+            ChainValidityTest.StubKey("root"), true,
+        )
+        val status = ChainValidity.evaluate(
+            chain = listOf(leaf, batch, root),
+            pinnedRoots = listOf(root),
+            anchored = true,
+            hardwareBacked = true,
+            attestedPatchYearMonths = emptyList(),
+            systemPatchYearMonth = 202601,
+            nowMillis = year2026,
+        )
+        assertTrue(status.outcome == ValidityOutcome.EXPIRED_ISSUER)
+
+        val r = report()
+        val rows = DetectionResult.fromBitmask(
+            r.bitmask, r.revocation, null, status, null, null, null, r.reasons,
+        )
+        val text = ReportBuilder.build(rows, r, presentation, appVersion = "2.9 (11)")
+        assertTrue(
+            "the offender is still located",
+            text.contains("certificate 2 of 3 in the chain")
+        )
+        for (banned in listOf("2.5.4.5", "#13", "CN=", "SERIALNUMBER", "e18c4f2ca699739a",
+            "f92009e853b6b045", "Droid CA2")) {
+            assertFalse(
+                "the report leaked '$banned'",
+                text.uppercase().contains(banned.uppercase())
+            )
+        }
+    }
+
+    /** An offender that cannot be located renders no position rather than a guess. */
+    @Test
+    fun anUnlocatedOffenderRendersNoPosition() {
+        val status = ValidityStatus(ValidityOutcome.RECENTLY_EXPIRED)
+        val row = DetectionResult.fromBitmask(0, null, null, status)
+            .single { it.flag == DetectionResult.DETECTION_ATTEST_VALIDITY }
+        assertTrue(row.detail!!.contains("lapsed only recently"))
+        assertFalse(row.detail!!.contains("in the chain"))
+        assertFalse(row.detail!!.contains("("))
+    }
 }

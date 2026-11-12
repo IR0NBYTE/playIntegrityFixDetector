@@ -80,7 +80,8 @@ object ChainValidity {
             if (impossible != null) {
                 return ValidityStatus(
                     ValidityOutcome.IMPOSSIBLE_WINDOW,
-                    offenderSubject = subjectOf(impossible),
+                    offenderPosition = positionOf(chain, impossible),
+                    chainLength = chain.size,
                 )
             }
 
@@ -108,14 +109,16 @@ object ChainValidity {
             if (lapsedAt + EXPIRY_MARGIN_MILLIS < floor) {
                 return ValidityStatus(
                     ValidityOutcome.EXPIRED_ISSUER,
-                    offenderSubject = subjectOf(worst),
+                    offenderPosition = positionOf(chain, worst),
+                    chainLength = chain.size,
                     daysPastFloor = (floor - lapsedAt) / MILLIS_PER_DAY,
                 )
             }
             if (lapsedAt < floor) {
                 return ValidityStatus(
                     ValidityOutcome.RECENTLY_EXPIRED,
-                    offenderSubject = subjectOf(worst),
+                    offenderPosition = positionOf(chain, worst),
+                    chainLength = chain.size,
                 )
             }
             ValidityStatus(ValidityOutcome.VERIFIED)
@@ -200,6 +203,13 @@ object ChainValidity {
         return cal.get(Calendar.YEAR)
     }
 
-    private fun subjectOf(cert: X509Certificate): String? =
-        runCatching { cert.subjectX500Principal.name }.getOrNull()
+    /**
+     * 1-based position of [cert] in [chain], or null when it is not there. The
+     * certificate's name is deliberately not used: see
+     * [ValidityStatus.offenderPosition].
+     */
+    internal fun positionOf(chain: List<X509Certificate>, cert: X509Certificate): Int? {
+        val index = chain.indexOfFirst { it === cert }
+        return if (index < 0) null else index + 1
+    }
 }
