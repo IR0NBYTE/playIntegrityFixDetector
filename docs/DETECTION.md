@@ -219,6 +219,43 @@ would close it, and says what to do if a stock device ever trips the arm.
 
 The reason table goes from 51 codes to 52.
 
+## Outcome (3.3, 2026-11-12)
+
+Mostly a release about being wrong less. Two independent reviews of the code
+were run beside the usual watch, and what they found outweighs what the watch
+did.
+
+| Item | Outcome | Evidence |
+|---|---|---|
+| Ten ways a genuine device could set a bit | Fixed | A boot patch level of `YYYYMM00` was convicted although Keymaster 4.0 `types.hal:805` and KeyMint `Tag.aidl:817` both say "If the day is not known, 00 may be substituted." The 128 byte challenge limit behind 1103 and 1104 is stated only by KeyMint and was applied to every generation. 508 (the OEM unlocking toggle) and 306 (a busybox binary, which OEMs ship on read-only partitions) each set a bit alone. 1002 would fire on every x86_64 image because `[vsyscall]` was not allowlisted. 203 matched any socket whose remote port was 27042. Bare maps needles matched inside the random install path. 1203 convicted an unrecognised attestation root. 1205 could be driven by the mapping-count heuristic 904. 807 could mistake an allocation in flight for a deletion scar |
+| Reason 810, a Build constant that no longer matches its property | Landed, **witnessed both ways** | `JingMatrix/TEESimulator#327` (`bcf144953`, open) writes the values it attests into the live properties from the service stage, which defeats the attested patch level comparison and leaves nothing in the property area. `ro.*` is write-once for init and `android.os.Build` reads each property once, so a difference means a late rewrite. Silent on six devices, fired on an API 34 emulator after `ro.build.tags` was rewritten, silent again after restore |
+| Reasons 808, 809 and 905 | Landed on 2026-11-06, **retail witness now taken** | A stock SM-G780G and a stock moto g04 return `0x0` with no reasons, and every tmpfs source on both is `tmpfs`. Before this the only negative witnesses were emulators |
+| Attestation rows that lit with nothing under them | Fixed | Reasons 1201 to 1206 name the six arms of the anomaly bit and 1114 to 1124 the eleven arms of the active probe, whose mask is now derived from its reason |
+| The exported report carried a certificate name | Fixed | The validity row printed an issuer's subject, which on Google batch certificates is a `serialNumber` attribute rendered as hex. It prints the certificate's position in the chain |
+| A property area emptied by delete-and-prune was refused | Fixed before it shipped | Introduced by the prefix read of 2026-11-06 and never in a release. The layout now comes from what the device's other areas agree on |
+| The code integrity self test never ran | Fixed | `codeint::selfTestFailures` arrived on 2026-10-08 with a comment saying it runs on every device and was called by nothing. It returns zero failures on six devices now that it is |
+| What the station Pixel 7a actually is | Corrected | It had been read as a genuine Pixel since 2026-10-09. It is rooted: Magisk 28.1 with Zygisk, the denylist, Shamiko and Vector. No keystore module is installed, so its KeyMint answers are still hardware answers, but it is not a stock negative |
+
+Measured on the release tree: a stock SM-G780G and a stock moto g04 return
+`0x0 []`; the rooted Pixel 7a returns `0x4104 [305, 901, 905, 1206]` with
+Shamiko hiding root and the boot properties claiming a green locked device;
+the rooted SM-A065F returns `0x4186 [201, 305, 308, 807, 901, 902, 905, 1206]`,
+unchanged from before the fixes. 457 unit tests and 44 non-UI instrumented
+tests pass on all six devices. The twelve UI tests did not run this round.
+
+This is the second release in a row to correct what a bench device is, and
+the third time a check here was found not to be running at all. Both are the
+same lesson: a result nobody tried to falsify is not a result.
+
+Three things were decided against the detector and are written down as such
+in COVERAGE.md. A forged chain under a home-made root now reads as
+unverifiable where it used to be convicted. A simulator that claims a
+pre-KeyMint attestation version is judged by neither 1103 nor 1104. And 810
+cannot tell a late resetprop from something that rewrites `Build` fields in
+the Java layer inside this process.
+
+The reason table goes from 52 codes to 74.
+
 ## Sequencing
 
 1. D1 first. It is the smallest change with the highest live value and it closes
