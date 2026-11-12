@@ -465,9 +465,10 @@ object AttestationAnalysis {
     }
 
     /**
-     * The fourth RootOfTrust field, present from KeyMint v3. Deliberately not a
-     * member of [RootOfTrust]: that is a data class, and a ByteArray member
-     * would make its generated equals reference-based.
+     * The fourth RootOfTrust field, present from attestation version 3, which
+     * is Keymaster 4.0. Deliberately not a member of [RootOfTrust]: that is a
+     * data class, and a ByteArray member would make its generated equals
+     * reference-based.
      */
     fun parseVerifiedBootHash(extensionValue: ByteArray): ByteArray? {
         return try {
@@ -812,8 +813,9 @@ object AttestationAnalysis {
     /**
      * KeyDescription.keymasterVersion, child index 2. This is the TA's own
      * version, distinct from attestationVersion, which versions the record
-     * schema. Schema v1 has seven members and still carries this at index 2, so
-     * the fixed low index resolves on every generation.
+     * schema. Schema v1, from Keymaster 2, has the same eight members and
+     * carries this at index 2, so the fixed low index resolves on every
+     * generation.
      */
     fun parseKeymasterVersion(extensionValue: ByteArray): Int? =
         parseKeyDescriptionInteger(extensionValue, KEYMASTER_VERSION_INDEX)
