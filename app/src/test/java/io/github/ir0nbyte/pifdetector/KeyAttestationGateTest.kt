@@ -131,4 +131,58 @@ class KeyAttestationGateTest {
             with.filter { it.flag != DetectionResult.DETECTION_ATTEST_ANOMALY },
         )
     }
+
+    // ---- what drives 1205 and 1206 ----------------------------------------
+
+    @Test
+    fun onlyStructuralRootHidingDrivesTheBootContradiction() {
+        for (code in listOf(901, 902, 903, 905)) {
+            assertTrue("$code", KeyAttestationProbe.deviceTampered(listOf(201, code)))
+        }
+        assertFalse(
+            "904 is a mapping-count heuristic",
+            KeyAttestationProbe.deviceTampered(listOf(904))
+        )
+        assertFalse(KeyAttestationProbe.deviceTampered(emptyList()))
+        assertFalse(KeyAttestationProbe.deviceTampered(listOf(501, 504, 1206)))
+    }
+
+    /**
+     * A ROOT_HIDER code that is in neither set fails here, so adding a 9xx arm
+     * forces someone to say whether it is structural evidence.
+     */
+    @Test
+    fun everyRootHiderCodeIsClassifiedAsStructuralOrHeuristic() {
+        val rootHider = ReasonCodes.knownCodes
+            .filter { ReasonCodes.flagOf(it) == DetectionResult.DETECTION_ROOT_HIDER }
+            .toSet()
+        val structural = KeyAttestationProbe.STRUCTURAL_ROOT_HIDER_REASONS
+        val heuristic = KeyAttestationProbe.HEURISTIC_ROOT_HIDER_REASONS
+        assertEquals(setOf(904), heuristic)
+        assertEquals("a code cannot be both", emptySet<Int>(), structural intersect heuristic)
+        assertEquals(
+            "ROOT_HIDER codes with no 1205 decision",
+            emptySet<Int>(),
+            rootHider - structural - heuristic,
+        )
+        assertEquals(
+            "a classified code that is not a ROOT_HIDER code",
+            emptySet<Int>(),
+            (structural + heuristic) - rootHider,
+        )
+    }
+
+    @Test
+    fun propertiesClaimLockedOnlyWhenTheEngineReported() {
+        assertTrue(KeyAttestationProbe.propertiesClaimLocked(0, nativeReported = true))
+        assertFalse(
+            "a silent engine is not a claim",
+            KeyAttestationProbe.propertiesClaimLocked(0, nativeReported = false)
+        )
+        assertFalse(
+            KeyAttestationProbe.propertiesClaimLocked(
+                DetectionResult.DETECTION_BOOTLOADER, nativeReported = true
+            )
+        )
+    }
 }

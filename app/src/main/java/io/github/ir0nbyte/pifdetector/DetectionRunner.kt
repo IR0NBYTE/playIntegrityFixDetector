@@ -56,14 +56,17 @@ class DetectionRunner {
         executor.execute {
             // A null or empty array means the engine could not report. Treat
             // it as a clean mask with no reasons rather than guessing.
-            val engine = isIntegrityTampered(appContext) ?: IntArray(1)
+            val rawEngine = isIntegrityTampered(appContext)
+            val nativeReported = rawEngine != null && rawEngine.isNotEmpty()
+            val engine = rawEngine ?: IntArray(1)
             val nativeMask = engine.firstOrNull() ?: 0
             val reasons = if (engine.size > 1) engine.drop(1) else emptyList()
             // Read once per run so both probes see the same identity.
             val presentation = DeviceIdentity.fromRuntime(appContext)
             val facts = deviceFacts()
             val passive = attestationProbe.probe(
-                nativeMask, onlineRefreshEnabled, appContext, facts, presentation
+                nativeMask, reasons, nativeReported, onlineRefreshEnabled, appContext, facts,
+                presentation,
             )
 
             // An unrecognised root is the same observation the active probe's
