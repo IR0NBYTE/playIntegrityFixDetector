@@ -166,7 +166,7 @@ class ReportBuilderTest {
     /**
      * The one path from a certificate into the report. Google attestation CA
      * and batch certificates name themselves by a serialNumber attribute, which
-     * X500Principal.getName() renders as DER hex (2.5.4.5=#1310...), so a
+     * X500Principal.getName() renders as DER hex (2.5.4.5=#1310 and the bytes), so a
      * banned-word check on "serial" cannot see it. This drives a chain whose
      * expired batch certificate carries one through the real ChainValidity path
      * and asserts nothing of its name reaches the text.
