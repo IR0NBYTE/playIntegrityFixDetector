@@ -4,10 +4,11 @@ package io.github.ir0nbyte.pifdetector
  * Human text for the reason codes a run produces beside the bitmask.
  *
  * Most come from the native engine. The 1100 family comes from
- * [KeystoreBoundary], [AttestedIdentity], [StrongBoxCheck] and
- * [CompanionAlgorithmCheck], which run in Kotlin because the requests they make
- * are framework API calls, so [ReasonCodesSyncTest] checks this table against
- * all five producers rather than against native-lib.cpp alone.
+ * [KeystoreBoundary], [AttestedIdentity], [StrongBoxCheck],
+ * [CompanionAlgorithmCheck] and [ActiveAttestationProbe], and the 1200 family
+ * from [KeyAttestationProbe]. Those run in Kotlin because the requests they
+ * make are framework API calls, so [ReasonCodesSyncTest] checks this table
+ * against all seven producers rather than against native-lib.cpp alone.
  *
  * A detection used to be a lit row and nothing else, so the only way to learn
  * which needle, property or path actually fired was to attach a debugger to the
@@ -157,6 +158,40 @@ object ReasonCodes {
         Reason(1113, DetectionResult.DETECTION_ATTEST_FORGERY,
             "The same keystore served a Google-rooted hardware chain for one " +
                 "key algorithm and the AOSP software fallback for the other"),
+
+        Reason(1114, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "An attestation key request came back as a single self-signed " +
+                "certificate instead of a chain"),
+        Reason(1115, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "In the attestation key chain, a certificate does not verify " +
+                "against the one that issued it"),
+        Reason(1116, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "In the attestation key chain, a certificate was issued by " +
+                "something that is not a certificate authority"),
+        Reason(1117, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The attestation key record does not carry the challenge that " +
+                "was asked for"),
+        Reason(1118, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The attestation key chain claims hardware but is not anchored to " +
+                "a published Google root, while the ordinary chain was clean"),
+        Reason(1119, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "An authentication-bound key request came back as a single " +
+                "self-signed certificate instead of a chain"),
+        Reason(1120, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "In the authentication-bound key chain, a certificate does not " +
+                "verify against the one that issued it"),
+        Reason(1121, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "In the authentication-bound key chain, a certificate was issued " +
+                "by something that is not a certificate authority"),
+        Reason(1122, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The authentication-bound key's certificate signature follows the " +
+                "SHA-512 digest requested for the key itself"),
+        Reason(1123, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The authentication-bound key record does not carry the challenge " +
+                "that was asked for"),
+        Reason(1124, DetectionResult.DETECTION_ATTEST_FORGERY,
+            "The authentication-bound key record says no user authentication " +
+                "is required, although the request required it"),
 
         Reason(1201, DetectionResult.DETECTION_ATTEST_ANOMALY,
             "A certificate in the attestation chain does not verify against " +

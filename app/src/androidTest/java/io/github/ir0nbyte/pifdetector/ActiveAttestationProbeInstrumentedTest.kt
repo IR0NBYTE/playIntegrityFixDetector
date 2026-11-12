@@ -31,7 +31,7 @@ class ActiveAttestationProbeInstrumentedTest {
                 DeviceIdentity.presentsAsPhysicalHardware(presentation)
         )
         for (passiveFlagged in listOf(false, true)) {
-            val result = ActiveAttestationProbe().probe(passiveFlagged, presentation)
+            val result = ActiveAttestationProbe().probe(passiveFlagged, presentation).mask
             Log.i(DIAG_TAG, "probe(passiveFlagged=$passiveFlagged) = 0x${result.toString(16)}")
             assertTrue(
                 "probe must return 0, ATTEST_FORGERY or ATTEST_SOFTWARE, got 0x${result.toString(16)}",
@@ -44,8 +44,8 @@ class ActiveAttestationProbeInstrumentedTest {
 
     @Test
     fun passiveFlaggedNeverIncreasesTheActiveVerdict() {
-        val loud = ActiveAttestationProbe().probe(false, presentation)
-        val quiet = ActiveAttestationProbe().probe(true, presentation)
+        val loud = ActiveAttestationProbe().probe(false, presentation).mask
+        val quiet = ActiveAttestationProbe().probe(true, presentation).mask
         Log.i(DIAG_TAG, "suppression: unsuppressed=0x${loud.toString(16)} suppressed=0x${quiet.toString(16)}")
         assertTrue(
             "suppressing anchoring must not add findings",

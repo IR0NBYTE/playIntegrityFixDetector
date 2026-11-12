@@ -20,8 +20,9 @@ data class DetectionReport(
 
     /**
      * Reason codes naming which sub-probe set a bit, from the native engine,
-     * the keystore boundary probe, the attested identity probe, the StrongBox
-     * probe and the companion algorithm probe. Advisory: a bit with no reason
+     * the key attestation probe, the active attestation probe, the keystore
+     * boundary probe, the attested identity probe, the StrongBox probe and the
+     * companion algorithm probe. Advisory: a bit with no reason
      * is still set, so an unwired check simply reports nothing extra.
      */
     val reasons: List<Int> = emptyList(),
@@ -72,7 +73,7 @@ class DetectionRunner {
             // An unrecognised root is the same observation the active probe's
             // own unanchored arm would convict, so it counts as already
             // explained rather than as a clean passive run.
-            val activeMask = activeAttestationProbe.probe(
+            val active = activeAttestationProbe.probe(
                 passive.mask != 0 || passive.rootUnrecognised, presentation
             )
             val boundary = boundaryProbe.probe()
@@ -80,7 +81,7 @@ class DetectionRunner {
             val strongBox = strongBoxProbe.probe(appContext)
             val companionAlgorithm = companionAlgorithmProbe.probe()
             val report = DetectionReport(
-                bitmask = nativeMask or passive.mask or activeMask or boundary.mask or
+                bitmask = nativeMask or passive.mask or active.mask or boundary.mask or
                     identity.mask or strongBox.mask or companionAlgorithm.mask,
                 revocation = passive.revocation,
                 crossSource = passive.crossSource,
@@ -89,7 +90,7 @@ class DetectionRunner {
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
                 companionAlgorithm = companionAlgorithm.verdict,
-                reasons = reasons + passive.reasons + boundary.reasons +
+                reasons = reasons + passive.reasons + active.reasons + boundary.reasons +
                     identity.reasons + strongBox.reasons + companionAlgorithm.reasons,
                 presentation = presentation,
                 rootUnrecognised = passive.rootUnrecognised,
