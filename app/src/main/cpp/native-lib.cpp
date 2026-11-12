@@ -4238,9 +4238,14 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
      * Fixtures for accountPropertyArea, built by the same rules bionic's
      * allocator follows: a root node, the dirty backup area beside it, then one
      * named trie node carrying one property.
+     *
+     * The area is a stock-size 128 KiB one with its contents at the front, not
+     * a buffer exactly as long as what it holds. An area that full could have
+     * stranded an allocation by itself, and the arm skips it, so a fixture that
+     * small would prove a finding the arm never makes.
      */
     {
-        std::vector<unsigned char> area(propa::kHeaderBytes + 1024, 0);
+        std::vector<unsigned char> area(propa::kHeaderBytes + (128u << 10), 0);
         unsigned char* data = area.data() + propa::kHeaderBytes;
         uint32_t used = 0;
         auto alloc = [&](uint32_t size) -> uint32_t {
@@ -4275,7 +4280,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         std::vector<unsigned char> scratch;
         PropAreaAccount acc;
 
-        const size_t areaLen = propa::kHeaderBytes + used;
+        const size_t areaLen = area.size();
         if (!accountPropertyArea(area.data(), areaLen, &acc, &scratch, 0) ||
             !acc.parsed || acc.unreachable != 0 || acc.nodes != 1 || acc.props != 1) {
             LOGD("clean property area did not account exactly: parsed=%d unreachable=%u "
@@ -4325,16 +4330,22 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             memcpy(longArea.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
             const uint32_t lroot = lalloc(propa::kNodeBytes);
             lalloc(propa::kValueMax);
-            const char* lseg = "ro";
-            const uint32_t lnode = lalloc(propa::kNodeBytes + 3);
-            memcpy(ld + lnode + propa::kNodeBytes, lseg, 3);
+            // "ro.a" is two segments, so the property hangs off a node "a"
+            // under the node "ro", as find_property builds it.
+            const uint32_t outerNode = lalloc(propa::kNodeBytes + 3);
+            memcpy(ld + outerNode + propa::kNodeBytes, "ro", 3);
             const uint32_t two = 2;
-            memcpy(ld + lnode, &two, sizeof(two));
+            memcpy(ld + outerNode, &two, sizeof(two));
+            const uint32_t lnode = lalloc(propa::kNodeBytes + 2);
+            memcpy(ld + lnode + propa::kNodeBytes, "a", 2);
+            const uint32_t one = 1;
+            memcpy(ld + lnode, &one, sizeof(one));
+            memcpy(ld + outerNode + 16, &lnode, sizeof(lnode));
             const char* lname = "ro.a";
             const uint32_t linfo = lalloc(propa::kInfoBytes + 5);
             memcpy(ld + linfo + propa::kInfoBytes, lname, 5);
             memcpy(ld + lnode + 4, &linfo, sizeof(linfo));
-            memcpy(ld + lroot + 16, &lnode, sizeof(lnode));
+            memcpy(ld + lroot + 16, &outerNode, sizeof(outerNode));
             // The long value itself, and the self relative offset that reaches it.
             const uint32_t lvalue = lalloc(8);
             memcpy(ld + lvalue, "longval", 8);
@@ -4349,6 +4360,18 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
                 !acc.parsed || acc.unreachable != 0 || acc.props != 1) {
                 LOGD("a read-only long value was not accounted: parsed=%d unreachable=%u "
                      "props=%u", acc.parsed ? 1 : 0, acc.unreachable, acc.props);
+                failures++;
+            }
+            // And the trie it hangs in keeps both invariants, so the fixture
+            // is a device bionic could build and not merely one this parser
+            // tolerates.
+            PropTrieAudit longAudit;
+            if (!auditPropertyTrie(longArea.data(), longLen, &longAudit, &scratch) ||
+                !longAudit.parsed || longAudit.nodes != 2 || longAudit.props != 1 ||
+                longAudit.nameOffPath || longAudit.nameOutOfOrder) {
+                LOGD("the long value fixture breaks a trie invariant: nodes=%u offPath=%d "
+                     "outOfOrder=%d", longAudit.nodes, longAudit.nameOffPath ? 1 : 0,
+                     longAudit.nameOutOfOrder ? 1 : 0);
                 failures++;
             }
         }
@@ -4439,6 +4462,20 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             LOGD("a zero run ending at bytes_used was not marked as the tail");
             failures++;
         }
+        // With room to spare the arm would judge this area, which is the
+        // point of the fixture.
+        if (acc.couldHaveStranded) {
+            LOGD("the deletion fixture is one the arm would skip as nearly full");
+            failures++;
+        }
+        // The same deletion in an area with almost no room left is one AOSP
+        // could have left by itself, and the arm must skip it.
+        if (!accountPropertyArea(deleted.data(), propa::kHeaderBytes + used + 64, &acc,
+                                 &scratch, 0) ||
+            !acc.parsed || !acc.couldHaveStranded) {
+            LOGD("a nearly full area was not marked as able to strand an allocation");
+            failures++;
+        }
 
         /*
          * The same area emptied, as Magisk's prune leaves it when the deleted
@@ -4492,7 +4529,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             memcpy(rd + rinfo + 4, "1", 2);
             memcpy(rd + root + 16, &rnode, sizeof(rnode));
             memcpy(refilled.data(), &rused, sizeof(rused));
-            const size_t refilledLen = propa::kHeaderBytes + rused;
+            const size_t refilledLen = refilled.size();
             if (!accountPropertyArea(refilled.data(), refilledLen, &acc, &scratch,
                                      withBackup) ||
                 !acc.parsed || acc.unreachable != used - withBackup ||
@@ -4597,7 +4634,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
      * the only case an in-place rename can get wrong.
      */
     {
-        std::vector<unsigned char> area(propa::kHeaderBytes + 2048, 0);
+        std::vector<unsigned char> area(propa::kHeaderBytes + (128u << 10), 0);
         unsigned char* data = area.data() + propa::kHeaderBytes;
         uint32_t used = 0;
         auto alloc = [&](uint32_t size) -> uint32_t {
@@ -4636,9 +4673,25 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         wr(nodeA + 12, nodeB);       // "bb" to its right, which is the order
         wrHdr(0, used);
 
-        const size_t areaLen = propa::kHeaderBytes + used;
+        const size_t areaLen = area.size();
         std::vector<unsigned char> scratch;
         PropTrieAudit audit;
+
+        // The trie arm only speaks about an area accountPropertyArea also
+        // parses, so every fixture here that stands for something a device can
+        // hold has to pass that gate too, or the arm would never see it.
+        auto passesGate = [&](const std::vector<unsigned char>& buf, size_t len,
+                              const char* what) {
+            (void)what;   // only LOGD reads it, and release builds compile that out
+            PropAreaAccount gate;
+            std::vector<unsigned char> gateScratch;
+            if (!accountPropertyArea(buf.data(), len, &gate, &gateScratch, 0) ||
+                !gate.parsed) {
+                LOGD("trie fixture '%s' does not parse in accountPropertyArea", what);
+                failures++;
+            }
+        };
+        passesGate(area, areaLen, "well formed");
 
         if (!auditPropertyTrie(area.data(), areaLen, &audit, &scratch) ||
             !audit.parsed || audit.nodes != 2 || audit.props != 2 ||
@@ -4656,6 +4709,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             unsigned char* badData = bad.data() + propa::kHeaderBytes;
             memcpy(badData + nodeA + propa::kNodeBytes, "bb", 3);
             memcpy(badData + nodeB + propa::kNodeBytes, "aa", 3);
+            passesGate(bad, areaLen, "segments swapped");
             if (!auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) ||
                 !audit.nameOutOfOrder) {
                 LOGD("a level out of cmp_prop_name order was not reported");
@@ -4671,6 +4725,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             uint32_t info = 0;
             memcpy(&info, badData + nodeA + 4, sizeof(info));
             memcpy(badData + info + propa::kInfoBytes, "zz", 3);
+            passesGate(bad, areaLen, "prop_info renamed");
             if (!auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) ||
                 !audit.nameOffPath) {
                 LOGD("a prop_info name off its trie path was not reported");
@@ -4714,6 +4769,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             memcpy(nested.data(), &nused, sizeof(nused));
 
             const size_t nestedLen = propa::kHeaderBytes + nused;
+            passesGate(nested, nestedLen, "two segment path");
             if (!auditPropertyTrie(nested.data(), nestedLen, &audit, &scratch) ||
                 !audit.parsed || audit.props != 1 || audit.nameOffPath) {
                 LOGD("a two segment path was not joined to its prop_info name");
@@ -4722,6 +4778,7 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
 
             // Same tree, prop_info renamed to the last segment alone.
             memcpy(nd + info + propa::kInfoBytes, "build\0\0\0", 9);
+            passesGate(nested, nestedLen, "last segment only");
             if (!auditPropertyTrie(nested.data(), nestedLen, &audit, &scratch) ||
                 !audit.nameOffPath) {
                 LOGD("a prop_info holding only its last segment was accepted");
