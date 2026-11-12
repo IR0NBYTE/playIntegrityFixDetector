@@ -2834,8 +2834,13 @@ static bool detectRootManagerApp(JNIEnv *env, jobject context) {
 }
 
 /*
- * Every path here is one only root can create. /data/local/tmp was removed on
- * 2026-10-29 for failing that test: it is shell:shell drwxrwx--x, so adb push
+ * No app or shell user can create any path here on a shipped device, but that
+ * is a statement about after shipping, not about what the OEM put in the
+ * image: the build system is root, and some vendors leave busybox in
+ * /system/bin, /system/xbin or /vendor/bin of a production image. So
+ * detectBusyBox only answers whether one is present and notes nothing; the
+ * caller records it only beside another root arm. /data/local/tmp was
+ * removed on 2026-10-29 for failing the shipped-device test: it is shell:shell drwxrwx--x, so adb push
  * writes an su named file there on any device with developer options on, and
  * anything left behind by unrelated work stays. Finding one said somebody once
  * copied a file, not that the device was rooted. /data/local itself is
@@ -2873,10 +2878,7 @@ static bool detectBusyBox() {
         Deobfuscate(base64_decode("HzwlNS1mXDcnICBmSDotL2MrRSs9IyMx")),
     };
     for (const auto& p : paths) {
-        if (access(p.c_str(), F_OK) == 0) {
-            reason::note(reason::kBusyBoxPresent);
-            return true;
-        }
+        if (access(p.c_str(), F_OK) == 0) return true;
     }
     return false;
 }
@@ -3211,9 +3213,14 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
             bool zygisk = false;
             if (isZygiskActiveEnhanced()) zygisk = true;
             if (detectSuBinary()) zygisk = true;
-            if (detectBusyBox()) zygisk = true;
+            const bool busybox = detectBusyBox();
             if (detectLegacyRootArtifacts()) zygisk = true;
             if (detectRootManagerApp(e, o)) zygisk = true;
+            /*
+             * Busybox alone is not root: OEMs ship it in read-only images.
+             * It corroborates another arm here and never sets the bit itself.
+             */
+            if (busybox && zygisk) reason::note(reason::kBusyBoxPresent);
             if (zygisk) r |= DETECTION_ZYGISK;
             r |= detectMountArtifacts();
             bool hider = false;
