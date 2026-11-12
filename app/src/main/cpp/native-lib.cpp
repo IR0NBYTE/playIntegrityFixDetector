@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <cstring>
+#include <strings.h>
 #include <dirent.h>
 #include <chrono>
 #include <algorithm>
@@ -2491,6 +2492,26 @@ static bool tryConnectLoopback(uint16_t port) {
 }
 
 /*
+ * One row of /proc/net/tcp or tcp6, whose columns open with sl, local_address,
+ * rem_address and st.
+ * Fires only for a socket whose LOCAL port is 27042 or 27043 (69A2, 69A3) and
+ * whose state is 0A, LISTEN. Matching ":69A2" anywhere on the line also hit
+ * the remote address column, so any app's outgoing connection to a server on
+ * that port read as a Frida server on this device. The header row has no
+ * hex port in column two and stays silent.
+ */
+static bool isFridaListenerRow(const char* line) {
+    if (!line) return false;
+    char sl[32] = {0}, local[96] = {0}, remote[96] = {0}, st[8] = {0};
+    if (sscanf(line, " %31s %95s %95s %7s", sl, local, remote, st) != 4) return false;
+    const char* colon = strrchr(local, ':');
+    if (!colon || strlen(colon + 1) != 4) return false;
+    const char* port = colon + 1;
+    const bool fridaPort = strcasecmp(port, "69A2") == 0 || strcasecmp(port, "69A3") == 0;
+    return fridaPort && strcasecmp(st, "0A") == 0;
+}
+
+/*
  * Each arm records its own code. They are evaluated rather than chained with
  * ||, for the reason the root family already carries: a chain of || records
  * only the first arm, so a process with an agent mapped and a port open
@@ -2525,8 +2546,7 @@ static bool detectFridaPort() {
         procread::Budget budget;
         while (fgets(line, sizeof(line), fp)) {
             if (!budget.take(strlen(line))) break;
-            if (strstr(line, ":69A2") || strstr(line, ":69a2") ||
-                strstr(line, ":69A3") || strstr(line, ":69a3")) {
+            if (isFridaListenerRow(line)) {
                 socketInTable = true;
                 break;
             }
@@ -4161,6 +4181,28 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             LOGD("no mapped property area parsed (%d seen), the layout does not match",
                  seen);
             failures++;
+        }
+    }
+
+    /*
+     * The procfs socket arm fires on a local listener on 27042 or 27043 and on
+     * nothing else: not a connection to a remote 27042, not an established
+     * socket that happens to own the port, not the header.
+     */
+    {
+        struct TcpRowCase { const char* line; bool expected; };
+        static const TcpRowCase kTcpRows[] = {
+            {"   0: 0100007F:69A2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  2000        0 41234 1 0000000000000000 100 0 0 10 0", true},
+            {"   1: 00000000000000000000000001000000:69a3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  2000        0 41235 1 0000000000000000 100 0 0 10 0", true},
+            {"   2: 0F02000A:A1B4 22B8F45D:69A2 01 00000000:00000000 00:00000000 00000000 10123        0 51234 1 0000000000000000 20 4 30 10 -1", false},
+            {"   3: 0100007F:69A2 0100007F:C350 01 00000000:00000000 00:00000000 00000000  2000        0 51235 1 0000000000000000 20 4 30 10 -1", false},
+            {"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode", false},
+        };
+        for (const auto& c : kTcpRows) {
+            if (isFridaListenerRow(c.line) != c.expected) {
+                LOGD("tcp row case wrong: '%.40s'", c.line);
+                failures++;
+            }
         }
     }
 
