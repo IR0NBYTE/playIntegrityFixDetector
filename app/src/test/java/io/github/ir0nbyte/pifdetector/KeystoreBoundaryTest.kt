@@ -19,21 +19,28 @@ class KeystoreBoundaryTest {
     private val cleanNoChallenge =
         KeystoreBoundary.NoChallengeShape(selfSigned = true, carriesAttestationRecord = false)
     private val refused =
-        KeystoreBoundary.ChallengeOutcome(accepted = false, securityLevel = null)
+        KeystoreBoundary.ChallengeOutcome(
+            accepted = false, securityLevel = null, attestationVersion = null
+        )
     private val acceptedInHardware = KeystoreBoundary.ChallengeOutcome(
         accepted = true,
         securityLevel = AttestationAnalysis.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
+        attestationVersion = 300,
     )
     private val acceptedInStrongBox = KeystoreBoundary.ChallengeOutcome(
         accepted = true,
         securityLevel = AttestationAnalysis.SECURITY_LEVEL_STRONGBOX,
+        attestationVersion = 300,
     )
     private val acceptedInSoftware = KeystoreBoundary.ChallengeOutcome(
         accepted = true,
         securityLevel = AttestationAnalysis.SECURITY_LEVEL_SOFTWARE,
+        attestationVersion = 300,
     )
     private val acceptedWithNoRecord =
-        KeystoreBoundary.ChallengeOutcome(accepted = true, securityLevel = null)
+        KeystoreBoundary.ChallengeOutcome(
+            accepted = true, securityLevel = null, attestationVersion = null
+        )
 
     private fun evaluate(
         noChallenge: KeystoreBoundary.NoChallengeShape? = cleanNoChallenge,
@@ -136,18 +143,81 @@ class KeystoreBoundaryTest {
         assertEquals(listOf(KeystoreBoundary.REASON_OVER_LIMIT_ACCEPTED), verdict.reasons)
     }
 
-    /** No baseline means no downgrade claim: there is nothing to compare to. */
+    /**
+     * No baseline means nothing says which HAL generation answered, and the
+     * length rule exists only in KeyMint, so neither over-limit reason is
+     * claimed.
+     */
     @Test
-    fun withoutALegalBaselineTheDowngradeIsNotClaimed() {
+    fun withoutALegalBaselineTheLengthArmIsSilent() {
         val verdict = evaluate(legal = null, overLimit = acceptedInSoftware)
-        assertEquals(listOf(KeystoreBoundary.REASON_OVER_LIMIT_ACCEPTED), verdict.reasons)
+        assertEquals(0, verdict.mask)
+        assertEquals(emptyList<Int>(), verdict.reasons)
     }
 
     /** A refused legal challenge is also no baseline. */
     @Test
     fun aRefusedLegalChallengeIsNotABaselineEither() {
         val verdict = evaluate(legal = refused, overLimit = acceptedInSoftware)
-        assertEquals(listOf(KeystoreBoundary.REASON_OVER_LIMIT_ACCEPTED), verdict.reasons)
+        assertEquals(0, verdict.mask)
+        assertEquals(emptyList<Int>(), verdict.reasons)
+    }
+
+    // ---- the generation gate -----------------------------------------------
+
+    private fun legalAt(version: Int?) = KeystoreBoundary.ChallengeOutcome(
+        accepted = true,
+        securityLevel = AttestationAnalysis.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
+        attestationVersion = version,
+    )
+
+    /**
+     * Keymaster 3.0, 4.0 and 4.1 state no challenge length, so a TA of that
+     * generation accepting 129 bytes, even from software, is not a departure
+     * from its contract. A record with no readable version says nothing
+     * either.
+     */
+    @Test
+    fun aKeymasterEraKeystoreAcceptingAnOverLimitChallengeIsSilent() {
+        for (version in listOf(null, 3, 4)) {
+            for (over in listOf(acceptedInHardware, acceptedInSoftware)) {
+                val verdict = evaluate(legal = legalAt(version), overLimit = over)
+                assertEquals("version $version", 0, verdict.mask)
+                assertEquals("version $version", emptyList<Int>(), verdict.reasons)
+            }
+        }
+    }
+
+    @Test
+    fun everyKeyMintGenerationIsJudged() {
+        for (version in listOf(100, 200, 300, 400)) {
+            assertEquals(
+                "version $version",
+                listOf(KeystoreBoundary.REASON_OVER_LIMIT_ACCEPTED),
+                evaluate(legal = legalAt(version), overLimit = acceptedInHardware).reasons,
+            )
+            assertEquals(
+                "version $version",
+                listOf(
+                    KeystoreBoundary.REASON_OVER_LIMIT_ACCEPTED,
+                    KeystoreBoundary.REASON_OVER_LIMIT_DOWNGRADED,
+                ),
+                evaluate(legal = legalAt(version), overLimit = acceptedInSoftware).reasons,
+            )
+        }
+    }
+
+    /** The gate does not touch the no-challenge arm, which is not a length rule. */
+    @Test
+    fun theGenerationGateLeavesTheNoChallengeArmAlone() {
+        val verdict = evaluate(
+            noChallenge = KeystoreBoundary.NoChallengeShape(
+                selfSigned = true, carriesAttestationRecord = true
+            ),
+            legal = legalAt(4),
+            overLimit = acceptedInHardware,
+        )
+        assertEquals(listOf(KeystoreBoundary.REASON_NO_CHALLENGE_RECORD), verdict.reasons)
     }
 
     /**

@@ -10,6 +10,14 @@ package io.github.ir0nbyte.pifdetector
  * inferred, and both were measured on two independent KeyMint implementations
  * before anything was written against them.
  *
+ * Quoted from the KeyMint HAL is also a limit on where they apply. The 128 byte
+ * challenge rule is stated only by KeyMint's Tag.aidl. The Keymaster 3.0, 4.0
+ * and 4.1 HALs describe ATTESTATION_CHALLENGE and state no length at all, so a
+ * Keymaster TA that accepts 129 bytes is following its own contract. The over
+ * limit arm is therefore judged only when the legal challenge's own record says
+ * KeyMint (attestation version 100 or higher), and says nothing otherwise. The
+ * no-challenge arm is not gated this way: it is not a length rule.
+ *
  * Deliberately Android-free and side-effect-free so the whole table is unit
  * testable. [KeystoreBoundaryProbe] does the generating and hands the results
  * here.
@@ -28,6 +36,12 @@ object KeystoreBoundary {
      */
     const val MAX_CHALLENGE_BYTES = 128
 
+    /**
+     * KeyMint 1.0 records carry attestationVersion 100, and every later KeyMint
+     * a multiple of 100 above it. Keymaster 3.0, 4.0 and 4.1 carry 2, 3 and 4.
+     */
+    const val KEYMINT_ATTESTATION_VERSION_1 = 100
+
     /** A key generated with no attestation challenge at all. */
     data class NoChallengeShape(
         val selfSigned: Boolean,
@@ -42,10 +56,14 @@ object KeystoreBoundary {
      * nullable rather than collapsing it to a boolean matters: "no record"
      * and "a software record" are different observations, and only the second
      * one is a downgrade.
+     *
+     * [attestationVersion] is the record's attestationVersion, or null under
+     * the same conditions. It is what says which HAL generation answered.
      */
     data class ChallengeOutcome(
         val accepted: Boolean,
         val securityLevel: Int?,
+        val attestationVersion: Int?,
     ) {
         val hardwareBacked: Boolean
             get() = securityLevel == AttestationAnalysis.SECURITY_LEVEL_TRUSTED_ENVIRONMENT ||
@@ -82,8 +100,16 @@ object KeystoreBoundary {
             if (!shape.selfSigned) reasons.add(REASON_NO_CHALLENGE_NOT_SELF_SIGNED)
         }
 
+        // The length rule exists only in KeyMint, so it is judged only when the
+        // legal request was served and its record says KeyMint. Without that
+        // baseline nothing says which contract the keystore was bound by, and
+        // an arm that cannot tell says nothing. This gates both over-limit
+        // reasons, not just the first.
+        val legalBaseline = observation.legalChallenge
+        val keyMintSpoke = legalBaseline != null && legalBaseline.accepted &&
+            (legalBaseline.attestationVersion ?: 0) >= KEYMINT_ATTESTATION_VERSION_1
         val over = observation.overLimitChallenge
-        if (over != null && over.accepted) {
+        if (keyMintSpoke && over != null && over.accepted) {
             reasons.add(REASON_OVER_LIMIT_ACCEPTED)
 
             // The sharper half of the same observation. Silently serving an
