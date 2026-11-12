@@ -51,8 +51,17 @@ class KeyAttestationProbe {
      * revocation, sitting last, never ran on any device that tripped an earlier
      * check.
      */
+    /**
+     * @param nativeReasons the engine's reason codes for this run. Reason 1205
+     *   is driven only by the structural root-hider codes among them.
+     * @param nativeReported whether the engine returned anything at all. A
+     *   null or empty engine array is absence of evidence, and must not be
+     *   read as boot properties claiming a locked device.
+     */
     fun probe(
         nativeBitmask: Int,
+        nativeReasons: List<Int>,
+        nativeReported: Boolean,
         onlineRefreshEnabled: Boolean,
         context: Context,
         facts: AttestationAnalysis.DeviceFacts,
@@ -242,13 +251,12 @@ class KeyAttestationProbe {
                 anchored = googleAnchored,
             )
 
-            if (AttestationAnalysis.isBootContradiction(rot, deviceTampered(nativeBitmask))) {
+            if (AttestationAnalysis.isBootContradiction(rot, deviceTampered(nativeReasons))) {
                 mask = mask or DetectionResult.DETECTION_ATTEST_ANOMALY
                 anomalyReasons.add(REASON_ROT_CONTRADICTS_TAMPERING)
             }
 
-            val propertiesClaimLocked =
-                (nativeBitmask and DetectionResult.DETECTION_BOOTLOADER) == 0
+            val propertiesClaimLocked = propertiesClaimLocked(nativeBitmask, nativeReported)
             if (hardwareBacked && googleAnchored &&
                 AttestationAnalysis.bootPropertiesContradictAttestation(rot, propertiesClaimLocked)
             ) {
@@ -299,10 +307,6 @@ class KeyAttestationProbe {
         reasons = listOf(reason),
     )
 
-    private fun deviceTampered(nativeBitmask: Int): Boolean {
-        return (nativeBitmask and DetectionResult.DETECTION_ROOT_HIDER) != 0
-    }
-
     private fun generateAttestedChain(): AttestedKey? {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
 
@@ -334,6 +338,37 @@ class KeyAttestationProbe {
     }
 
     companion object {
+        /**
+         * Root-hider arms that observe a structure in the mount table: a tmpfs
+         * over a read-only system partition (901), a bind mount rooted under
+         * /adb (902), an overlay over /system (903), a tmpfs named after a root
+         * solution (905). These alone drive reason 1205.
+         */
+        val STRUCTURAL_ROOT_HIDER_REASONS: Set<Int> = setOf(901, 902, 903, 905)
+
+        /**
+         * Root-hider arms that are counts or thresholds rather than structures.
+         * 904 counts read-write-execute anonymous mappings against what ART
+         * explains. A misfire there would otherwise become a second red row
+         * that reads like hardware-backed proof while adding no evidence, so
+         * these never drive 1205. Every ROOT_HIDER code has to sit in exactly
+         * one of the two sets, and KeyAttestationGateTest fails the build when
+         * a new one sits in neither, so a future 9xx code forces a decision.
+         */
+        val HEURISTIC_ROOT_HIDER_REASONS: Set<Int> = setOf(904)
+
+        /** Whether the engine saw structural evidence of root hiding. */
+        internal fun deviceTampered(nativeReasons: List<Int>): Boolean =
+            nativeReasons.any { it in STRUCTURAL_ROOT_HIDER_REASONS }
+
+        /**
+         * The boot properties claim a locked device only when the engine
+         * actually reported and its bootloader arm stayed silent. An engine
+         * that returned nothing is not a claim about anything.
+         */
+        internal fun propertiesClaimLocked(nativeBitmask: Int, nativeReported: Boolean): Boolean =
+            nativeReported && (nativeBitmask and DetectionResult.DETECTION_BOOTLOADER) == 0
+
         /**
          * Gate 3's split, pure so it is testable without AndroidKeyStore. Called
          * only for a chain whose signatures already verified link by link, whose
