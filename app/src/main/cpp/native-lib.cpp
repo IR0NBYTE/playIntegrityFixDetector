@@ -192,6 +192,14 @@ namespace prop {
     static const char* const kSecure             = "QjdqMikqRSoh";
     static const char* const kOemUnlockAllowed   = "QyE3byMsXQcxLyAmUzMbICAlXy8hJQ==";
 
+    // The rest of the android.os.Build table (reason 810). The fields that
+    // read kBuildId, kProductDevice, kProductBrand, kProductModel, kBuildTags,
+    // kBuildType, kBuildFingerprint and kSystemSecurityPatch reuse those.
+    static const char* const kProductName        = "QjdqMT4mVC0nNWInUTUh";
+    static const char* const kProductManufacturer = "QjdqMT4mVC0nNWIkUTYxJy0qRC02JD4=";
+    static const char* const kVersionIncremental = "QjdqIzkgXDxqNyk7QzErL2IgXjs2JCEsXiwlLQ==";
+    static const char* const kVersionRelease     = "QjdqIzkgXDxqNyk7QzErL2I7VTQhID8s";
+
     // Cross-source comparison inputs. These are read and handed to the Kotlin
     // layer verbatim; nothing in the native scan compares them.
     static const char* const kSystemSecurityPatch = "QjdqIzkgXDxqNyk7QzErL2I6VTsxMyU9SQc0IDgqWA==";
@@ -206,6 +214,7 @@ namespace prop {
         kFlashLocked, kVbmetaDeviceState, kDebuggable, kSecure,
         kOemUnlockAllowed,
         kSystemSecurityPatch, kVendorSecurityPatch, kVbmetaDigest, kVbmetaHashAlg,
+        kProductName, kProductManufacturer, kVersionIncremental, kVersionRelease,
     };
 }
 
@@ -287,6 +296,7 @@ namespace reason {
     constexpr jint kPropertyAreaWiped     = 807;
     constexpr jint kPropertyNameOutOfOrder = 808;
     constexpr jint kPropertyNameOffPath   = 809;
+    constexpr jint kBuildPropertyDrift    = 810;
 
     /*
      * Collected for the duration of one engine run. The engine is entered from
@@ -3139,6 +3149,142 @@ static std::string getProp(const char *prop_name) {
     return {value};
 }
 
+/*
+ * Build constants against the properties they were read from (reason 810).
+ *
+ * The android.os.Build static fields are read from system properties once,
+ * when the runtime initialises the class (in zygote's preload, or at app fork
+ * on builds that reload them for appcompat overrides), and never again. ro.*
+ * properties are write-once for init. So a field whose live property now reads
+ * differently means something rewrote a read-only property after the runtime
+ * read it, which is what a late resetprop does; TEESimulator PR #327 writes
+ * attested values that way from the service stage. Eleven of the twelve field
+ * to property pairs are in the table frameworks/base
+ * core/jni/com_android_internal_os_Zygote.cpp uses to reload these constants
+ * (lines 1713 to 1741); FINGERPRINT is not in that table but is re-derived just
+ * after it (lines 1812 to 1817). Every pair was also checked against Build.java
+ * on main and on API 24.
+ *
+ * Pure: a field whose cached value is empty or "unknown" (Build's own word for
+ * an absent property) or whose live value is empty is never a finding. A live
+ * value that may have been cut at PROP_VALUE_MAX - 1 bytes only has to be a
+ * prefix of the cached one.
+ */
+static bool buildFieldDrifted(const std::string& cached, const std::string& live,
+                              bool liveMayBeTruncated) {
+    if (cached.empty() || cached == "unknown") return false;
+    if (live.empty()) return false;
+    if (liveMayBeTruncated) return cached.compare(0, live.size(), live) != 0;
+    return cached != live;
+}
+
+using PropReadCallbackFn = void (*)(const prop_info*,
+                                    void (*)(void*, const char*, const char*, uint32_t),
+                                    void*);
+
+static void copyPropValue(void* cookie, const char*, const char* value, uint32_t) {
+    if (cookie && value) static_cast<std::string*>(cookie)->assign(value);
+}
+
+/*
+ * A property's value without the 91 byte cut __system_property_get makes.
+ * __system_property_read_callback exists from API 26 and minSdk is 24, so it
+ * is resolved at run time; without it the truncating read is used and the
+ * caller is told the value may be cut.
+ */
+static bool readPropertyLive(const std::string& name, std::string* value,
+                             bool* mayBeTruncated) {
+    value->clear();
+    *mayBeTruncated = false;
+    static const PropReadCallbackFn readCallback = reinterpret_cast<PropReadCallbackFn>(
+        dlsym(RTLD_DEFAULT, "__system_property_read_callback"));
+    if (readCallback) {
+        const prop_info* pi = __system_property_find(name.c_str());
+        if (!pi) return false;
+        readCallback(pi, copyPropValue, value);
+        return true;
+    }
+    char buf[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name.c_str(), buf) < 0) return false;
+    value->assign(buf);
+    *mayBeTruncated = value->size() == PROP_VALUE_MAX - 1;
+    return true;
+}
+
+static bool readStaticStringField(JNIEnv* env, jclass cls, const char* field,
+                                  std::string* out) {
+    jfieldID id = env->GetStaticFieldID(cls, field, "Ljava/lang/String;");
+    if (!id) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+    LocalRef<jstring> str(env, static_cast<jstring>(env->GetStaticObjectField(cls, id)));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    if (!str) return false;
+    const char* chars = env->GetStringUTFChars(str, nullptr);
+    if (!chars) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+    out->assign(chars);
+    env->ReleaseStringUTFChars(str, chars);
+    return true;
+}
+
+// JNI hands back modified UTF-8 and a property holds raw bytes, so outside
+// ASCII the two spellings of one value can differ. Such a field is skipped.
+static bool isPlainAscii(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c >= 0x80) return false;
+    }
+    return true;
+}
+
+static bool buildPropertiesDrifted(JNIEnv* env) {
+    struct FieldProp {
+        bool inVersion;
+        const char* field;
+        const char* encodedProp;
+    };
+    static const FieldProp kFields[] = {
+        {false, "ID",             prop::kBuildId},
+        {false, "PRODUCT",        prop::kProductName},
+        {false, "DEVICE",         prop::kProductDevice},
+        {false, "MANUFACTURER",   prop::kProductManufacturer},
+        {false, "BRAND",          prop::kProductBrand},
+        {false, "MODEL",          prop::kProductModel},
+        {false, "TAGS",           prop::kBuildTags},
+        {false, "TYPE",           prop::kBuildType},
+        {true,  "INCREMENTAL",    prop::kVersionIncremental},
+        {true,  "RELEASE",        prop::kVersionRelease},
+        {true,  "SECURITY_PATCH", prop::kSystemSecurityPatch},
+        {false, "FINGERPRINT",    prop::kBuildFingerprint},
+    };
+
+    LocalRef<jclass> build(env, findClassChecked(env, "android/os/Build"));
+    LocalRef<jclass> version(env, findClassChecked(env, "android/os/Build$VERSION"));
+
+    bool drifted = false;
+    for (const auto& f : kFields) {
+        jclass cls = f.inVersion ? version.get() : build.get();
+        if (!cls) continue;
+        std::string cached, live;
+        bool mayBeTruncated = false;
+        if (!readStaticStringField(env, cls, f.field, &cached)) continue;
+        if (!readPropertyLive(decodeProp(f.encodedProp), &live, &mayBeTruncated)) continue;
+        if (!isPlainAscii(cached) || !isPlainAscii(live)) continue;
+        if (buildFieldDrifted(cached, live, mayBeTruncated)) {
+            LOGD("Build.%s no longer matches the live property", f.field);
+            drifted = true;
+        }
+    }
+    if (drifted) reason::note(reason::kBuildPropertyDrift);
+    return drifted;
+}
+
 __attribute__((always_inline))
 static inline bool isBootloaderUnlocked() {
     std::string verified_boot_state = getProp(decodeProp(prop::kVerifiedBootState).c_str());
@@ -3513,6 +3659,11 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
         {9, [](JNIEnv*, jobject) -> jint {
             if (detectTreatWheel())
                 return DETECTION_TREAT_WHEEL;
+            return 0;
+        }},
+        {10, [](JNIEnv* e, jobject) -> jint {
+            if (buildPropertiesDrifted(e))
+                return DETECTION_PROP_SPOOF;
             return 0;
         }},
     };
@@ -4376,6 +4527,37 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
                 "7a1d000000-7a1d010000 r-xp 00000000 fd:00 5678  /system/lib64/liblspd.so")) {
             LOGD("library needle outside /data/app no longer matches");
             failures++;
+        }
+    }
+
+    /*
+     * A Build constant fires only on a real disagreement with its property:
+     * not on Build's "unknown", not on an absent property, and a live value
+     * cut at the truncating read's limit only has to be a prefix.
+     */
+    {
+        struct DriftCase {
+            const char* cached;
+            const char* live;
+            bool mayBeTruncated;
+            bool expected;
+        };
+        static const std::string kLong(PROP_VALUE_MAX - 1, 'a');
+        static const std::string kLonger = kLong + "bcd";
+        static const std::string kOther = std::string(PROP_VALUE_MAX - 2, 'a') + "z";
+        const DriftCase kDrift[] = {
+            {"UP1A.231005.007", "UP1A.231005.007", false, false},
+            {"UP1A.231005.007", "AP2A.240805.005", false, true},
+            {"unknown",         "AP2A.240805.005", false, false},
+            {"UP1A.231005.007", "",                false, false},
+            {kLonger.c_str(),   kLong.c_str(),     true,  false},
+            {kLonger.c_str(),   kOther.c_str(),    true,  true},
+        };
+        for (const auto& c : kDrift) {
+            if (buildFieldDrifted(c.cached, c.live, c.mayBeTruncated) != c.expected) {
+                LOGD("build drift case wrong: '%.24s' vs '%.24s'", c.cached, c.live);
+                failures++;
+            }
         }
     }
 
