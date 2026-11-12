@@ -912,6 +912,18 @@ The root-manager package probe is best-effort by construction. KernelSU, SukiSU
 Ultra and ReSukiSU all let the manager package name be set at build time, so a
 miss is expected rather than a bug. The probe covers the default names only.
 
+The library needles in /proc/self/maps (the Zygisk, TrickyStore and Frida
+agent names, reasons 301 and 205 among them) are matched against the line with
+the random directories of an app install removed. On API 30+ an app sits at
+`/data/app/~~<22 chars>==/<pkg>-<22 chars>==/`, both suffixes fresh base64url
+on every install and update, so a four letter needle such as `lspd` occurs in
+them by chance, about 2.3e-6 per install event. Every directory component
+under `/data/app/` that ends in `==` is dropped before matching, while the file
+name and every path outside `/data/app/` are kept, so `liblspd.so` still fires
+wherever it is installed. A hooker that names only its install directory, and
+not its library, is not seen by these needles; adoptable storage paths under
+`/mnt/expand/` are not stripped and keep the old, unlikely exposure.
+
 ## Measured behaviour on a properly hidden device
 
 The interesting case is not a carelessly rooted phone, it is one configured the

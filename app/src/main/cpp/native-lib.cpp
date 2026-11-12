@@ -389,6 +389,73 @@ static inline int detectSuspiciousParent() {
     return 0;
 }
 
+/*
+ * A maps line with the random parts of an app install path removed. On API
+ * 30+ an app lives at <root>/~~<22 chars>==/<pkg>-<22 chars>==/, both
+ * suffixes drawn fresh from the base64url alphabet on every install and
+ * update, so a bare four letter needle such as "lspd" turns up in them by
+ * chance. The root is /data/app/ on internal storage and
+ * /mnt/expand/<uuid>/app/ on adopted storage, so the rule is not tied to
+ * either: any path component that ends in "==" and starts with "~~" is
+ * dropped whole, and one of the form <name>-<22 chars>== keeps <name> and
+ * loses the suffix. The package name, the file name and every other
+ * component are kept, so a needle in any of them still matches.
+ */
+static bool isBase64UrlChar(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_';
+}
+
+static std::string withoutRandomInstallDirs(const std::string& line) {
+    static const size_t kSuffix = 22;
+    std::string out;
+    out.reserve(line.size());
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        size_t end = line.find('/', pos);
+        const bool last = end == std::string::npos;
+        if (last) end = line.size();
+        const size_t len = end - pos;
+        size_t keep = len;
+        bool drop = false;
+        if (len >= 2 && line.compare(end - 2, 2, "==") == 0) {
+            if (line.compare(pos, 2, "~~") == 0) {
+                drop = true;
+            } else if (len >= kSuffix + 4 && line[end - 2 - kSuffix - 1] == '-') {
+                bool b64 = true;
+                for (size_t k = end - 2 - kSuffix; k < end - 2; k++)
+                    if (!isBase64UrlChar(line[k])) { b64 = false; break; }
+                if (b64) keep = len - kSuffix - 3;
+            }
+        }
+        if (!drop) {
+            out.append(line, pos, keep);
+            if (!last) out.push_back('/');
+        }
+        if (last) break;
+        pos = end + 1;
+    }
+    return out;
+}
+
+// The library needles of the Zygisk arm, over one maps line.
+static bool zygiskNeedleInMapsLine(const std::string& line) {
+    const std::string hay = withoutRandomInstallDirs(line);
+    return hay.find("rezygisk") != std::string::npos ||
+           hay.find("zygisk_next") != std::string::npos ||
+           hay.find("libzygisk_") != std::string::npos ||
+           hay.find("libzygisk.so") != std::string::npos ||
+           hay.find("libmagiskhide.so") != std::string::npos ||
+           hay.find("zygisk_assistant") != std::string::npos ||
+           hay.find("nohello") != std::string::npos ||
+           hay.find("shamiko") != std::string::npos ||
+           hay.find("lspd") != std::string::npos ||
+
+           hay.find(Deobfuscate(base64_decode("SiEjKD8iby4hIjgmQg=="))) != std::string::npos ||
+           hay.find("LSPosed") != std::string::npos ||
+           hay.find("[anon:zygisk]") != std::string::npos;
+}
+
 __attribute__((always_inline))
 static inline bool isZygiskActiveEnhanced() {
     bool found = false;
@@ -406,19 +473,7 @@ static inline bool isZygiskActiveEnhanced() {
                 break;
             }
 
-            if (line.find("rezygisk") != std::string::npos ||
-                line.find("zygisk_next") != std::string::npos ||
-                line.find("libzygisk_") != std::string::npos ||
-                line.find("libzygisk.so") != std::string::npos ||
-                line.find("libmagiskhide.so") != std::string::npos ||
-                line.find("zygisk_assistant") != std::string::npos ||
-                line.find("nohello") != std::string::npos ||
-                line.find("shamiko") != std::string::npos ||
-                line.find("lspd") != std::string::npos ||
-
-                line.find(Deobfuscate(base64_decode("SiEjKD8iby4hIjgmQg=="))) != std::string::npos ||
-                line.find("LSPosed") != std::string::npos ||
-                line.find("[anon:zygisk]") != std::string::npos) {
+            if (zygiskNeedleInMapsLine(line)) {
                 libraryMapped = true;
                 break;
             }
@@ -547,11 +602,12 @@ static bool detectTrickyStore() {
         procread::Budget budget;
         while (std::getline(maps, line)) {
             if (!budget.take(line.size() + 1)) break;
-            if (line.find("tricky_store") != std::string::npos ||
-                line.find("TrickyStore") != std::string::npos ||
-                line.find("keybox") != std::string::npos ||
-                line.find("keyboxhub") != std::string::npos ||
-                line.find("KeyboxHub") != std::string::npos) {
+            const std::string hay = withoutRandomInstallDirs(line);
+            if (hay.find("tricky_store") != std::string::npos ||
+                hay.find("TrickyStore") != std::string::npos ||
+                hay.find("keybox") != std::string::npos ||
+                hay.find("keyboxhub") != std::string::npos ||
+                hay.find("KeyboxHub") != std::string::npos) {
                 maps.close();
                 return true;
             }
@@ -2600,9 +2656,10 @@ static bool detectFridaThreads() {
         procread::Budget budget;
         while (std::getline(maps, line)) {
             if (!budget.take(line.size() + 1)) break;
-            if (line.find("frida-agent") != std::string::npos ||
-                line.find("frida-gadget") != std::string::npos ||
-                line.find("libgadget") != std::string::npos) {
+            const std::string hay = withoutRandomInstallDirs(line);
+            if (hay.find("frida-agent") != std::string::npos ||
+                hay.find("frida-gadget") != std::string::npos ||
+                hay.find("libgadget") != std::string::npos) {
                 libraryMapped = true;
                 break;
             }
@@ -4180,6 +4237,47 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         if (seen > 0 && parsed == 0) {
             LOGD("no mapped property area parsed (%d seen), the layout does not match",
                  seen);
+            failures++;
+        }
+    }
+
+    /*
+     * A needle that lands inside the random directories of an app install is
+     * chance, not a hooker; the same needle in a library name still fires.
+     */
+    {
+        if (zygiskNeedleInMapsLine(
+                "7a1c000000-7a1c001000 r--p 00000000 fd:30 1234  "
+                "/data/app/~~Qx7lspdVb9_Kt2mZc4Ra1w==/com.example.app-Hn3lspdW0pQe8sYt5uIo2A==/base.apk")) {
+            LOGD("random install directory matched a needle");
+            failures++;
+        }
+        if (zygiskNeedleInMapsLine(
+                "7a1c000000-7a1c001000 r--p 00000000 fd:30 1234  "
+                "/mnt/expand/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0/app/"
+                "~~Qx7lspdVb9_Kt2mZc4Ra1w==/com.example.app-Hn3lspdW0pQe8sYt5uIo2A==/base.apk")) {
+            LOGD("random adopted-storage install directory matched a needle");
+            failures++;
+        }
+        if (withoutRandomInstallDirs(
+                "/data/app/~~Qx7lspdVb9_Kt2mZc4Ra1w==/com.x-Hn3lspdW0pQe8sYt5uIo2A==/lib/arm64/libfoo.so")
+                != "/data/app/com.x/lib/arm64/libfoo.so") failures++;
+        if (!zygiskNeedleInMapsLine(
+                "7a1c000000-7a1c001000 r--p 00000000 fd:30 1234  "
+                "/data/app/~~Qx7aaaaVb9_Kt2mZc4Ra1w==/org.lsposed.lspd-Hn3aaaaW0pQe8sYt5uIo2A==/base.apk")) {
+            LOGD("needle in an installed package name no longer matches");
+            failures++;
+        }
+        if (!zygiskNeedleInMapsLine(
+                "7a1c000000-7a1c001000 r--p 00000000 fd:30 1234  "
+                "/mnt/expand/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0/app/"
+                "~~Qx7aaaaVb9_Kt2mZc4Ra1w==/org.lsposed.lspd-Hn3aaaaW0pQe8sYt5uIo2A==/base.apk")) {
+            LOGD("needle in an adopted-storage package name no longer matches");
+            failures++;
+        }
+        if (!zygiskNeedleInMapsLine(
+                "7a1d000000-7a1d010000 r-xp 00000000 fd:00 5678  /system/lib64/liblspd.so")) {
+            LOGD("library needle outside /data/app no longer matches");
             failures++;
         }
     }
