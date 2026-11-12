@@ -278,6 +278,17 @@ version may be unset on anything launched before Android 12. The SM-G780G's
 declared 4 is below even 40 and off the documented ladder, which does not matter
 here: anything under 100 is excluded.
 
+The feature version is an OEM-written file, so reaching 100 is not on its own
+enough to name the HAL. The gate adds two more conditions. The platform must be
+Android 12 (SDK 31) or later, since no earlier platform loads a KeyMint HAL.
+And the declared version must be no higher than the highest KeyMint version
+`VersionBounds.platformVersionBound` allows for the running SDK: 100 on SDK 31
+and 32, 200 on 33, 300 on 34 and 35, 400 on 36, 500 on 37. A declaration above
+what the platform can host is not a secure element whose HAL this arm can
+name, so it is not judged, and an SDK the table does not know yet has no bound
+and is not judged either. So 100 on SDK 31 and 300 on SDK 34 are judged, while
+400 on SDK 33 is silent.
+
 What remains unwitnessed is a second KeyMint secure element refusing the size.
 One does, and the generation that does not is now excluded by measurement rather
 than by argument.

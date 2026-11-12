@@ -81,7 +81,7 @@ class StrongBoxProbe {
 
     fun probe(context: Context): StrongBoxCheck.Verdict {
         return try {
-            StrongBoxCheck.evaluate(observe(context))
+            StrongBoxCheck.evaluate(observe(context), Build.VERSION.SDK_INT)
         } catch (e: Throwable) {
             // Fail open. A probe that cannot run must not accuse anyone.
             Log.w(TAG, "strongbox probe failed; failing safe", e)
