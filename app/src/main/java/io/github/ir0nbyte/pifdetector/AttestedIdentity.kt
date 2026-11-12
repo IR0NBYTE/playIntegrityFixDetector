@@ -91,9 +91,9 @@ object AttestedIdentity {
      * Built only from a record whose authorization lists both parsed. An
      * unparseable record yields null rather than an empty set, because "no
      * identifier" and "could not tell" must not reach the table as the same
-     * observation: KeyDescription schema versions before the eight-member
-     * layout do not parse here, and those are the oldest devices this app
-     * supports.
+     * observation. Every KeyDescription schema version, from the Keymaster 2
+     * version 1 onward, has the same eight members, so a record yields null
+     * here because a list could not be read, not because of its age.
      */
     data class RecordIds(
         val hardwareEnforced: Set<Int>,
