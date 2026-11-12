@@ -21,7 +21,9 @@ import java.security.cert.X509Certificate
  *   layer a simulator replaces.
  * - A challenge past the documented 128 byte maximum, which Tag.aidl says must
  *   draw INVALID_INPUT_LENGTH. Nothing in keystore2 enforces that limit, so
- *   again the rejection has to come from KeyMint.
+ *   again the rejection has to come from KeyMint. Keymaster 3.0 to 4.1 state
+ *   no limit, so this arm is judged only when the legal request's record
+ *   carries a KeyMint attestation version.
  *
  * Deliberately not implemented, and the reasons are worth keeping:
  *
@@ -85,16 +87,20 @@ class KeystoreBoundaryProbe {
             val record = chain.firstOrNull()
                 ?.getExtensionValue(AttestationAnalysis.ATTESTATION_OID)
             val level = record?.let { AttestationAnalysis.parseAttestationSecurityLevel(it) }
+            val version = record?.let { AttestationAnalysis.parseAttestationVersion(it) }
             KeystoreBoundary.ChallengeOutcome(
                 accepted = chain.isNotEmpty(),
                 securityLevel = level,
+                attestationVersion = version,
             )
         } catch (e: Exception) {
             // The documented outcome for the over-limit arm, and the reason this
             // catch does not record an observation for it: a refusal is the
             // contract being honoured, so there is nothing to report.
             Log.d(TAG, "challenge of $size bytes refused", e)
-            KeystoreBoundary.ChallengeOutcome(accepted = false, securityLevel = null)
+            KeystoreBoundary.ChallengeOutcome(
+                accepted = false, securityLevel = null, attestationVersion = null
+            )
         } finally {
             wipe(alias)
         }
