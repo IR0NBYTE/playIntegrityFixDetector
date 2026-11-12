@@ -128,10 +128,23 @@ object AttestationAnalysis {
      * A serial is looked up in both encodings because the published list mixes
      * them. Renderings shorter than the list's own minimum are dropped: a
      * one-character key could otherwise match a genuine certificate.
+     *
+     * A negative serial is also looked up as its encoded bytes read unsigned.
+     * DER encodes the serial as a signed INTEGER, so a TA that writes an 8 byte
+     * serial with the top bit set and no leading zero byte produces a value
+     * Java reads as negative. The magnitude alone is then a different number
+     * from the one the list would carry, which is the unsigned reading of
+     * those same bytes.
      */
     fun serialLookupKeys(serial: BigInteger): List<String> {
         val positive = serial.abs()
-        return listOf(positive.toString(16), positive.toString(10))
+        val renderings = mutableListOf(positive.toString(16), positive.toString(10))
+        if (serial.signum() < 0) {
+            val unsigned = BigInteger(1, serial.toByteArray())
+            renderings += unsigned.toString(16)
+            renderings += unsigned.toString(10)
+        }
+        return renderings
             .filter { it.length >= MIN_SERIAL_KEY_LENGTH }
             .distinct()
     }
