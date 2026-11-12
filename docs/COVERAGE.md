@@ -368,8 +368,18 @@ finding:
   allocates the `prop_info` that hangs off it, and `allocate_obj` moves
   `bytes_used_` before either is written, so a reader can catch an ordinary
   property being added and see bytes that are briefly unreachable. That window
-  closes in microseconds. A deletion does not close. An area is reported only
-  when both passes agree on `bytes_used_` and on the same unreachable count.
+  usually closes in microseconds. It does not when init's first store into a
+  new 4 KiB page of the area faults: the area is mapped without touching
+  anything past the header, so that store is a shmem page fault, and under
+  memory pressure it can sit in direct reclaim for tens of milliseconds while a
+  `prop_info` straddling the page boundary stays entirely zero, byte for byte a
+  deletion scar. init is the only writer, so only the newest allocation can be
+  in flight, and it is always the unreachable run that ends exactly at
+  `bytes_used_`. When any candidate area has such a run, the confirming pass
+  waits 250 ms first, once per scan; an interior run needs no wait, and a clean
+  device has no candidate and pays nothing. A deletion does not close. An area
+  is reported only when both passes agree on `bytes_used_` and on the same
+  unreachable count.
 - **The unreachable bytes must all be zero.** `remove` memsets what it detaches,
   so a deletion leaves zeroes. A half written allocation does not.
 - **An area close to full is skipped.** Running out of space is the one way AOSP
