@@ -32,6 +32,12 @@ class KeyAttestationProbe {
          * green: the probe set the bit and the report could not say why.
          */
         val reasons: List<Int> = emptyList(),
+        /**
+         * The chain verifies end to end but ends in a self-signed root this
+         * build does not recognise, so nothing in the record was judged.
+         * Reported, never a finding: see [unanchoredChainIsReportOnly].
+         */
+        val rootUnrecognised: Boolean = false,
     )
 
     /**
@@ -74,8 +80,31 @@ class KeyAttestationProbe {
 
             val googleAnchored =
                 AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
-            if (!softwareBacked && !googleAnchored)
-                return anomaly(REASON_NEITHER_SOFTWARE_NOR_ANCHORED)
+            if (!softwareBacked && !googleAnchored) {
+                // A chain that holds together and ends in a self-signed root
+                // this build has never seen is reported, not convicted. The
+                // pinned set is only as complete as the day it was assembled:
+                // a root Google adds with a new key, or an OEM that attests to
+                // its own root, must not read as a forgery. Every other shape
+                // (a known AOSP software root under a record that does not say
+                // software, a top that is not self-signed) stays 1203. A
+                // keystore that does not echo the challenge it was given is a
+                // finding under any root, so the report-only shape still
+                // answers for 1204.
+                val reportOnly = unanchoredChainIsReportOnly(
+                    chain,
+                    AttestationAnalysis.anchorKeyEncodings(AttestationRoots.pinnedRoots),
+                    AttestationAnalysis.anchorKeyEncodings(SoftwareAttestationRoots.roots),
+                )
+                val mismatched = reportOnly && AttestationAnalysis.challengeMismatch(
+                    AttestationAnalysis.parseAttestationChallenge(extValue), attested.challenge
+                )
+                val reason = unanchoredChainReason(reportOnly, mismatched)
+                    ?: return ProbeOutcome(
+                        0, RevocationStatus.NOT_EVALUATED, rootUnrecognised = true
+                    )
+                return anomaly(reason)
+            }
 
             val challenge = AttestationAnalysis.parseAttestationChallenge(extValue)
             if (AttestationAnalysis.challengeMismatch(challenge, attested.challenge)) {
@@ -305,6 +334,51 @@ class KeyAttestationProbe {
     }
 
     companion object {
+        /**
+         * Gate 3's split, pure so it is testable without AndroidKeyStore. Called
+         * only for a chain whose signatures already verified link by link, whose
+         * record does not say software, and which did not anchor to a pinned
+         * Google root.
+         *
+         * True only when the top certificate is UNRECOGNISED by
+         * [CompanionAlgorithmCheck.classifyRoot] AND is self-signed: its subject
+         * equals its issuer and it verifies under its own key. A one-element
+         * chain never qualifies, because its only certificate is the attested
+         * key itself, which is not a root.
+         */
+        internal fun unanchoredChainIsReportOnly(
+            chain: List<X509Certificate>,
+            googleAnchorKeys: Set<List<Byte>>,
+            softwareAnchorKeys: Set<List<Byte>>,
+        ): Boolean {
+            if (chain.size < 2) return false
+            val top = chain.last()
+            val origin = CompanionAlgorithmCheck.classifyRoot(
+                top, googleAnchorKeys, softwareAnchorKeys
+            )
+            if (origin != CompanionAlgorithmCheck.RootOrigin.UNRECOGNISED) return false
+            return isSelfSigned(top)
+        }
+
+        /**
+         * Gate 3's outcome once [unanchoredChainIsReportOnly] has been decided.
+         * Null means report only. A chain that is not report-only stays 1203. A
+         * report-only chain whose record does not echo the challenge it was
+         * given is 1204: that needs no trusted root to be a finding.
+         */
+        internal fun unanchoredChainReason(reportOnly: Boolean, challengeMismatched: Boolean): Int? =
+            when {
+                !reportOnly -> REASON_NEITHER_SOFTWARE_NOR_ANCHORED
+                challengeMismatched -> REASON_CHALLENGE_MISMATCH
+                else -> null
+            }
+
+        private fun isSelfSigned(cert: X509Certificate): Boolean = runCatching {
+            if (cert.issuerX500Principal != cert.subjectX500Principal) return false
+            cert.verify(cert.publicKey)
+            true
+        }.getOrDefault(false)
+
         private const val TAG = "KeyAttestationProbe"
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val KEY_ALIAS = "pifd_attest_probe"

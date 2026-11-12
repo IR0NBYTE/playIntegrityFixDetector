@@ -298,6 +298,7 @@ class ChainValidityTest {
         private val notAfterMillis: Long,
         private val key: PublicKey,
         private val selfSigned: Boolean,
+        private val verifies: Boolean = true,
     ) : X509Certificate() {
         override fun getNotBefore(): Date = Date(notBeforeMillis)
         override fun getNotAfter(): Date = Date(notAfterMillis)
@@ -322,8 +323,10 @@ class ChainValidityTest {
         override fun getKeyUsage(): BooleanArray? = null
         override fun getBasicConstraints() = -1
         override fun getEncoded() = subject.toByteArray()
-        override fun verify(key: PublicKey?) = Unit
-        override fun verify(key: PublicKey?, sigProvider: String?) = Unit
+        override fun verify(key: PublicKey?) {
+            if (!verifies) throw java.security.SignatureException("stub does not verify")
+        }
+        override fun verify(key: PublicKey?, sigProvider: String?) = verify(key)
         override fun toString() = subject
         override fun hasUnsupportedCriticalExtension() = false
         override fun getCriticalExtensionOIDs(): MutableSet<String> = mutableSetOf()
