@@ -4854,22 +4854,25 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
      * failing closed on every area rather than reading them.
      */
     {
-        std::ifstream selfMaps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
-        const std::string dir = Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+        // Read the way the arms read: the same ranges, the same layout hint,
+        // and a readOwnMemory snapshot under the same size cap, never the live
+        // mapping, which can be unmapped or shortened under the walk.
+        const PropertyAreaRanges ranges = collectPropertyAreaRanges();
+        const uint32_t layoutHint = propertyLayoutHint(ranges);
+        std::vector<unsigned char> image;
         std::vector<unsigned char> scratch;
         PropAreaAccount acc;
-        int parsed = 0, seen = 0;
-        std::string mapLine;
-        procread::Budget budget;
-        while (std::getline(selfMaps, mapLine)) {
-            if (!budget.take(mapLine.size() + 1)) break;
-            bool isArea = false, isPrivate = false;
-            unsigned long long start = 0, end = 0;
-            classifyPropertyAreaLine(mapLine, dir, &isArea, &isPrivate, &start, &end);
-            if (!isArea || start == 0 || end <= start) continue;
-            seen++;
-            if (accountPropertyArea(reinterpret_cast<const unsigned char*>(start),
-                                    end - start, &acc, &scratch, 0)) {
+        int parsed = 0;
+        const int seen = static_cast<int>(ranges.size());
+        for (const auto& range : ranges) {
+            const unsigned long long len = range.second - range.first;
+            if (len == 0 || len > propa::kMaxAreaBytes) continue;
+            if (!readOwnMemory(reinterpret_cast<const void*>(range.first),
+                               static_cast<size_t>(len), &image)) {
+                continue;
+            }
+            if (accountPropertyArea(image.data(), static_cast<size_t>(len), &acc, &scratch,
+                                    layoutHint)) {
                 parsed++;
             }
         }
