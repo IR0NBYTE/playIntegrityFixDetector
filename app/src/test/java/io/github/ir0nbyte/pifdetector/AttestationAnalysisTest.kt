@@ -307,6 +307,33 @@ class AttestationAnalysisTest {
     }
 
     /**
+     * Eight serial bytes with the top bit set and no leading zero are a
+     * negative DER INTEGER. The list would carry the unsigned reading of those
+     * bytes, so that is looked up too, in both forms, beside the magnitude.
+     */
+    @Test
+    fun aNegativeSerialIsAlsoLookedUpAsItsUnsignedBytes() {
+        val bytes = byteArrayOf(
+            0x80.toByte(), 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+        )
+        val serial = BigInteger(bytes)
+        assertTrue(serial.signum() < 0)
+
+        val keys = AttestationAnalysis.serialLookupKeys(serial)
+        assertTrue(keys.contains("8001020304050607"))
+        assertTrue(keys.contains("9223655723807081991"))
+        assertTrue(keys.contains("7ffefdfcfbfaf9f9"))
+        assertTrue(keys.contains("9223088349902469625"))
+        assertEquals(4, keys.size)
+    }
+
+    @Test
+    fun aPositiveSerialGainsNoUnsignedRendering() {
+        val serial = BigInteger(1, byteArrayOf(0x70, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07))
+        assertEquals(2, AttestationAnalysis.serialLookupKeys(serial).size)
+    }
+
+    /**
      * A one-character rendering could match an unrelated entry if a malformed
      * body ever reached the lookup, so renderings below the published list's own
      * serial floor are not used as keys at all.
