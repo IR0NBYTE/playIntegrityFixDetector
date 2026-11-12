@@ -2511,8 +2511,17 @@ namespace codeint {
  */
 static int selfTestFailures() {
     int failures = 0;
+    // Each failing check names itself, so a non-zero count on a device can be
+    // traced to the line that produced it.
+    auto fail = [&failures](const char* what) {
+        LOGD("code integrity self test failed: %s", what);
+        failures++;
+    };
     const std::vector<Mapping> maps = readMappings();
-    if (maps.empty()) return 1;
+    if (maps.empty()) {
+        LOGD("code integrity self test failed: /proc/self/maps read empty");
+        return 1;
+    }
 
 #if PIFD_PROLOGUE_SCAN_SUPPORTED
     // A synthesised trampoline must decode to the address it jumps to, and an
@@ -2527,7 +2536,7 @@ static int selfTestFailures() {
     const uint32_t b = 0x14000040u;
     memcpy(buf, &b, 4);
     target = 0;
-    if (!branchTargetAt(maps, base, &target) || target != base + 256) failures++;
+    if (!branchTargetAt(maps, base, &target) || target != base + 256) fail("arm64 B +256");
 
     // LDR x16, #8 ; BR x16 ; <literal>
     memset(buf, 0, sizeof(buf));
@@ -2538,14 +2547,14 @@ static int selfTestFailures() {
     memcpy(buf + 8, &literal, 8);
     target = 0;
     if (!branchTargetAt(maps, base, &target) ||
-        target != static_cast<uintptr_t>(literal)) failures++;
+        target != static_cast<uintptr_t>(literal)) fail("arm64 LDR x16 ; BR x16");
 
     // STP x29, x30, [sp, #-16]! is an ordinary prologue, not a branch.
     memset(buf, 0, sizeof(buf));
     const uint32_t stp = 0xA9BF7BFDu;
     memcpy(buf, &stp, 4);
     target = 0;
-    if (branchTargetAt(maps, base, &target)) failures++;
+    if (branchTargetAt(maps, base, &target)) fail("arm64 STP prologue decoded as a branch");
 
 #elif defined(__x86_64__)
     // E9 rel32
@@ -2555,7 +2564,7 @@ static int selfTestFailures() {
     memcpy(buf + 1, &rel, 4);
     target = 0;
     if (!branchTargetAt(maps, base, &target) ||
-        target != base + 5 + static_cast<uintptr_t>(rel)) failures++;
+        target != base + 5 + static_cast<uintptr_t>(rel)) fail("x86_64 E9 rel32");
 
     // movabs rax, imm64 ; jmp rax
     memset(buf, 0, sizeof(buf));
@@ -2565,13 +2574,13 @@ static int selfTestFailures() {
     buf[10] = 0xFF; buf[11] = 0xE0;
     target = 0;
     if (!branchTargetAt(maps, base, &target) ||
-        target != static_cast<uintptr_t>(imm)) failures++;
+        target != static_cast<uintptr_t>(imm)) fail("x86_64 movabs rax ; jmp rax");
 
     // push rbp is an ordinary prologue.
     memset(buf, 0, sizeof(buf));
     buf[0] = 0x55;
     target = 0;
-    if (branchTargetAt(maps, base, &target)) failures++;
+    if (branchTargetAt(maps, base, &target)) fail("x86_64 push rbp decoded as a branch");
 #endif
 #endif  // PIFD_PROLOGUE_SCAN_SUPPORTED
 
@@ -2584,8 +2593,7 @@ static int selfTestFailures() {
             for (uintptr_t a : {m.start, m.end - 1, m.end, m.start - 1})
                 same = same && findMapping(live, a) == findMappingLinear(live, a);
             if (!same) {
-                LOGD("mapping lookup disagrees with the linear walk");
-                failures++;
+                fail("mapping lookup disagrees with the linear walk");
                 break;
             }
         }
@@ -2604,20 +2612,31 @@ static int selfTestFailures() {
     } else {
         const std::vector<Mapping> withPage = readMappings();
         std::string offender;
-        if (!foreignExecMapping(withPage, &offender)) failures++;
+        if (!foreignExecMapping(withPage, &offender))
+            fail("anonymous exec page not reported");
         munmap(page, 4096);
 
         // And with it gone, a clean scan must say nothing.
         const std::vector<Mapping> after = readMappings();
         std::string none;
-        if (foreignExecMapping(after, &none)) failures++;
+        if (foreignExecMapping(after, &none)) {
+            fail("clean scan reported a mapping");
+            for (const auto& m : after) {
+                if (!m.exec || isLegitimateCodeSource(m.path)) continue;
+                LOGD("clean scan offender: %lx-%lx off=%llx '%s'",
+                     static_cast<unsigned long>(m.start),
+                     static_cast<unsigned long>(m.end), m.offset,
+                     m.path.empty() ? "<anonymous>" : m.path.c_str());
+            }
+        }
     }
 
     // A legitimate source must never be reported, whatever else is true.
     if (isLegitimateCodeSource("/mnt/expand/1234-abcd/app/~~x==/base.apk!/lib/arm64-v8a/libfoo.so")
-        == false) failures++;
-    if (isLegitimateCodeSource("/data/adb/modules/evil/lib/libhook.so")) failures++;
-    if (isLegitimateCodeSource("")) failures++;
+        == false) fail("adopted storage app library not legitimate");
+    if (isLegitimateCodeSource("/data/adb/modules/evil/lib/libhook.so"))
+        fail("/data/adb module library legitimate");
+    if (isLegitimateCodeSource("")) fail("empty path legitimate");
 
     // Kernel owned executable pages must parse as exec and still be silent.
     static const char* const kKernelExecLines[] = {
@@ -2627,14 +2646,14 @@ static int selfTestFailures() {
     for (const char* line : kKernelExecLines) {
         Mapping m;
         if (!parseMappingLine(line, &m) || !m.exec) {
-            failures++;
+            fail(line);
             continue;
         }
         std::string offender;
-        if (foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
+        if (foreignExecMapping(std::vector<Mapping>{m}, &offender)) fail(line);
     }
     for (const char* name : {"[vdso]", "[vectors]", "[sigpage]", "[vsyscall]", "[uprobes]"}) {
-        if (!isLegitimateCodeSource(name)) failures++;
+        if (!isLegitimateCodeSource(name)) fail(name);
     }
 
     // A memfd that only carries a kernel page's name is not that page.
@@ -2643,12 +2662,14 @@ static int selfTestFailures() {
         if (!parseMappingLine(
                 "7b2c400000-7b2c401000 r-xp 00000000 00:01 4242  /memfd:[vsyscall] (deleted)",
                 &m)) {
-            failures++;
+            fail("memfd [vsyscall] line did not parse");
         } else {
             std::string offender;
-            if (!foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
+            if (!foreignExecMapping(std::vector<Mapping>{m}, &offender))
+                fail("memfd [vsyscall] not reported");
         }
-        if (isLegitimateCodeSource("/memfd:[uprobes] (deleted)")) failures++;
+        if (isLegitimateCodeSource("/memfd:[uprobes] (deleted)"))
+            fail("memfd [uprobes] legitimate");
     }
 
     // Code mapped from /data/local/tmp/ is foreign.
@@ -2657,10 +2678,11 @@ static int selfTestFailures() {
         if (!parseMappingLine(
                 "7b2c400000-7b2c9c0000 r-xp 00000000 fd:30 9012  "
                 "/data/local/tmp/re.frida.server/frida-agent-64.so", &m)) {
-            failures++;
+            fail("/data/local/tmp line did not parse");
         } else {
             std::string offender;
-            if (!foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
+            if (!foreignExecMapping(std::vector<Mapping>{m}, &offender))
+                fail("/data/local/tmp library not reported");
         }
     }
 
@@ -5033,6 +5055,11 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             }
         }
     }
+
+
+    const int codeIntegrity = codeint::selfTestFailures();
+    if (codeIntegrity != 0) LOGD("code integrity self test failures: %d", codeIntegrity);
+    failures += codeIntegrity;
 
     return failures;
 }
