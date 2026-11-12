@@ -1785,6 +1785,29 @@ struct Mapping {
     std::string path;
 };
 
+// One /proc/self/maps line into a Mapping. Kept pure so the self test can
+// hand it lines this device does not have.
+static bool parseMappingLine(const std::string& line, Mapping* out) {
+    unsigned long long start = 0, end = 0, fileOffset = 0;
+    char perms[8] = {0};
+    int pathOffset = 0;
+    if (sscanf(line.c_str(), "%llx-%llx %7s %llx %*s %*s %n",
+               &start, &end, perms, &fileOffset, &pathOffset) < 4) {
+        return false;
+    }
+    Mapping m;
+    m.start = static_cast<uintptr_t>(start);
+    m.end = static_cast<uintptr_t>(end);
+    m.offset = fileOffset;
+    m.readable = perms[0] == 'r';
+    m.exec = perms[2] == 'x';
+    if (pathOffset > 0 && static_cast<size_t>(pathOffset) <= line.size()) {
+        m.path = line.substr(static_cast<size_t>(pathOffset));
+    }
+    *out = std::move(m);
+    return true;
+}
+
 static std::vector<Mapping> readMappings() {
     std::vector<Mapping> out;
     std::ifstream maps(Deobfuscate(base64_decode("Hyg2Li9mQz0oJ2MkUSg3")));
@@ -1794,22 +1817,8 @@ static std::vector<Mapping> readMappings() {
     procread::Budget budget;
     while (std::getline(maps, line)) {
         if (!budget.take(line.size() + 1)) break;
-        unsigned long long start = 0, end = 0, fileOffset = 0;
-        char perms[8] = {0};
-        int pathOffset = 0;
-        if (sscanf(line.c_str(), "%llx-%llx %7s %llx %*s %*s %n",
-                   &start, &end, perms, &fileOffset, &pathOffset) < 4) {
-            continue;
-        }
         Mapping m;
-        m.start = static_cast<uintptr_t>(start);
-        m.end = static_cast<uintptr_t>(end);
-        m.offset = fileOffset;
-        m.readable = perms[0] == 'r';
-        m.exec = perms[2] == 'x';
-        if (pathOffset > 0 && static_cast<size_t>(pathOffset) <= line.size()) {
-            m.path = line.substr(static_cast<size_t>(pathOffset));
-        }
+        if (!parseMappingLine(line, &m)) continue;
         out.push_back(std::move(m));
     }
     return out;
@@ -1852,11 +1861,24 @@ static bool isLegitimateCodeSource(const std::string& path) {
         "[anon:dalvik-", "[anon:.bss", "[anon:linker", "[anon:scudo",
         "[anon:libc_malloc", "[anon:bionic", "[anon:thread signal stack",
         "[anon:System.", "[anon:stack_and_tls", "[anon:arc4random",
-        "jit-cache", "jit-zygote", "[vdso]", "[vectors]", "[sigpage]",
+        "jit-cache", "jit-zygote",
         "/memfd:jit-cache", "/memfd:jit-zygote", "/dev/ashmem",
     };
     for (const char* name : kAnonNames) {
         if (path.find(name) != std::string::npos) return true;
+    }
+
+    // Pages the kernel itself maps. These are matched by equality with the
+    // whole path, never as a substring, so a memfd or file whose name merely
+    // contains one (/memfd:[vsyscall] (deleted)) is still judged. x86_64
+    // kernels list the legacy vsyscall page as --xp in every process
+    // (LEGACY_VSYSCALL_XONLY is the default and GKI keeps it), and [uprobes]
+    // is the kernel's XOL area in any process that ran a uprobed instruction.
+    static const char* const kKernelPages[] = {
+        "[vdso]", "[vectors]", "[sigpage]", "[vsyscall]", "[uprobes]",
+    };
+    for (const char* name : kKernelPages) {
+        if (path == name) return true;
     }
     return false;
 }
@@ -2258,6 +2280,38 @@ static int selfTestFailures() {
         == false) failures++;
     if (isLegitimateCodeSource("/data/adb/modules/evil/lib/libhook.so")) failures++;
     if (isLegitimateCodeSource("")) failures++;
+
+    // Kernel owned executable pages must parse as exec and still be silent.
+    static const char* const kKernelExecLines[] = {
+        "ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]",
+        "7ffff7ff9000-7ffff7ffa000 --xp 00000000 00:00 0                          [uprobes]",
+    };
+    for (const char* line : kKernelExecLines) {
+        Mapping m;
+        if (!parseMappingLine(line, &m) || !m.exec) {
+            failures++;
+            continue;
+        }
+        std::string offender;
+        if (foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
+    }
+    for (const char* name : {"[vdso]", "[vectors]", "[sigpage]", "[vsyscall]", "[uprobes]"}) {
+        if (!isLegitimateCodeSource(name)) failures++;
+    }
+
+    // A memfd that only carries a kernel page's name is not that page.
+    {
+        Mapping m;
+        if (!parseMappingLine(
+                "7b2c400000-7b2c401000 r-xp 00000000 00:01 4242  /memfd:[vsyscall] (deleted)",
+                &m)) {
+            failures++;
+        } else {
+            std::string offender;
+            if (!foreignExecMapping(std::vector<Mapping>{m}, &offender)) failures++;
+        }
+        if (isLegitimateCodeSource("/memfd:[uprobes] (deleted)")) failures++;
+    }
 
     return failures;
 }
