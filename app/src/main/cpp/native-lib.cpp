@@ -8,7 +8,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <cerrno>
-#include <sys/select.h>
+#include <poll.h>
 #include <vector>
 #include <map>
 #include <memory>
@@ -150,10 +150,13 @@ static std::string base64_decode(const std::string &input) {
     for (int i = 0; i < 64; i++)
         T[base64Chars[i]] = i;
     std::string output;
-    int val = 0, valb = -8;
+    // Unsigned, because every literal over five characters shifts bits out
+    // of the top, which on a signed int is undefined behaviour.
+    uint32_t val = 0;
+    int valb = -8;
     for (unsigned char c : input) {
         if (T[c] == -1) break;
-        val = (val << 6) + T[c];
+        val = (val << 6) + static_cast<uint32_t>(T[c]);
         valb += 6;
         if (valb >= 0) {
             output.push_back(static_cast<char>((val >> valb) & 0xFF));
@@ -161,6 +164,12 @@ static std::string base64_decode(const std::string &input) {
         }
     }
     return output;
+}
+
+// ::tolower on a plain char is undefined for bytes above 0x7F where char is
+// signed (x86, x86_64), so every lowercase pass goes through unsigned char.
+static char lowerChar(char c) {
+    return static_cast<char>(::tolower(static_cast<unsigned char>(c)));
 }
 
 namespace prop {
@@ -526,7 +535,7 @@ static inline bool detectPIFSideEffects() {
         while (std::getline(maps, line)) {
             if (!budget.take(line.size() + 1)) break;
             std::string lower = line;
-            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            std::transform(lower.begin(), lower.end(), lower.begin(), lowerChar);
             if (lower.find(modulePif) != std::string::npos ||
                 lower.find(modulePifk) != std::string::npos ||
                 line.find(dexAnon) != std::string::npos) {
@@ -625,14 +634,14 @@ static bool boardContradictsSoc(const std::string& brand,
     if (board.empty() || cpuHardware.empty()) return false;
 
     std::string brandLower = brand;
-    std::transform(brandLower.begin(), brandLower.end(), brandLower.begin(), ::tolower);
+    std::transform(brandLower.begin(), brandLower.end(), brandLower.begin(), lowerChar);
     const bool claimsGoogleDevice =
         brandLower == "google" || fingerprint.compare(0, 7, "google/") == 0;
     if (!claimsGoogleDevice) return false;
 
     std::string b = board, h = cpuHardware;
-    std::transform(b.begin(), b.end(), b.begin(), ::tolower);
-    std::transform(h.begin(), h.end(), h.begin(), ::tolower);
+    std::transform(b.begin(), b.end(), b.begin(), lowerChar);
+    std::transform(h.begin(), h.end(), h.begin(), lowerChar);
 
     static const char* pixelBoards[] = {
         "panther", "cheetah", "lynx", "felix", "tangorpro",
@@ -659,8 +668,8 @@ static bool fingerprintContradicts(const std::string& fp, const char* brand) {
     if (strlen(brand) > 0) {
         std::string fpBrand = fp.substr(0, fp.find('/'));
         std::string b(brand);
-        std::transform(fpBrand.begin(), fpBrand.end(), fpBrand.begin(), ::tolower);
-        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+        std::transform(fpBrand.begin(), fpBrand.end(), fpBrand.begin(), lowerChar);
+        std::transform(b.begin(), b.end(), b.begin(), lowerChar);
         if (!fpBrand.empty() && fpBrand != b) {
             reason::note(reason::kBrandMismatch);
             return true;
@@ -1816,7 +1825,7 @@ static jint detectMountArtifacts() {
     };
     bool moduleMounted = false;
     for (std::string name : moduleNames) {
-        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+        std::transform(name.begin(), name.end(), name.begin(), lowerChar);
         for (const char* encoded : kModuleNeedles) {
             if (name.find(Deobfuscate(base64_decode(encoded))) != std::string::npos) {
                 moduleMounted = true;
@@ -2605,11 +2614,10 @@ static bool tryConnectLoopback(uint16_t port) {
     if (rc == 0) {
         listening = true;
     } else if (errno == EINPROGRESS) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(sock, &wfds);
-        timeval tv{0, 200000};
-        if (select(sock + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+        // poll, not select: FD_SET on a descriptor of 1024 or more aborts
+        // under FORTIFY and writes past the set without it.
+        pollfd pfd{sock, POLLOUT, 0};
+        if (poll(&pfd, 1, 200) > 0 && (pfd.revents & POLLOUT)) {
             int err = 0;
             socklen_t len = sizeof(err);
             if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
@@ -2832,7 +2840,7 @@ static bool detectPixelCanaryFingerprint() {
         if (fp.find("google/") != std::string::npos) {
             if (strlen(brand) > 0) {
                 std::string b(brand);
-                std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+                std::transform(b.begin(), b.end(), b.begin(), lowerChar);
                 if (b != "google") return true;
             }
         }
@@ -2841,7 +2849,7 @@ static bool detectPixelCanaryFingerprint() {
 
     if (strlen(brand) > 0) {
         std::string b(brand);
-        std::transform(b.begin(), b.end(), b.begin(), ::tolower);
+        std::transform(b.begin(), b.end(), b.begin(), lowerChar);
         if (b != "google") return true;
     }
 
