@@ -20,6 +20,8 @@ class StrongBoxCheckTest {
     private companion object {
         /** What the bench Pixel 7a declares, measured. */
         const val PIXEL_FEATURE_VERSION = 300
+        /** Android 14, whose KeyMint bound of 300 admits that version. */
+        const val DEFAULT_SDK = 34
     }
 
     private val teeLevel = AttestationAnalysis.SECURITY_LEVEL_TRUSTED_ENVIRONMENT
@@ -38,11 +40,13 @@ class StrongBoxCheckTest {
         ordinaryKeyLevel: Int? = teeLevel,
         ordinaryRecord: StrongBoxCheck.Record? = record(),
         aes192: StrongBoxCheck.AesOutcome? = StrongBoxCheck.AesOutcome.UNAVAILABLE,
+        sdkInt: Int = DEFAULT_SDK,
     ) = StrongBoxCheck.evaluate(
         StrongBoxCheck.Observation(
             featureDeclared, strongBoxFeatureVersion, availability,
             ordinaryKeyLevel, ordinaryRecord, aes192,
-        )
+        ),
+        sdkInt,
     )
 
     /**
@@ -52,6 +56,7 @@ class StrongBoxCheckTest {
     private fun honestStrongBox(
         aes192: StrongBoxCheck.AesOutcome = StrongBoxCheck.AesOutcome.REFUSED,
         strongBoxFeatureVersion: Int? = PIXEL_FEATURE_VERSION,
+        sdkInt: Int = DEFAULT_SDK,
     ) = evaluate(
         featureDeclared = true,
         strongBoxFeatureVersion = strongBoxFeatureVersion,
@@ -59,6 +64,7 @@ class StrongBoxCheckTest {
         ordinaryKeyLevel = teeLevel,
         ordinaryRecord = record(),
         aes192 = aes192,
+        sdkInt = sdkInt,
     )
 
     // ---- the measured baseline ---------------------------------------------
@@ -318,13 +324,17 @@ class StrongBoxCheckTest {
         }
     }
 
-    /** From KeyMint 1.0 the restriction exists, so acceptance is a finding. */
+    /**
+     * From KeyMint 1.0 the restriction exists, so acceptance is a finding,
+     * on an SDK whose platform can host that KeyMint version.
+     */
     @Test
     fun aKeyMintSecureElementThatTakesTheSizeIsAFinding() {
-        for (version in listOf(100, 200, 300, 400)) {
+        for ((version, sdk) in listOf(100 to 31, 200 to 33, 300 to 34, 400 to 36)) {
             val verdict = honestStrongBox(
                 aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
                 strongBoxFeatureVersion = version,
+                sdkInt = sdk,
             )
             assertEquals(
                 "strongbox_keystore=$version carries the AES restriction",
@@ -344,6 +354,79 @@ class StrongBoxCheckTest {
         assertEquals(0, verdict.mask)
     }
 
+    @Test
+    fun keyMintOneOnTheFirstKeyMintSdkIsJudged() {
+        val verdict = honestStrongBox(
+            aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            strongBoxFeatureVersion = 100,
+            sdkInt = 31,
+        )
+        assertEquals(listOf(StrongBoxCheck.REASON_STRONGBOX_TOOK_AES_192), verdict.reasons)
+    }
+
+    @Test
+    fun keyMintThreeOnAndroid14IsJudged() {
+        val verdict = honestStrongBox(
+            aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            strongBoxFeatureVersion = 300,
+            sdkInt = 34,
+        )
+        assertEquals(listOf(StrongBoxCheck.REASON_STRONGBOX_TOOK_AES_192), verdict.reasons)
+    }
+
+    /**
+     * Android 13 hosts KeyMint 2 at most, so a declared 400 is not a KeyMint
+     * secure element whose HAL we can name, and is not judged.
+     */
+    @Test
+    fun aVersionAboveWhatTheSdkCanHostIsNotJudged() {
+        val verdict = honestStrongBox(
+            aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            strongBoxFeatureVersion = 400,
+            sdkInt = 33,
+        )
+        assertEquals(0, verdict.mask)
+    }
+
+    /** No platform before Android 12 loads a KeyMint HAL. */
+    @Test
+    fun aKeyMintVersionBeforeAndroid12IsNotJudged() {
+        for (sdk in listOf(28, 29, 30)) {
+            val verdict = honestStrongBox(
+                aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+                strongBoxFeatureVersion = 100,
+                sdkInt = sdk,
+            )
+            assertEquals("sdk $sdk", 0, verdict.mask)
+        }
+    }
+
+    /** An SDK the bounds table does not know yet has no bound, so no verdict. */
+    @Test
+    fun anSdkWithNoBoundIsNotJudged() {
+        val verdict = honestStrongBox(
+            aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+            strongBoxFeatureVersion = 300,
+            sdkInt = 99,
+        )
+        assertEquals(0, verdict.mask)
+    }
+
+    /** The Keymaster-era versions stay silent on every SDK. */
+    @Test
+    fun keymasterVersionsStaySilentOnEverySdk() {
+        for (version in listOf(4, 40, 41)) {
+            for (sdk in 28..37) {
+                val verdict = honestStrongBox(
+                    aes192 = StrongBoxCheck.AesOutcome.ACCEPTED,
+                    strongBoxFeatureVersion = version,
+                    sdkInt = sdk,
+                )
+                assertEquals("v$version sdk $sdk", 0, verdict.mask)
+            }
+        }
+    }
+
     /** The gate is pinned to the version the restriction arrived in. */
     @Test
     fun theGateIsTheFirstKeyMintFeatureVersion() {
@@ -354,7 +437,7 @@ class StrongBoxCheckTest {
 
     @Test
     fun anObservationWithNothingInItIsSilent() {
-        val verdict = StrongBoxCheck.evaluate(StrongBoxCheck.Observation())
+        val verdict = StrongBoxCheck.evaluate(StrongBoxCheck.Observation(), DEFAULT_SDK)
         assertEquals(0, verdict.mask)
         assertEquals(emptyList<Int>(), verdict.reasons)
     }

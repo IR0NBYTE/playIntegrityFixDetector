@@ -110,6 +110,31 @@ object StrongBoxCheck {
      */
     const val STRONGBOX_FEATURE_VERSION_KEYMINT_1 = 100
 
+    /** The first SDK whose platform can carry a KeyMint HAL at all. */
+    const val KEYMINT_FIRST_SDK = 31
+
+    /**
+     * Whether the AES size restriction may be judged at this feature version
+     * on this SDK.
+     *
+     * Three conditions, all of which must hold. The version is a KeyMint one
+     * (see [STRONGBOX_FEATURE_VERSION_KEYMINT_1]). The platform is Android 12
+     * or later, since no earlier platform loads a KeyMint HAL. And the version
+     * is no higher than the highest KeyMint version [VersionBounds] allows for
+     * this SDK. The declaration is an OEM-written feature file, so a value
+     * above what the platform can host is not a KeyMint secure element we can
+     * name the HAL of, and it is not ours to read as one. An SDK the table
+     * does not know yet has no bound, and is never judged.
+     */
+    fun aesRestrictionApplies(featureVersion: Int?, sdkInt: Int): Boolean {
+        val version = featureVersion ?: return false
+        if (version < STRONGBOX_FEATURE_VERSION_KEYMINT_1) return false
+        if (sdkInt < KEYMINT_FIRST_SDK) return false
+        val bound = VersionBounds.platformVersionBound(sdkInt, releaseBuild = true)
+            ?: return false
+        return version <= bound.keyMint
+    }
+
     /**
      * The two security levels one attestation record states.
      *
@@ -152,7 +177,11 @@ object StrongBoxCheck {
         val isFinding: Boolean get() = mask != 0
     }
 
-    fun evaluate(observation: Observation): Verdict {
+    /**
+     * @param sdkInt Build.VERSION.SDK_INT, which bounds the AES arm. See
+     *   [aesRestrictionApplies].
+     */
+    fun evaluate(observation: Observation, sdkInt: Int): Verdict {
         val reasons = ArrayList<Int>(4)
 
         // keystore2 has just said there is no StrongBox instance on this
@@ -187,12 +216,13 @@ object StrongBoxCheck {
         // and says nothing about key sizes. And on the secure element being a
         // KeyMint one, because the restriction does not exist before KeyMint
         // and a genuine Keymaster 4.0 StrongBox on the bench accepts the size:
-        // see STRONGBOX_FEATURE_VERSION_KEYMINT_1. Phrased as acceptance being
-        // the finding, never refusal, which is what a conforming StrongBox
-        // does.
+        // see STRONGBOX_FEATURE_VERSION_KEYMINT_1. The KeyMint gate is bounded
+        // by the SDK as well, in aesRestrictionApplies. Phrased as acceptance
+        // being the finding, never refusal, which is what a conforming
+        // StrongBox does.
         if (observation.availability == Availability.SERVED &&
             observation.aes192 == AesOutcome.ACCEPTED &&
-            (observation.strongBoxFeatureVersion ?: 0) >= STRONGBOX_FEATURE_VERSION_KEYMINT_1
+            aesRestrictionApplies(observation.strongBoxFeatureVersion, sdkInt)
         ) {
             reasons.add(REASON_STRONGBOX_TOOK_AES_192)
         }
