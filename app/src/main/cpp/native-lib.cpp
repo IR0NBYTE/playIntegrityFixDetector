@@ -959,6 +959,11 @@ namespace propa {
     // nonsense mapping length cannot ask for a nonsense allocation.
     constexpr size_t kMaxAreaBytes = 16u << 20;
     constexpr uint32_t kMaxCredibleLongValue = 4096;
+    // auditPropertyTrie holds the dotted path of every level still to walk. A
+    // real property name is a few dozen bytes; these bound what a crafted trie
+    // can make that cost.
+    constexpr size_t kMaxPathBytes = 1024;
+    constexpr size_t kMaxPendingPathBytes = 4u << 20;
 }
 
 struct PropAreaAccount {
@@ -1341,7 +1346,8 @@ struct PropTrieAudit {
  * Returns false and judges nothing for anything it cannot read exactly, on the
  * same terms as accountPropertyArea: a wrong magic or version, an offset or a
  * name that does not fit inside bytes_used_, a namelen that disagrees with the
- * string beside it, a cycle, or a structure past the node budget. A reading
+ * string beside it, a cycle, a structure past the node budget, or a path or a
+ * queue of pending paths past the caps in propa. A reading
  * this code got wrong must not convict.
  */
 static bool auditPropertyTrie(const unsigned char* base, size_t len,
@@ -1390,7 +1396,16 @@ static bool auditPropertyTrie(const unsigned char* base, size_t len,
         uint32_t root;
         std::string prefix;
     };
+    /*
+     * Each pending level carries a copy of its path, so a crafted trie, one
+     * long first-level name over a chain of nodes that each have children,
+     * makes the queue cost the path length times the chain length: 85 MB for a
+     * 128 KiB area and gigabytes for a 1 MiB one, which ends in bad_alloc and
+     * an abort. A path past kMaxPathBytes, or more than kMaxPendingPathBytes of
+     * paths queued at once, is refused like any other unreadable structure.
+     */
     std::vector<Level> levels;
+    size_t pendingPathBytes = 0;
     const uint32_t firstLevel = rd(16);
     if (firstLevel != 0) levels.push_back({firstLevel, std::string()});
 
@@ -1410,6 +1425,7 @@ static bool auditPropertyTrie(const unsigned char* base, size_t len,
     while (!levels.empty()) {
         const Level level = levels.back();
         levels.pop_back();
+        pendingPathBytes -= level.prefix.size();
 
         // In-order walk of this level: push the left spine, take a node off,
         // then do the same for its right subtree. Iterative so a long spine
@@ -1445,6 +1461,7 @@ static bool auditPropertyTrie(const unsigned char* base, size_t len,
             std::string path = level.prefix;
             if (!path.empty()) path.push_back('.');
             path.append(reinterpret_cast<const char*>(name), nameLen);
+            if (path.size() > propa::kMaxPathBytes) return false;
 
             const uint32_t prop = rd(off + 4);
             if (prop != 0) {
@@ -1463,7 +1480,11 @@ static bool auditPropertyTrie(const unsigned char* base, size_t len,
             }
 
             const uint32_t children = rd(off + 16);
-            if (children != 0) levels.push_back({children, path});
+            if (children != 0) {
+                pendingPathBytes += path.size();
+                if (pendingPathBytes > propa::kMaxPendingPathBytes) return false;
+                levels.push_back({children, path});
+            }
 
             cursor = rd(off + 12);                       // right
         }
@@ -4740,6 +4761,87 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
             memcpy(bad.data() + propa::kHeaderBytes + nodeA, &wrongLen, sizeof(wrongLen));
             if (auditPropertyTrie(bad.data(), areaLen, &audit, &scratch) || audit.parsed) {
                 LOGD("the trie walk accepted a namelen that does not match its string");
+                failures++;
+            }
+        }
+
+        /*
+         * Tries crafted to make the walk's own bookkeeping expensive. One
+         * first-level segment longer than any path the walk will hold is
+         * refused outright.
+         */
+        {
+            const uint32_t longSeg = static_cast<uint32_t>(propa::kMaxPathBytes) + 76;
+            std::vector<unsigned char> crafted(propa::kHeaderBytes + 4096, 0);
+            unsigned char* cd = crafted.data() + propa::kHeaderBytes;
+            memcpy(crafted.data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+            memcpy(crafted.data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+            const uint32_t first = propa::kNodeBytes + ((propa::kValueMax + 3u) & ~3u);
+            memcpy(cd + 16, &first, sizeof(first));
+            memcpy(cd + first, &longSeg, sizeof(longSeg));
+            memset(cd + first + propa::kNodeBytes, 'x', longSeg);
+            const uint32_t cused = first + ((propa::kNodeBytes + longSeg + 1 + 3u) & ~3u);
+            memcpy(crafted.data(), &cused, sizeof(cused));
+            if (auditPropertyTrie(crafted.data(), crafted.size(), &audit, &scratch) ||
+                audit.parsed) {
+                LOGD("the trie walk accepted a path past kMaxPathBytes");
+                failures++;
+            }
+        }
+
+        /*
+         * A first-level segment just under the path cap whose child level is a
+         * chain of nodes that each have children of their own. Every one of
+         * them queues a copy of the long path before any is walked, so enough
+         * of them pass kMaxPendingPathBytes and are refused, while a short
+         * chain of the same shape reads normally.
+         */
+        {
+            auto chainArea = [&](uint32_t links, std::vector<unsigned char>* out) {
+                const uint32_t headSeg = 1000;
+                const uint32_t first = propa::kNodeBytes + ((propa::kValueMax + 3u) & ~3u);
+                const uint32_t headSize = (propa::kNodeBytes + headSeg + 1 + 3u) & ~3u;
+                const uint32_t nodeSize = (propa::kNodeBytes + 3 + 1 + 3u) & ~3u;
+                const uint32_t cused = first + headSize + links * 2 * nodeSize;
+                out->assign(propa::kHeaderBytes + cused + 4096, 0);
+                unsigned char* cd = out->data() + propa::kHeaderBytes;
+                auto put = [&](uint32_t off, uint32_t v) { memcpy(cd + off, &v, sizeof(v)); };
+                memcpy(out->data() + 8, &propa::kMagic, sizeof(propa::kMagic));
+                memcpy(out->data() + 12, &propa::kVersion, sizeof(propa::kVersion));
+                memcpy(out->data(), &cused, sizeof(cused));
+                put(16, first);
+                put(first, headSeg);
+                memset(cd + first + propa::kNodeBytes, 'h', headSeg);
+                uint32_t at = first + headSize;
+                put(first + 16, at);
+                for (uint32_t i = 0; i < links; i++) {
+                    // Three letter names in increasing order down the right spine.
+                    const char seg[4] = {static_cast<char>('a' + (i / 676) % 26),
+                                         static_cast<char>('a' + (i / 26) % 26),
+                                         static_cast<char>('a' + i % 26), '\0'};
+                    const uint32_t node = at;
+                    const uint32_t leaf = at + nodeSize;
+                    at += 2 * nodeSize;
+                    put(node, 3);
+                    memcpy(cd + node + propa::kNodeBytes, seg, 4);
+                    put(node + 16, leaf);
+                    if (i + 1 < links) put(node + 12, at);
+                    put(leaf, 3);
+                    memcpy(cd + leaf + propa::kNodeBytes, "zzz", 4);
+                }
+            };
+            std::vector<unsigned char> chain;
+            chainArea(64, &chain);
+            if (!auditPropertyTrie(chain.data(), chain.size(), &audit, &scratch) ||
+                !audit.parsed || audit.nodes != 1 + 2 * 64 || audit.nameOutOfOrder) {
+                LOGD("a short chain under a long segment was not read: parsed=%d nodes=%u",
+                     audit.parsed ? 1 : 0, audit.nodes);
+                failures++;
+            }
+            chainArea(static_cast<uint32_t>(propa::kMaxPendingPathBytes / 1000) + 64, &chain);
+            if (auditPropertyTrie(chain.data(), chain.size(), &audit, &scratch) ||
+                audit.parsed) {
+                LOGD("the trie walk queued more than kMaxPendingPathBytes of paths");
                 failures++;
             }
         }
