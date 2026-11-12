@@ -28,6 +28,7 @@
 #include <inttypes.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <time.h>
 
 #ifdef IS_DEBUG_BUILD
 #include <android/log.h>
@@ -966,6 +967,10 @@ struct PropAreaAccount {
     uint32_t bytesUsed = 0;
     uint32_t unreachable = 0;
     bool unreachableAllZero = false;
+    // An unreachable all-zero run ends exactly at bytes_used_. That is the only
+    // place an allocation init is still making can be, so it is the one run a
+    // second read has to wait for.
+    bool unreachableZeroTail = false;
     uint32_t nodes = 0;
     uint32_t props = 0;
 };
@@ -1251,9 +1256,21 @@ static bool accountPropertyArea(const unsigned char* base, size_t len,
         if (data[i] != '\0') allZero = false;
     }
 
+    bool zeroTail = false;
+    if (bytesUsed > 0 && (*scratch)[bytesUsed - 1] == 0) {
+        zeroTail = true;
+        for (uint32_t i = bytesUsed; i > 0 && (*scratch)[i - 1] == 0; i--) {
+            if (data[i - 1] != '\0') {
+                zeroTail = false;
+                break;
+            }
+        }
+    }
+
     out->bytesUsed = bytesUsed;
     out->unreachable = unreachable;
     out->unreachableAllZero = allZero;
+    out->unreachableZeroTail = zeroTail;
     out->couldHaveStranded =
         static_cast<uint64_t>(bytesUsed) + propa::kMaxCredibleLongValue >= dataSize;
     out->parsed = true;
@@ -1468,7 +1485,9 @@ static bool auditPropertyTrie(const unsigned char* base, size_t len,
  * before it allocates the prop_info that hangs off it, and allocate_obj moves
  * bytes_used_ before either is written, so a reader can catch an ordinary
  * property being added and see bytes that are briefly unreachable. That window
- * closes in microseconds. A deletion does not close. An area is only reported
+ * usually closes in microseconds, but not when init's first store into a new
+ * page faults, so when the unreachable run is the newest allocation the second
+ * pass waits 250 ms first. A deletion does not close. An area is only reported
  * when both passes agree on bytes_used_ and on the same unreachable count.
  *
  * Each pass copies the area through readOwnMemory before parsing it, rather
@@ -1628,12 +1647,44 @@ static bool detectWipedPropertyAllocations(const PropertyAreaRanges& ranges,
         accountPropertyArea(image.data(), len, &first[i], &scratch, layoutHint);
     }
 
+    auto candidate = [](const PropAreaAccount& a) {
+        return a.parsed && !a.couldHaveStranded && a.unreachable != 0 &&
+               a.unreachableAllZero;
+    };
+
+    /*
+     * An allocation init is in the middle of making is unreachable and still
+     * zero, byte for byte what a deletion leaves, and it does not always close
+     * in microseconds. The first store into each new 4 KiB page of the area is
+     * a shmem page fault in init, and under memory pressure that fault can sit
+     * in direct reclaim for tens of milliseconds, with a prop_info that
+     * straddles the page boundary still entirely zero. init is the only
+     * writer, so only the newest allocation can be in flight, and it is always
+     * the run that ends exactly at bytes_used_. When any candidate has such a
+     * run, the confirming pass waits 250 ms first, once for the whole scan. A
+     * clean device has no candidate and pays nothing. The wait is to an
+     * absolute deadline on the monotonic clock, so a signal that interrupts
+     * the sleep does not shorten it.
+     */
+    for (size_t i = 0; i < ranges.size(); i++) {
+        if (candidate(first[i]) && first[i].unreachableZeroTail) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+            deadline.tv_nsec += 250L * 1000 * 1000;
+            if (deadline.tv_nsec >= 1000L * 1000 * 1000) {
+                deadline.tv_sec += 1;
+                deadline.tv_nsec -= 1000L * 1000 * 1000;
+            }
+            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
+            }
+            break;
+        }
+    }
+
     bool wiped = false;
     for (size_t i = 0; i < ranges.size(); i++) {
         const PropAreaAccount& a = first[i];
-        if (!a.parsed || a.couldHaveStranded || a.unreachable == 0 ||
-            !a.unreachableAllZero)
-            continue;
+        if (!candidate(a)) continue;
 
         PropAreaAccount again;
         const size_t len = snapshot(i);
@@ -4361,6 +4412,12 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
                  acc.unreachableAllZero ? 1 : 0);
             failures++;
         }
+        // The wiped prop_info was the newest allocation, so its run ends at
+        // bytes_used_ and is indistinguishable from one still being written.
+        if (!acc.unreachableZeroTail) {
+            LOGD("a zero run ending at bytes_used was not marked as the tail");
+            failures++;
+        }
 
         /*
          * The same area emptied, as Magisk's prune leaves it when the deleted
@@ -4421,6 +4478,12 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
                 !acc.unreachableAllZero || acc.nodes != 1 || acc.props != 1) {
                 LOGD("a refilled area did not report its gap: parsed=%d unreachable=%u "
                      "expected=%u", acc.parsed ? 1 : 0, acc.unreachable, used - withBackup);
+                failures++;
+            }
+            // The gap is interior: a reachable allocation follows it, so it
+            // cannot be one in flight.
+            if (acc.unreachableZeroTail) {
+                LOGD("an interior zero run was marked as the tail");
                 failures++;
             }
             if (accountPropertyArea(refilled.data(), refilledLen, &acc, &scratch, 0) ||
