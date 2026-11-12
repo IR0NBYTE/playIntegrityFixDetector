@@ -172,6 +172,7 @@ data class DetectionResult(
             shape: RecordShape.Verdict? = null,
             moduleHash: ModuleHash.Status? = null,
             reasonCodes: List<Int> = emptyList(),
+            rootUnrecognised: Boolean = false,
         ): List<DetectionResult> {
             val reasonsByFlag = ReasonCodes.describe(reasonCodes)
             return SPECS.map { spec ->
@@ -206,6 +207,15 @@ data class DetectionResult(
 
                 spec.flag == DETECTION_ATTEST_MODULE_HASH && moduleHash != null ->
                     applyModuleHash(base, moduleHash)
+
+                // Reported, never a finding, and never allowed to soften a row
+                // something else already convicted.
+                spec.flag == DETECTION_ATTEST_ANOMALY && rootUnrecognised && !detected ->
+                    base.copy(
+                        state = CheckState.UNVERIFIABLE,
+                        detail = "The attestation chain verifies, but it ends in a root this " +
+                            "build does not recognise, so nothing in the record was judged.",
+                    )
 
                 else -> base
             }.let { row ->

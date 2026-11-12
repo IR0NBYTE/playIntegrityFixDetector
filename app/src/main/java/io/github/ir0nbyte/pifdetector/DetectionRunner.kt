@@ -26,6 +26,12 @@ data class DetectionReport(
      */
     val reasons: List<Int> = emptyList(),
 
+    /**
+     * The passive chain verified but ended in a self-signed root this build
+     * does not recognise. Renders the Key Attestation row as unverifiable.
+     */
+    val rootUnrecognised: Boolean = false,
+
     /** What the device claimed to be during this run, for the report header. */
     val presentation: DeviceIdentity.Presentation = DeviceIdentity.UNKNOWN,
 )
@@ -60,7 +66,12 @@ class DetectionRunner {
                 nativeMask, onlineRefreshEnabled, appContext, facts, presentation
             )
 
-            val activeMask = activeAttestationProbe.probe(passive.mask != 0, presentation)
+            // An unrecognised root is the same observation the active probe's
+            // own unanchored arm would convict, so it counts as already
+            // explained rather than as a clean passive run.
+            val activeMask = activeAttestationProbe.probe(
+                passive.mask != 0 || passive.rootUnrecognised, presentation
+            )
             val boundary = boundaryProbe.probe()
             val identity = identityProbe.probe()
             val strongBox = strongBoxProbe.probe(appContext)
@@ -78,6 +89,7 @@ class DetectionRunner {
                 reasons = reasons + passive.reasons + boundary.reasons +
                     identity.reasons + strongBox.reasons + companionAlgorithm.reasons,
                 presentation = presentation,
+                rootUnrecognised = passive.rootUnrecognised,
             )
             mainHandler.post {
                 if (!cancelled.get()) onResult(report)
