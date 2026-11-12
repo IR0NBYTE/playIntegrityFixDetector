@@ -2961,11 +2961,19 @@ static inline bool isBootloaderUnlocked() {
         unlocked = true;
     }
 
-    std::string oem_unlock = getProp(
-        decodeProp(prop::kOemUnlockAllowed).c_str());
-    if (oem_unlock == "1") {
-        reason::note(reason::kOemUnlockAllowed);
-        unlocked = true;
+    /*
+     * sys.oem_unlock_allowed is the "OEM unlocking" switch in Developer
+     * options. A locked retail phone whose owner flipped it reads 1 and is
+     * still locked, so it describes a permitted setting, not a boot state.
+     * It is recorded only to corroborate an arm above and never sets the bit
+     * on its own.
+     */
+    if (unlocked) {
+        std::string oem_unlock = getProp(
+            decodeProp(prop::kOemUnlockAllowed).c_str());
+        if (oem_unlock == "1") {
+            reason::note(reason::kOemUnlockAllowed);
+        }
     }
 
     return unlocked;
