@@ -12,39 +12,61 @@ import java.security.cert.X509Certificate
 class ActiveAttestationProbe {
     private class Attested(val chain: List<X509Certificate>, val challenge: ByteArray)
 
-    fun probe(passiveProbeFlagged: Boolean, presentation: DeviceIdentity.Presentation): Int {
+    /**
+     * What one run found. Every forgery arm names itself with a reason code
+     * and the mask is derived from that code, so the row can never light up
+     * without saying which arm lit it. The software-backed outcome carries no
+     * reason: it is a readout of where the key lives, not a forgery arm.
+     */
+    data class Outcome(val mask: Int, val reasons: List<Int>) {
+        companion object {
+            val NONE = Outcome(0, emptyList())
+
+            /** The software-backed readout, which names no arm. */
+            val SOFTWARE = Outcome(DetectionResult.DETECTION_ATTEST_SOFTWARE, emptyList())
+
+            /** An arm that fired, its mask taken from the code's own row. */
+            fun of(reason: Int): Outcome =
+                Outcome(ReasonCodes.flagOf(reason) ?: 0, listOf(reason))
+        }
+    }
+
+    fun probe(passiveProbeFlagged: Boolean, presentation: DeviceIdentity.Presentation): Outcome {
         return try {
-            attestKeyProvocation(passiveProbeFlagged, presentation).takeIf { it != 0 }
+            attestKeyProvocation(passiveProbeFlagged, presentation).takeIf { it.mask != 0 }
                 ?: authRequiredProvocation()
         } catch (e: Throwable) {
             Log.w(TAG, "active attestation probe failed; failing safe", e)
-            0
+            Outcome.NONE
         }
     }
 
     private fun attestKeyProvocation(
         passiveProbeFlagged: Boolean,
         presentation: DeviceIdentity.Presentation,
-    ): Int {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return 0
+    ): Outcome {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return Outcome.NONE
         val attested = generate(ALIAS_ATTEST_KEY) { builder ->
             builder.setDigests(KeyProperties.DIGEST_SHA256)
-        } ?: return 0
+        } ?: return Outcome.NONE
 
         val chain = attested.chain
-        if (chain.isEmpty()) return 0
+        if (chain.isEmpty()) return Outcome.NONE
 
         if (AttestationAnalysis.isSelfSignedSingleCert(chain)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(REASON_ATTEST_KEY_SELF_SIGNED_SINGLE)
         }
 
-        chainStructureForgery(chain)?.let { return it }
+        chainStructureForgery(
+            chain, REASON_ATTEST_KEY_SIGNATURE_BROKEN, REASON_ATTEST_KEY_NON_CA_ISSUER
+        )?.let { return it }
 
-        val ext = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID) ?: return 0
+        val ext = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID)
+            ?: return Outcome.NONE
 
         val challenge = AttestationAnalysis.parseAttestationChallenge(ext)
         if (AttestationAnalysis.challengeMismatch(challenge, attested.challenge)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(REASON_ATTEST_KEY_CHALLENGE_MISMATCH)
         }
 
         if (!passiveProbeFlagged) {
@@ -54,28 +76,32 @@ class ActiveAttestationProbe {
             val anchored =
                 AttestationAnalysis.chainAnchorsToPinnedRoot(chain, AttestationRoots.pinnedRoots)
             if (!anchored) {
-                if (!softwareBacked) return DetectionResult.DETECTION_ATTEST_FORGERY
+                if (!softwareBacked) return Outcome.of(REASON_ATTEST_KEY_HARDWARE_UNANCHORED)
                 if (DeviceIdentity.presentsAsPhysicalHardware(presentation)) {
-                    return DetectionResult.DETECTION_ATTEST_SOFTWARE
+                    return Outcome.SOFTWARE
                 }
             }
         }
 
-        return 0
+        return Outcome.NONE
     }
 
-    private fun chainStructureForgery(chain: List<X509Certificate>): Int? {
+    private fun chainStructureForgery(
+        chain: List<X509Certificate>,
+        signatureBroken: Int,
+        nonCaIssuer: Int,
+    ): Outcome? {
         if (AttestationAnalysis.chainSignaturesBroken(chain)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(signatureBroken)
         }
         if (AttestationAnalysis.chainHasNonCaIssuer(chain)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(nonCaIssuer)
         }
         return null
     }
 
     @Suppress("DEPRECATION")
-    private fun authRequiredProvocation(): Int {
+    private fun authRequiredProvocation(): Outcome {
         val attested = generate(ALIAS_AUTH_BOUND) { builder ->
             builder.setDigests(KeyProperties.DIGEST_SHA512)
             builder.setUserAuthenticationRequired(true)
@@ -87,35 +113,38 @@ class ActiveAttestationProbe {
             } else {
                 builder.setUserAuthenticationValidityDurationSeconds(AUTH_VALIDITY_SECONDS)
             }
-        } ?: return 0
+        } ?: return Outcome.NONE
 
         val chain = attested.chain
-        if (chain.isEmpty()) return 0
+        if (chain.isEmpty()) return Outcome.NONE
 
         if (AttestationAnalysis.isSelfSignedSingleCert(chain)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(REASON_AUTH_BOUND_SELF_SIGNED_SINGLE)
         }
 
-        chainStructureForgery(chain)?.let { return it }
+        chainStructureForgery(
+            chain, REASON_AUTH_BOUND_SIGNATURE_BROKEN, REASON_AUTH_BOUND_NON_CA_ISSUER
+        )?.let { return it }
 
-        val ext = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID) ?: return 0
+        val ext = chain[0].getExtensionValue(AttestationAnalysis.ATTESTATION_OID)
+            ?: return Outcome.NONE
 
         if (chain.size >= 2 &&
             AttestationAnalysis.leafSignatureTracksRequestedDigest(chain[0].sigAlgName)
         ) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(REASON_AUTH_BOUND_LEAF_USED_REQUESTED_DIGEST)
         }
 
         val challenge = AttestationAnalysis.parseAttestationChallenge(ext)
         if (AttestationAnalysis.challengeMismatch(challenge, attested.challenge)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(REASON_AUTH_BOUND_CHALLENGE_MISMATCH)
         }
 
         if (AttestationAnalysis.authRequirementContradiction(ext)) {
-            return DetectionResult.DETECTION_ATTEST_FORGERY
+            return Outcome.of(REASON_AUTH_BOUND_AUTH_CONTRADICTION)
         }
 
-        return 0
+        return Outcome.NONE
     }
 
     private fun generate(
@@ -159,11 +188,43 @@ class ActiveAttestationProbe {
         }
     }
 
-    private companion object {
-        const val TAG = "ActiveAttestProbe"
-        const val ANDROID_KEYSTORE = "AndroidKeyStore"
-        const val ALIAS_ATTEST_KEY = "pifd_probe_attestkey"
-        const val ALIAS_AUTH_BOUND = "pifd_probe_authbound"
-        const val AUTH_VALIDITY_SECONDS = 60
+    companion object {
+        private const val TAG = "ActiveAttestProbe"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val ALIAS_ATTEST_KEY = "pifd_probe_attestkey"
+        private const val ALIAS_AUTH_BOUND = "pifd_probe_authbound"
+        private const val AUTH_VALIDITY_SECONDS = 60
+
+        /**
+         * One code per forgery arm, all on the forgery row. The two
+         * provocations run the same structural checks, so each gets its own
+         * codes and a report says which request exposed the chain.
+         * Append-only.
+         */
+        const val REASON_ATTEST_KEY_SELF_SIGNED_SINGLE = 1114
+        const val REASON_ATTEST_KEY_SIGNATURE_BROKEN = 1115
+        const val REASON_ATTEST_KEY_NON_CA_ISSUER = 1116
+        const val REASON_ATTEST_KEY_CHALLENGE_MISMATCH = 1117
+        const val REASON_ATTEST_KEY_HARDWARE_UNANCHORED = 1118
+        const val REASON_AUTH_BOUND_SELF_SIGNED_SINGLE = 1119
+        const val REASON_AUTH_BOUND_SIGNATURE_BROKEN = 1120
+        const val REASON_AUTH_BOUND_NON_CA_ISSUER = 1121
+        const val REASON_AUTH_BOUND_LEAF_USED_REQUESTED_DIGEST = 1122
+        const val REASON_AUTH_BOUND_CHALLENGE_MISMATCH = 1123
+        const val REASON_AUTH_BOUND_AUTH_CONTRADICTION = 1124
+
+        val REASON_CODES: Set<Int> = setOf(
+            REASON_ATTEST_KEY_SELF_SIGNED_SINGLE,
+            REASON_ATTEST_KEY_SIGNATURE_BROKEN,
+            REASON_ATTEST_KEY_NON_CA_ISSUER,
+            REASON_ATTEST_KEY_CHALLENGE_MISMATCH,
+            REASON_ATTEST_KEY_HARDWARE_UNANCHORED,
+            REASON_AUTH_BOUND_SELF_SIGNED_SINGLE,
+            REASON_AUTH_BOUND_SIGNATURE_BROKEN,
+            REASON_AUTH_BOUND_NON_CA_ISSUER,
+            REASON_AUTH_BOUND_LEAF_USED_REQUESTED_DIGEST,
+            REASON_AUTH_BOUND_CHALLENGE_MISMATCH,
+            REASON_AUTH_BOUND_AUTH_CONTRADICTION,
+        )
     }
 }
