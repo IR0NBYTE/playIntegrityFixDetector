@@ -450,9 +450,6 @@ data class DetectionResult(
                     add("attested OS patch level does not equal the device property " +
                         "on a locked, verified device")
                 }
-                if (v.malformedDayPrecisionPatchLevel) {
-                    add("a day-precision patch level is neither a valid date nor a month")
-                }
                 if (v.bootHashMismatch) {
                     add("attested verified boot hash does not match the device's vbmeta digest")
                 }
@@ -474,6 +471,10 @@ data class DetectionResult(
                 }
                 if (v.monthPrecisionDayLevel) {
                     add("a day-precision patch level carries only a month")
+                }
+                if (v.dayZeroPatchLevel) {
+                    add("a day-precision patch level gives its day as 00, which the HAL " +
+                        "permits when the day is not known")
                 }
                 if (v.bootPatchLevelMissing) {
                     add("boot patch level is absent although KeyMint 3 requires it")

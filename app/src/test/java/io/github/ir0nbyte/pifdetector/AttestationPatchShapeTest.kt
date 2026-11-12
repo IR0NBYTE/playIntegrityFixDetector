@@ -63,18 +63,18 @@ class AttestationPatchShapeTest {
     }
 
     /**
-     * The finding is exactly one shape: a real year, a real month, day 00. That
-     * is the form a month-granular config value takes when it is multiplied out
-     * to the long form, and AOSP's own parser cannot produce it.
+     * The day-zero bucket is exactly one shape: a real year, a real month, day
+     * 00. The HAL permits it ("If the day is not known, 00 may be
+     * substituted"), so it is reported, never a finding.
      */
     @Test
-    fun onlyTheDayZeroShapeIsAFinding() {
-        assertTrue(AttestationAnalysis.dayPrecisionPatchIsImpossible(20241100L))
-        assertTrue(AttestationAnalysis.dayPrecisionPatchIsImpossible(20250400L))
+    fun onlyTheDayZeroShapeLandsInTheDayZeroBucket() {
+        assertTrue(AttestationAnalysis.dayPrecisionPatchHasDayZero(20241100L))
+        assertTrue(AttestationAnalysis.dayPrecisionPatchHasDayZero(20250400L))
 
-        assertFalse(AttestationAnalysis.dayPrecisionPatchIsImpossible(0L))
-        assertFalse(AttestationAnalysis.dayPrecisionPatchIsImpossible(null))
-        assertFalse(AttestationAnalysis.dayPrecisionPatchIsImpossible(20240805L))
+        assertFalse(AttestationAnalysis.dayPrecisionPatchHasDayZero(0L))
+        assertFalse(AttestationAnalysis.dayPrecisionPatchHasDayZero(null))
+        assertFalse(AttestationAnalysis.dayPrecisionPatchHasDayZero(20240805L))
     }
 
     /**
@@ -85,8 +85,8 @@ class AttestationPatchShapeTest {
     @Test
     fun otherNonDateShapesAreForgiven() {
         for (raw in listOf(20250000L, 19700919L, 20241232L, 20241305L, 202404L, 202412L)) {
-            assertFalse("$raw must not be a finding",
-                AttestationAnalysis.dayPrecisionPatchIsImpossible(raw))
+            assertFalse("$raw is not the day-zero shape",
+                AttestationAnalysis.dayPrecisionPatchHasDayZero(raw))
             assertTrue("$raw must be reported",
                 AttestationAnalysis.dayPrecisionPatchIsMonthOnly(raw))
         }
@@ -100,12 +100,12 @@ class AttestationPatchShapeTest {
     @Test
     fun theTwoBucketsAreDisjointAndCoverEverything() {
         for (raw in listOf(202404L, 202413L, 20241100L, 20250000L, 19700919L, 20241232L)) {
-            val finding = AttestationAnalysis.dayPrecisionPatchIsImpossible(raw)
+            val finding = AttestationAnalysis.dayPrecisionPatchHasDayZero(raw)
             val reported = AttestationAnalysis.dayPrecisionPatchIsMonthOnly(raw)
             assertTrue("$raw must land in exactly one bucket", finding != reported)
         }
         // A valid date lands in neither.
-        assertFalse(AttestationAnalysis.dayPrecisionPatchIsImpossible(20240805L))
+        assertFalse(AttestationAnalysis.dayPrecisionPatchHasDayZero(20240805L))
         assertFalse(AttestationAnalysis.dayPrecisionPatchIsMonthOnly(20240805L))
         assertFalse(AttestationAnalysis.dayPrecisionPatchIsMonthOnly(0L))
         assertFalse(AttestationAnalysis.dayPrecisionPatchIsMonthOnly(null))
@@ -287,13 +287,31 @@ class AttestationPatchShapeTest {
 
     // ---- A5: a day-precision level that is not a date ----------------------
 
+    /**
+     * Keymaster 4.0 types.hal and KeyMint Tag.aidl: "If the day is not known,
+     * 00 may be substituted." Reported in the row detail, never a finding.
+     */
     @Test
-    fun malformedBootPatchLevelFires() {
+    fun aDayZeroBootPatchLevelIsReportedNotFlagged() {
         val v = AttestationAnalysis.crossSourceMismatch(
             extensionWith(bootPatch = 20241100L), AttestationAnalysis.DeviceFacts.EMPTY
         )
-        assertTrue(v.malformedDayPrecisionPatchLevel)
-        assertTrue(v.anyMismatch)
+        assertTrue(v.dayZeroPatchLevel)
+        assertFalse(v.anyMismatch)
+
+        val row = DetectionResult.fromBitmask(0, null, v)
+            .single { it.flag == DetectionResult.DETECTION_ATTEST_CROSS_SOURCE }
+        assertTrue(row.detail!!.contains("00"))
+        assertTrue(row.detail!!.contains("reported, not a finding"))
+    }
+
+    @Test
+    fun aDayZeroVendorPatchLevelIsReportedNotFlagged() {
+        val v = AttestationAnalysis.crossSourceMismatch(
+            extensionWith(vendorPatch = 20241100L), AttestationAnalysis.DeviceFacts.EMPTY
+        )
+        assertTrue(v.dayZeroPatchLevel)
+        assertFalse(v.anyMismatch)
     }
 
     @Test
@@ -301,7 +319,7 @@ class AttestationPatchShapeTest {
         val v = AttestationAnalysis.crossSourceMismatch(
             extensionWith(vendorPatch = 202404L), AttestationAnalysis.DeviceFacts.EMPTY
         )
-        assertFalse(v.malformedDayPrecisionPatchLevel)
+        assertFalse(v.dayZeroPatchLevel)
         assertTrue(v.monthPrecisionDayLevel)
         assertFalse(v.anyMismatch)
     }
@@ -311,7 +329,7 @@ class AttestationPatchShapeTest {
         val v = AttestationAnalysis.crossSourceMismatch(
             realAkitaExtension(), AttestationAnalysis.DeviceFacts.EMPTY
         )
-        assertFalse(v.malformedDayPrecisionPatchLevel)
+        assertFalse(v.dayZeroPatchLevel)
         assertFalse(v.anyMismatch)
     }
 
@@ -320,7 +338,7 @@ class AttestationPatchShapeTest {
         val v = AttestationAnalysis.crossSourceMismatch(
             extensionWith(bootPatch = 0L), AttestationAnalysis.DeviceFacts.EMPTY
         )
-        assertFalse(v.malformedDayPrecisionPatchLevel)
+        assertFalse(v.dayZeroPatchLevel)
     }
 
     // ---- A6: reported, deliberately not a detection ------------------------
