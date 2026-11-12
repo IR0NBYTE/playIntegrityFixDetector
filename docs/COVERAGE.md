@@ -82,7 +82,7 @@ rows that rest on them:
 | ROOT_HIDER | mountinfo source and mount-root analysis, OverlayFS on /system, anonymous rwxp count | Yes | Fires on the test device: 6 tmpfs mounts over system partitions whose source is not tmpfs, plus one /adb/ bind that leaks the module name. Reason 905 adds the case where a root tmpfs shadows nothing at all, which is what a module-less install looks like and what returned a mask of zero on a live Magisk 31.1 emulator. It matches the mount source against a needle rather than reporting any non-`tmpfs` source, because an unrooted API 23 image mounts `/sys/fs/cgroup` as `- tmpfs none` and the general rule would have convicted it. See the section on it below | The app being on the denylist, and SUSFS sus_mount, which falsifies mountinfo in kernel. 905 specifically is defeated by renaming the mount source, which is one line for whoever ships it |
 | BOOTLOADER | verifiedbootstate, flash.locked, veritymode, vbmeta.device_state, ro.debuggable, ro.secure, oem_unlock_allowed | Partly | Reads what the properties say. ro.secure is labelled userdebug_or_eng_prop and is denied to untrusted_app, so that arm silently no-ops. oem_unlock_allowed (508) is the Developer options switch, which a locked retail phone can have on, so it is noted only beside another arm and never sets the bit alone | Any resetprop-based property sanitizer; all of these are ordinary properties |
 | SIGNATURE | signing cert SHA-256 against a build-time digest, fail-closed | Yes | Works; compiled out in debug and when no digest is supplied | Signature-spoofing frameworks that swap the PackageInfo CREATOR |
-| PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, a `/dev/__properties__` area mapped private rather than shared, an area holding allocated space its own trie can no longer reach, a property name out of order in the trie level that indexes it, and a property name that disagrees with the trie path reaching it | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say. The accounting arm added in 3.2 is the one that reads the area's contents rather than its mapping flags, and it is the first arm in this file to ship with a positive witness as well as a negative one: it fires on an SM-A065F running Magisk 30.6 and is silent on an API 30 emulator. See the section on it below | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated. For the accounting arm, `resetprop --compact` rebuilds the area and erases the evidence completely: a compacted area is byte for byte identical to one where the property was never set, so that arm now reads only a stack on Magisk v30.7 or older, or one without PlayIntegrityFork, and no contents-reading arm can replace it. The two trie-invariant arms are the part compaction does not hide, and they are bounded in the other direction: 808 needs a same-length neighbour to pin the edited node's slot, which only 48.3% of properties have, and 809 is defeated by rewriting both copies of the name consistently. See the two sections on them below |
+| PROP_SPOOF | fingerprint vs brand, production-claim vs build type and tags, property read latency, board vs SoC, a `/dev/__properties__` area mapped private rather than shared, an area holding allocated space its own trie can no longer reach, a property name out of order in the trie level that indexes it, a property name that disagrees with the trie path reaching it, and an `android.os.Build` constant that no longer matches the live property it was read from | Yes | Directional, only fires when the scalars claim a clean production build. The mapping arm is the one that does not depend on what the scalars say: bionic passes `MAP_SHARED` in `map_fd_ro`, `map_prop_area_rw` and the property-info parser, byte identical from `android10-release` to the current tree, and `fork` carries sharing across the zygote, so every property area on a stock device reads `s`. Measured silent on four devices: 14 areas on a Pixel 7a, 15 on an SM-G780G, 14 on a moto g04 and 68 in the app process on an SM-A065F, 111 areas and not one of them private. The arm is also the reason reasons 801 to 805 now reach a report at all; before 3.1 the walk ended at its first finding with a bare `return true`, so the flag lit with nothing to say. The accounting arm added in 3.2 is the one that reads the area's contents rather than its mapping flags, and it is the first arm in this file to ship with a positive witness as well as a negative one: it fires on an SM-A065F running Magisk 30.6 and is silent on an API 30 emulator. See the section on it below | Global, self-consistent property rewriting. For the mapping arm specifically, a virtualizer that gives up the private page and goes back to hooking reads, which puts it back in front of the latency arm. An app-cloning or container host that re-maps the property area for its guests would read `p` and would be reported; that is environment manipulation rather than a stock device, but it is a real false positive vector and is not gated. For the accounting arm, `resetprop --compact` rebuilds the area and erases the evidence completely: a compacted area is byte for byte identical to one where the property was never set, so that arm now reads only a stack on Magisk v30.7 or older, or one without PlayIntegrityFork, and no contents-reading arm can replace it. The two trie-invariant arms are the part compaction does not hide, and they are bounded in the other direction: 808 needs a same-length neighbour to pin the edited node's slot, which only 48.3% of properties have, and 809 is defeated by rewriting both copies of the name consistently. See the two sections on them below. 810 is defeated by any rewrite that lands before zygote reads the properties; see its section |
 | CANARY_FP | global Pixel Canary build id, vendor fingerprint mismatch, brand cross-check | Yes | Only catches global fingerprint spoofing | Zygisk-scoped spoofing, which never reaches our process |
 | CODE_INTEGRITY | libc prologue inline-hook decode (arm64-v8a and x86_64 only), executable mappings from unrecognised sources, PLT GOT slots pointing outside any recognised code source, libc text against the file on disk | Yes | Reads only this process's own address space, so no privilege is involved. Measured silent on a clean API 34 emulator and on a rooted Samsung A06: Magisk's root is filesystem-level and inline-hooks nothing in our process, so silence there is the correct answer rather than a dead check. The arms are proven to fire by the native self test, which synthesises arm64 and x86_64 trampolines and maps an anonymous executable page on every device the suite runs on. The kernel's own executable pages are allowlisted by name: `[vdso]`, `[vectors]`, `[sigpage]`, and since 2026-11-12 `[vsyscall]`, which every x86_64 kernel lists as `--xp` in every process, and `[uprobes]`. Before that, 1002 fired on every x86_64 image; the suite had only run on arm64 | A hider that hooks nothing in our address space is invisible to it, by construction. On armeabi-v7a and x86 the prologue arm does not run at all: only arm64-v8a and x86_64 have decoders, and the other two report nothing rather than guess at byte patterns nobody verified. The text comparison is corroboration only and never fires alone, because a hider that can patch a prologue can also redirect a read of the library file. The GOT arm reads at most 8000 PLT slots per loaded object and 250000 across the walk; before 2026-11-12 the 8000 was one budget for the whole walk, spent on the first system libraries in load order, so a PLT hook in this app's own library or anything loaded later was never examined. A debug build logs the slots and objects seen per scan; no device count has been read yet. The code-source allowlist that 1001, 1002 and 1003 share matches some names anywhere in the mapping path: any mapping whose name contains `jit-cache` (or `jit-zygote`, or `[anon:dalvik-`) passes, so a hooker that names its memfd `jit-cache`, as Zygisk Next and ReZygisk do, is not seen by any of the three. Anchoring those names needs witnesses of ART's own mappings on real devices, which we do not have yet. `/data/local/tmp/` was on the allowlist until 2026-11-12 with no recorded reason; it is shell writable and is where frida-server and its agent are usually pushed, so it is now foreign. `/data/data/` and `/data/user/` stay recognised, so an injector that drops its library into this app's own data directory is not seen either |
 | TREAT_WHEEL | maps needle | Yes | In-process, genuinely fires | A renamed build |
@@ -862,6 +862,84 @@ The parser now does too. This cost coverage rather than causing a false finding:
 the arm above was silent on that area when it should have been reading it. With
 the guard in place all 1329 areas parse, and the host walk's node and property
 counts match an independent Python implementation exactly.
+
+## A Build constant that outlived its property
+
+Reason 810: a build property no longer matches the value the app runtime read
+at start.
+
+The `android.os.Build` static fields are read from system properties once,
+when the runtime initialises the class, and never again. That happens in
+zygote's preload, or at app fork on builds that reload the Build constants for
+appcompat overrides. `ro.*` properties are write-once for init. So a field
+that differs from a live read of its property means something rewrote a
+read-only property after the runtime read it, which is exactly what a late
+`resetprop` does. TEESimulator PR #327 writes attested values this way from the
+service stage, after zygote is already up.
+
+Eleven of the twelve pairs below appear in the table frameworks/base
+`core/jni/com_android_internal_os_Zygote.cpp` uses to reload these constants,
+lines 1713 to 1741. `Build.FINGERPRINT` is not in that table; it is re-derived
+just after it, lines 1812 to 1817. Every pair was also checked against
+`Build.java` on main and on API 24.
+
+| Field | Property |
+|---|---|
+| `Build.ID` | `ro.build.id` |
+| `Build.PRODUCT` | `ro.product.name` |
+| `Build.DEVICE` | `ro.product.device` |
+| `Build.MANUFACTURER` | `ro.product.manufacturer` |
+| `Build.BRAND` | `ro.product.brand` |
+| `Build.MODEL` | `ro.product.model` |
+| `Build.TAGS` | `ro.build.tags` |
+| `Build.TYPE` | `ro.build.type` |
+| `Build.VERSION.INCREMENTAL` | `ro.build.version.incremental` |
+| `Build.VERSION.RELEASE` | `ro.build.version.release` |
+| `Build.VERSION.SECURITY_PATCH` | `ro.build.version.security_patch` |
+| `Build.FINGERPRINT` | `ro.build.fingerprint` |
+
+The fields are read over JNI and each property is read live without
+truncation, through `__system_property_find` and
+`__system_property_read_callback` (API 26+, resolved at run time because
+minSdk is 24). Where only `__system_property_get` exists the value can be cut
+at 91 bytes, so a 91 byte live value only has to be a prefix of the field. A
+field is skipped, never reported, when its cached value is empty or Build's
+own `unknown`, when the live property is empty, when either read fails, and
+when either side holds a byte outside ASCII, because JNI returns modified
+UTF-8 and the two spellings of one value can then differ.
+
+### What defeats it
+
+- A rewrite that lands before zygote reads the properties. A module that runs
+  `resetprop` in post-fs-data, as most do, sets the value zygote then reads,
+  so the field and the property agree.
+- A zygote restart after the rewrite. The new zygote reads the rewritten
+  values and every app it forks agrees with them.
+- Builds that reload the Build constants at fork. On those the comparison only
+  sees a rewrite made after this app's own process started.
+- Rewriting the field as well as the property, by reflection inside this
+  process.
+
+### What it has been measured on
+
+Measured on 2026-11-12, on the branch that introduced it:
+
+- Silent on a retail SM-G780G and a retail moto g04 (verdict 0x0, no reasons,
+  on both), on a rooted Pixel 7a and a rooted SM-A065F, and on API 30 and API
+  34 emulators.
+- Fired (0x80, reason 810) on the API 34 emulator after `ro.build.tags` was
+  rewritten with `resetprop`, and went silent again once it was restored.
+- `/dev/__properties__/appcompat_override` is absent on all six.
+
+Not measured: API 24 to 29, and any build that carries the appcompat override
+area. The pure comparison is covered by the native self test, which proves the
+rules above.
+
+One false positive vector remains and is written down here: something that
+rewrites `android.os.Build` fields in the Java layer inside this app's process
+(per-app model spoofing on some gaming ROMs, app cloners and virtual spaces)
+leaves the property untouched and the field changed, which reads exactly like
+a late rewrite of the property.
 
 ## Why the RKP provisioning era is not a detection
 

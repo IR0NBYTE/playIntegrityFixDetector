@@ -103,6 +103,8 @@ object ReasonCodes {
             "A property name sits out of order in the trie that indexes it"),
         Reason(809, DetectionResult.DETECTION_PROP_SPOOF,
             "A property's name disagrees with the trie path that reaches it"),
+        Reason(810, DetectionResult.DETECTION_PROP_SPOOF,
+            "A build property no longer matches the value the app runtime read at start"),
 
         Reason(1001, DetectionResult.DETECTION_CODE_INTEGRITY,
             "A libc function begins with a jump into memory that is not a " +
