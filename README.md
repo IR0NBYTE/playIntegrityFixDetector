@@ -16,6 +16,8 @@ The load-bearing signal is key attestation. Every Zygisk PIF fork gates on the t
   <img src="screenshots/results_bottom.png" width="300" alt="Detection results - bottom" />
 </p>
 
+<p align="center"><sub>3.3 on a userdebug API 30 emulator image, which really does ship an su binary and set <code>ro.debuggable</code>. Tapping a row shows what the engine saw.</sub></p>
+
 ## What it detects
 
 - **Play Integrity Fix:** maps scan for PIF classes & `InMemoryDexClassLoader` DEX regions, `custom.pif.prop`/`custom.pif.json`, module dirs, known props
