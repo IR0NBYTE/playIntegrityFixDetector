@@ -45,6 +45,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Forked from this app's own app zygote; see AppZygoteCheck. -->
+        <service
+            android:name=".AppZygoteService"
+            android:exported="false"
+            android:isolatedProcess="true"
+            android:useAppZygote="true"
+            tools:targetApi="29" />
     </application>
 
 </manifest>

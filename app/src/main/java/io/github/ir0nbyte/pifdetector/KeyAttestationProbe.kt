@@ -342,9 +342,10 @@ class KeyAttestationProbe {
          * Root-hider arms that observe a structure in the mount table: a tmpfs
          * over a read-only system partition (901), a bind mount rooted under
          * /adb (902), an overlay over /system (903), a tmpfs named after a root
-         * solution (905). These alone drive reason 1205.
+         * solution (905), and one of 901, 902 or 905 seen only from this app's
+         * own isolated helper process (906). These alone drive reason 1205.
          */
-        val STRUCTURAL_ROOT_HIDER_REASONS: Set<Int> = setOf(901, 902, 903, 905)
+        val STRUCTURAL_ROOT_HIDER_REASONS: Set<Int> = setOf(901, 902, 903, 905, 906)
 
         /**
          * Root-hider arms that are counts or thresholds rather than structures.

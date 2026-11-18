@@ -136,7 +136,7 @@ class KeyAttestationGateTest {
 
     @Test
     fun onlyStructuralRootHidingDrivesTheBootContradiction() {
-        for (code in listOf(901, 902, 903, 905)) {
+        for (code in listOf(901, 902, 903, 905, 906)) {
             assertTrue("$code", KeyAttestationProbe.deviceTampered(listOf(201, code)))
         }
         assertFalse(

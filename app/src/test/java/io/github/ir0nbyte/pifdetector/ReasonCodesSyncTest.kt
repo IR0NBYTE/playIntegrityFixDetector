@@ -443,6 +443,7 @@ class ReasonCodesSyncTest {
             "the companion algorithm probe" to CompanionAlgorithmCheck.REASON_CODES,
             "the key attestation probe" to KeyAttestationProbe.REASON_CODES,
             "the active attestation probe" to ActiveAttestationProbe.REASON_CODES,
+            "the app zygote probe" to AppZygoteCheck.REASON_CODES,
         )
     }
 

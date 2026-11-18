@@ -217,6 +217,9 @@ object ReasonCodes {
 
         Reason(905, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs is mounted from a source named after a root solution"),
+        Reason(906, DetectionResult.DETECTION_ROOT_HIDER,
+            "Root mounts are hidden from this app but visible from its own " +
+                "isolated helper process"),
 
         Reason(901, DetectionResult.DETECTION_ROOT_HIDER,
             "A tmpfs shadows a read-only system partition"),
