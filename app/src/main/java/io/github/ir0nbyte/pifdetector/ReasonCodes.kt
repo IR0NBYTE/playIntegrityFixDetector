@@ -105,6 +105,8 @@ object ReasonCodes {
             "A property's name disagrees with the trie path that reaches it"),
         Reason(810, DetectionResult.DETECTION_PROP_SPOOF,
             "A build property no longer matches the value the app runtime read at start"),
+        Reason(811, DetectionResult.DETECTION_PROP_SPOOF,
+            "ro.board.first_api_level was created with no value after the boot properties were set"),
 
         Reason(1001, DetectionResult.DETECTION_CODE_INTEGRITY,
             "A libc function begins with a jump into memory that is not a " +

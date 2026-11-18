@@ -256,6 +256,14 @@ the Java layer inside this process.
 
 The reason table goes from 52 codes to 74.
 
+## Since 3.3
+
+| Item | Outcome | Evidence |
+|---|---|---|
+| Reason 811, an empty `ro.board.first_api_level` created after boot | Landed, **not yet witnessed** | PlayIntegrityFork `a645788` (2026-11-13) creates the property empty at post-fs-data when the device lacks it. Init sets the boot defaults in sorted name order into a bump allocator, so a genuine one sits below `ro.product.first_api_level` and `ro.vendor.api_level` in their shared `build_vendor_prop` area and a created one sits above. Empty alone is not a finding, because init accepts an empty value from a prop file. Matches any tool that creates the empty property after boot. Silent when the device already has the property, under the module's `skipaddprop`, below API 29, and wherever the anchors are not in the same area (API 30 measured) |
+
+The reason table goes from 74 codes to 75.
+
 ## Sequencing
 
 1. D1 first. It is the smallest change with the highest live value and it closes
