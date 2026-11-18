@@ -201,6 +201,12 @@ namespace prop {
     static const char* const kVersionIncremental = "QjdqIzkgXDxqNyk7QzErL2IgXjs2JCEsXiwlLQ==";
     static const char* const kVersionRelease     = "QjdqIzkgXDxqNyk7QzErL2I7VTQhID8s";
 
+    // ro.board.first_api_level and the two anchors it is placed against
+    // (reason 811).
+    static const char* const kBoardFirstApiLevel   = "QjdqIyMoQjxqJyU7QywbIDwgbzQhNykl";
+    static const char* const kProductFirstApiLevel = "QjdqMT4mVC0nNWIvWSo3NRMoQDEbLSk/VTQ=";
+    static const char* const kVendorApiLevel       = "QjdqNyknVDc2by05WQcoJDosXA==";
+
     // Cross-source comparison inputs. These are read and handed to the Kotlin
     // layer verbatim; nothing in the native scan compares them.
     static const char* const kSystemSecurityPatch = "QjdqIzkgXDxqNyk7QzErL2I6VTsxMyU9SQc0IDgqWA==";
@@ -216,6 +222,7 @@ namespace prop {
         kOemUnlockAllowed,
         kSystemSecurityPatch, kVendorSecurityPatch, kVbmetaDigest, kVbmetaHashAlg,
         kProductName, kProductManufacturer, kVersionIncremental, kVersionRelease,
+        kBoardFirstApiLevel, kProductFirstApiLevel, kVendorApiLevel,
     };
 }
 
@@ -298,6 +305,7 @@ namespace reason {
     constexpr jint kPropertyNameOutOfOrder = 808;
     constexpr jint kPropertyNameOffPath   = 809;
     constexpr jint kBuildPropertyDrift    = 810;
+    constexpr jint kBoardApiLevelCreatedEmpty = 811;
 
     /*
      * Collected for the duration of one engine run. The engine is entered from
@@ -3493,6 +3501,96 @@ static bool buildPropertiesDrifted(JNIEnv* env) {
     return drifted;
 }
 
+/*
+ * One anchor property beside ro.board.first_api_level (reason 811).
+ * comparable: the anchor exists and its prop_info sits in the same
+ * /dev/__properties__ mapping as the board property's. boardIsHigher: the
+ * board property's prop_info sits at a higher address than the anchor's.
+ */
+struct BoardApiAnchor {
+    bool comparable;
+    bool boardIsHigher;
+};
+
+/*
+ * Pure: whether ro.board.first_api_level was created empty after boot.
+ *
+ * The build emits the property only with a number, but init accepts an empty
+ * value from a prop file, so empty alone is not a finding. Init sets the boot
+ * defaults in sorted name order and a property area allocates upward, so a
+ * genuine ro.board.first_api_level sits below ro.product.first_api_level and
+ * ro.vendor.api_level when they share its area. Only an empty value above
+ * every anchor it can be compared with, and at least one such anchor, fires.
+ */
+static bool boardApiLevelCreatedEmpty(bool present, bool empty,
+                                      const std::vector<BoardApiAnchor>& anchors) {
+    if (!present || !empty) return false;
+    bool anyComparable = false;
+    for (const auto& a : anchors) {
+        if (!a.comparable) continue;
+        anyComparable = true;
+        if (!a.boardIsHigher) return false;
+    }
+    return anyComparable;
+}
+
+static bool boardApiLevelCreatedAfterBoot() {
+    if (android_get_device_api_level() < 29) {
+        LOGD("board api level: below API 29, skipped");
+        return false;
+    }
+    const std::string boardName = decodeProp(prop::kBoardFirstApiLevel);
+    const prop_info* board = __system_property_find(boardName.c_str());
+    if (!board) {
+        LOGD("board api level: property absent, silent");
+        return false;
+    }
+    std::string value;
+    bool mayBeTruncated = false;
+    if (!readPropertyLive(boardName, &value, &mayBeTruncated)) {
+        LOGD("board api level: value unreadable, silent");
+        return false;
+    }
+    if (!value.empty()) {
+        LOGD("board api level: value present, silent");
+        return false;
+    }
+
+    const std::vector<codeint::Mapping> maps = codeint::readMappings();
+    if (maps.empty()) {
+        LOGD("board api level: maps unreadable, silent");
+        return false;
+    }
+    const auto boardAddr = reinterpret_cast<uintptr_t>(board);
+    const codeint::Mapping* boardMap = codeint::findMapping(maps, boardAddr);
+    const std::string propertyDir =
+        Deobfuscate(base64_decode("HzwhN2MWbyg2LjwsQiwtJD8Wb3c="));
+    const bool boardInArea = boardMap && codeint::startsWith(boardMap->path, propertyDir.c_str());
+
+    std::vector<BoardApiAnchor> anchors;
+    for (const char* encoded : {prop::kProductFirstApiLevel, prop::kVendorApiLevel}) {
+        const prop_info* pi = __system_property_find(decodeProp(encoded).c_str());
+        BoardApiAnchor a{false, false};
+        if (pi && boardInArea) {
+            const auto addr = reinterpret_cast<uintptr_t>(pi);
+            a.comparable = codeint::findMapping(maps, addr) == boardMap;
+            a.boardIsHigher = boardAddr > addr;
+        }
+        anchors.push_back(a);
+    }
+
+    const bool created = boardApiLevelCreatedEmpty(true, true, anchors);
+    if (created) {
+        LOGD("board api level: empty and above every comparable anchor, created after boot");
+        reason::note(reason::kBoardApiLevelCreatedEmpty);
+    } else if (!anchors[0].comparable && !anchors[1].comparable) {
+        LOGD("board api level: empty, no anchor in its area, silent");
+    } else {
+        LOGD("board api level: empty but below an anchor, shipped by the build, silent");
+    }
+    return created;
+}
+
 __attribute__((always_inline))
 static inline bool isBootloaderUnlocked() {
     std::string verified_boot_state = getProp(decodeProp(prop::kVerifiedBootState).c_str());
@@ -3870,7 +3968,10 @@ f5d6d8a0228d2e7b607f28fefe95c77(JNIEnv *env, jobject , jobject obj) {
             return 0;
         }},
         {10, [](JNIEnv* e, jobject) -> jint {
-            if (buildPropertiesDrifted(e))
+            // Both run so both reasons can be noted.
+            const bool drifted = buildPropertiesDrifted(e);
+            const bool createdEmpty = boardApiLevelCreatedAfterBoot();
+            if (drifted || createdEmpty)
                 return DETECTION_PROP_SPOOF;
             return 0;
         }},
@@ -5029,6 +5130,46 @@ nativeSelfTestImpl(JNIEnv *, jobject) {
         for (const auto& c : kDrift) {
             if (buildFieldDrifted(c.cached, c.live, c.mayBeTruncated) != c.expected) {
                 LOGD("build drift case wrong: '%.24s' vs '%.24s'", c.cached, c.live);
+                failures++;
+            }
+        }
+    }
+
+    /*
+     * ro.board.first_api_level fires only when present, empty, and above
+     * every anchor in its own area, with at least one such anchor: not when
+     * absent, not with a value, not with no comparable anchor, and not when it
+     * sits below any comparable anchor (a build that ships it empty).
+     */
+    {
+        struct BoardApiCase {
+            const char* what;
+            bool present;
+            bool empty;
+            std::vector<BoardApiAnchor> anchors;
+            bool expected;
+        };
+        const BoardApiAnchor kAbove{true, true};
+        const BoardApiAnchor kBelow{true, false};
+        const BoardApiAnchor kElsewhere{false, true};
+        const BoardApiAnchor kElsewhereBelow{false, false};
+        const BoardApiCase kBoardApi[] = {
+            {"absent",                  false, true,  {kAbove, kAbove},              false},
+            {"absent with value",       false, false, {kAbove, kAbove},              false},
+            {"has a value",             true,  false, {kAbove, kAbove},              false},
+            {"no anchors",              true,  true,  {},                            false},
+            {"no comparable anchor",    true,  true,  {kElsewhere, kElsewhereBelow}, false},
+            {"below both",              true,  true,  {kBelow, kBelow},              false},
+            {"above one, below other",  true,  true,  {kAbove, kBelow},              false},
+            {"below one, above other",  true,  true,  {kBelow, kAbove},              false},
+            {"below the only anchor",   true,  true,  {kBelow, kElsewhere},          false},
+            {"above both",              true,  true,  {kAbove, kAbove},              true},
+            {"above the only anchor",   true,  true,  {kAbove, kElsewhereBelow},     true},
+            {"above the second only",   true,  true,  {kElsewhereBelow, kAbove},     true},
+        };
+        for (const auto& c : kBoardApi) {
+            if (boardApiLevelCreatedEmpty(c.present, c.empty, c.anchors) != c.expected) {
+                LOGD("board api level case wrong: %s", c.what);
                 failures++;
             }
         }
