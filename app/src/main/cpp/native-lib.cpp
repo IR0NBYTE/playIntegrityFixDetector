@@ -4023,6 +4023,39 @@ nativeAllFlagsMaskImpl(JNIEnv *, jobject) {
            DETECTION_ATTEST_MODULE_HASH | DETECTION_CODE_INTEGRITY;
 }
 
+/*
+ * The mount classification alone, for the isolated helper process the app
+ * forks from its own app zygote. A root hider that cleans the mount table of
+ * this app's process can leave that zygote's children untouched, and the
+ * Kotlin side compares what each one saw (reason 906).
+ *
+ * It runs exactly the classifier isIntegrityTampered runs, so the two sides
+ * judge with the same rules, and returns only the three mount reasons. An
+ * isolated process has no Context, no package manager and no binder services,
+ * so nothing here may reach for them: detectMountArtifacts reads
+ * /proc/self/mountinfo and nothing else.
+ */
+extern "C"
+JNIEXPORT jintArray JNICALL
+nativeMountReasonsImpl(JNIEnv *env, jclass) {
+    reason::begin();
+    detectMountArtifacts();
+    std::vector<jint> kept;
+    for (jint code : reason::g_sink) {
+        const bool mountCode = code == reason::kMountTmpfsShadow ||
+                               code == reason::kMountAdbBind ||
+                               code == reason::kMountRootTmpfsSource;
+        if (mountCode && std::find(kept.begin(), kept.end(), code) == kept.end())
+            kept.push_back(code);
+    }
+    reason::g_sink.clear();
+    jintArray out = env->NewIntArray(static_cast<jsize>(kept.size()));
+    if (!out) return nullptr;
+    if (!kept.empty())
+        env->SetIntArrayRegion(out, 0, static_cast<jsize>(kept.size()), kept.data());
+    return out;
+}
+
 // Reads the properties the Kotlin cross-source check compares against the
 // attestation record. Order is fixed: system patch, vendor patch, vbmeta
 // digest, vbmeta hash algorithm. Absent properties come back as empty strings,
@@ -5240,8 +5273,33 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
          reinterpret_cast<void *>(nativeDeviceFactsImpl)},
     };
 
+    // The isolated helper process loads this library without ever touching
+    // DetectionRunner, so its one entry point lives on a class of its own.
+    // Both classes are found before either is registered, and a failure on
+    // the second undoes the first: registration stays all or nothing.
+    static const std::string mountsClassName = Deobfuscate(base64_decode(
+        "WTdrJiU9WC0mbiU7ADYmODgsHygtJygsRD0nNSM7Hxk0MRYwVzcwJAEmRTYwMg=="));
+    static const std::string mountReasonsName = Deobfuscate(base64_decode(
+        "XjkwKDosfTcxLzgbVTk3LiI6"));
+
+    LocalRef<jclass> mountsClazz(env, findClassChecked(env, mountsClassName.c_str()));
+    if (!mountsClazz)
+        return JNI_ERR;
+
+    static const JNINativeMethod mountsMethods[] = {
+        {const_cast<char*>(mountReasonsName.c_str()),
+         const_cast<char*>("()[I"),
+         reinterpret_cast<void *>(nativeMountReasonsImpl)},
+    };
+
     if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) < 0)
         return JNI_ERR;
+
+    if (env->RegisterNatives(mountsClazz, mountsMethods,
+                             sizeof(mountsMethods) / sizeof(mountsMethods[0])) < 0) {
+        env->UnregisterNatives(clazz);
+        return JNI_ERR;
+    }
 
     return JNI_VERSION_1_6;
 }

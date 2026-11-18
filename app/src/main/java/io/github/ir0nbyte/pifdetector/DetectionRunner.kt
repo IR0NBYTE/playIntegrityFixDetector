@@ -21,9 +21,10 @@ data class DetectionReport(
     /**
      * Reason codes naming which sub-probe set a bit, from the native engine,
      * the key attestation probe, the active attestation probe, the keystore
-     * boundary probe, the attested identity probe, the StrongBox probe and the
-     * companion algorithm probe. Advisory: a bit with no reason
-     * is still set, so an unwired check simply reports nothing extra.
+     * boundary probe, the attested identity probe, the StrongBox probe, the
+     * companion algorithm probe and the app zygote probe. Advisory: a bit
+     * with no reason is still set, so an unwired check simply reports nothing
+     * extra.
      */
     val reasons: List<Int> = emptyList(),
 
@@ -47,6 +48,7 @@ class DetectionRunner {
     private val identityProbe = AttestedIdentityProbe()
     private val strongBoxProbe = StrongBoxProbe()
     private val companionAlgorithmProbe = CompanionAlgorithmProbe()
+    private val appZygoteProbe = AppZygoteProbe()
 
     fun runCheck(
         context: Context,
@@ -65,9 +67,18 @@ class DetectionRunner {
             // Read once per run so both probes see the same identity.
             val presentation = DeviceIdentity.fromRuntime(appContext)
             val facts = deviceFacts()
+            // Before the passive probe, so its boot contradiction arm sees a
+            // mount reason the hider kept from this process. When the engine
+            // did not report, the main side never looked, and nothing is
+            // compared.
+            val appZygote = if (nativeReported) {
+                appZygoteProbe.probe(appContext, reasons)
+            } else {
+                AppZygoteCheck.CLEAN
+            }
             val passive = attestationProbe.probe(
-                nativeMask, reasons, nativeReported, onlineRefreshEnabled, appContext, facts,
-                presentation,
+                nativeMask or appZygote.mask, reasons + appZygote.reasons, nativeReported,
+                onlineRefreshEnabled, appContext, facts, presentation,
             )
 
             // An unrecognised root is the same observation the active probe's
@@ -81,8 +92,8 @@ class DetectionRunner {
             val strongBox = strongBoxProbe.probe(appContext)
             val companionAlgorithm = companionAlgorithmProbe.probe()
             val report = DetectionReport(
-                bitmask = nativeMask or passive.mask or active.mask or boundary.mask or
-                    identity.mask or strongBox.mask or companionAlgorithm.mask,
+                bitmask = nativeMask or appZygote.mask or passive.mask or active.mask or
+                    boundary.mask or identity.mask or strongBox.mask or companionAlgorithm.mask,
                 revocation = passive.revocation,
                 crossSource = passive.crossSource,
                 validity = passive.validity,
@@ -90,7 +101,8 @@ class DetectionRunner {
                 shape = passive.shape,
                 moduleHash = passive.moduleHash,
                 companionAlgorithm = companionAlgorithm.verdict,
-                reasons = reasons + passive.reasons + active.reasons + boundary.reasons +
+                reasons = reasons + appZygote.reasons + passive.reasons + active.reasons +
+                    boundary.reasons +
                     identity.reasons + strongBox.reasons + companionAlgorithm.reasons,
                 presentation = presentation,
                 rootUnrecognised = passive.rootUnrecognised,
