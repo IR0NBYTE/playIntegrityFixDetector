@@ -1059,8 +1059,16 @@ A DenyList hider reverts the root mounts in the process of an app it hides
 from. Since API 29 an app can declare a service with
 `android:isolatedProcess="true"` and `android:useAppZygote="true"`. That
 service runs under an isolated uid in a process forked from the app's own app
-zygote, not from the system zygote the app itself came from, and a hider that
-only cleans up after the system zygote leaves that child's mount table alone.
+zygote, not from the system zygote the app itself came from. On the one hider
+measured, the app zygote and that child keep the mounts the app itself loses.
+
+Why is read from source and not measured. Magisk matches a uid from 90000
+upward against a separate list, by process name
+(`native/src/core/deny/utils.cpp:386-393` at `a4fb84b`, newer than the 28.1 on
+the bench), and adding the child's process name to the DenyList changed
+nothing. NeoZygisk and ReZygisk remap an isolated uid to its owning app by a
+stat on `app_data_dir`, which cannot work if that is null for an app zygote.
+None of the three has a rule that names the app zygote.
 
 The app declares one such service, `AppZygoteService`, with no
 `zygotePreloadName`. On each run the detector binds it, asks it once, and
@@ -1112,9 +1120,28 @@ process's mounts, which can only ever be silence under this rule.
 
 ### What it has been measured on
 
-Not yet witnessed as a check. Only the measurement harness above has run on
-hardware; the reason 906 code path, the service and the probe have been unit
-tested on the host and built, and have not run on a device.
+Measured 2026-11-18 on the debug build of the commit that added it.
+
+| Device | State | The child reported | Verdict |
+|---|---|---|---|
+| SM-G780G, API 33 | retail stock | nothing | `0x0 []` |
+| moto g04, API 34 | retail stock | nothing | `0x0 []` |
+| API 30 emulator | userdebug | nothing | `0x14 [305, 506]` |
+| Pixel 7a, API 35 | rooted, the app not on the DenyList | 901, 905 | `0x4104 [305, 901, 905, 1206]` |
+| Pixel 7a | the app on the DenyList | 901, 905 | `0x4100 [906, 1206]`, three runs alike |
+| Pixel 7a | DenyList restored | 901, 905 | `0x4104 [305, 901, 905, 1206]` |
+
+On the DenyList the main process loses both mount reasons and the su binary
+with them. Take 906 away and what is left of that verdict is `0x4000 [1206]`,
+the attestation disagreeing with the boot properties and no root evidence at
+all.
+
+The child answered on every device, with no timeout, the moto g04 being the
+slowest phone on the bench. The 47 non-UI instrumented tests pass on all four.
+
+Not measured: any hider but Magisk 28.1 with Zygisk, the DenyList and Shamiko.
+ReZygisk, NeoZygisk, KernelSU and APatch are read from source above and have
+not been run. Nothing below API 30 has been run either.
 
 ## Why the RKP provisioning era is not a detection
 
