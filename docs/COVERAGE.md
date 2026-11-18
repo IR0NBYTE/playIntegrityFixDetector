@@ -1050,6 +1050,72 @@ been run on the bench. No stock device that ships the property empty has been
 seen either, so the branch that keeps such a device silent is covered by the
 self test only.
 
+## Root mounts hidden from the app but not from its own helper
+
+Reason 906: root mounts are hidden from this app but visible from its own
+isolated helper process.
+
+A DenyList hider reverts the root mounts in the process of an app it hides
+from. Since API 29 an app can declare a service with
+`android:isolatedProcess="true"` and `android:useAppZygote="true"`. That
+service runs under an isolated uid in a process forked from the app's own app
+zygote, not from the system zygote the app itself came from, and a hider that
+only cleans up after the system zygote leaves that child's mount table alone.
+
+The app declares one such service, `AppZygoteService`, with no
+`zygotePreloadName`. On each run the detector binds it, asks it once, and
+unbinds. The child runs the same native mount classification the main
+process runs (`detectMountArtifacts`) and answers with which of three reasons
+it noted: 901 (a tmpfs shadows a system partition), 902 (a bind rooted under
+/adb on userdata) and 905 (a tmpfs whose source names a root solution).
+Nothing else is compared, so not 903, 904 or 309. The native call reads
+`/proc/self/mountinfo` and nothing else; it touches no Context, package
+manager or binder service, none of which an isolated process has.
+
+The arm fires when the child reports at least one of 901, 902 and 905 that
+the main process's own reason list for the same run does not contain.
+Everything else is silence: API below 29; the service cannot bind; no reply
+within 4000 ms; a malformed reply or one that says the child failed; a child
+that reports nothing; a child that reports only what the main process already
+reported; the probe called on the main thread; and an engine run in the main
+process that returned nothing, because then the main side never looked. The
+decision is a pure function and a unit test covers its whole table.
+
+906 is structural evidence, so it sits in `STRUCTURAL_ROOT_HIDER_REASONS` and
+can drive reason 1205 beside the mount reasons it stands in for. The probe
+runs before the passive attestation probe so that probe sees it.
+
+### What was measured
+
+Measured 2026-11-18 with a debug-only harness (local branch
+`appzygote-measure`, commit `b1f9fc6`) that dumps the mount table of the main
+process and of an isolated child forked from the app zygote.
+
+| Device | State | Main process | Isolated child |
+|---|---|---|---|
+| Pixel 7a | rooted, Magisk 28.1, Zygisk, DenyList, Shamiko, the app on the DenyList | 162 lines, no Magisk line | 1470 lines, `tmpfs magisk` on `/debug_ramdisk`, `/system/bin`, `/system/lib` and `/system/lib64` |
+| Pixel 7a | the same, with the child's process name also on the DenyList | unchanged | unchanged, the root mounts still present |
+| moto g04 | retail stock | the full table | the main table minus 8 lines (`/storage` and app data binds), nothing extra: no tmpfs or overlay the main table lacks |
+
+The child ran as uid 90000. On the Pixel 7a the child's lines are the shape
+901 and 905 read; on the moto g04 the child holds a subset of the main
+process's mounts, which can only ever be silence under this rule.
+
+### What defeats it
+
+- A hider that reverts the mounts for the app zygote and its children too.
+- Devices below API 29, which have no app zygote.
+- A device or ROM where the service cannot start, or does not answer within
+  4000 ms.
+- A root solution that leaves no mounts for 901, 902 or 905 to read, or one
+  whose mounts the main process already reports.
+
+### What it has been measured on
+
+Not yet witnessed as a check. Only the measurement harness above has run on
+hardware; the reason 906 code path, the service and the probe have been unit
+tested on the host and built, and have not run on a device.
+
 ## Why the RKP provisioning era is not a detection
 
 A leaked keybox is a factory keybox, and remote key provisioning issues
