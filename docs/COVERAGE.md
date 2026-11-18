@@ -1024,8 +1024,31 @@ PlayIntegrityFork.
 
 ### What it has been measured on
 
-Nothing yet on hardware. The pure decision is covered by the native self
-test.
+Measured 2026-11-18 on the debug build of the commit that added it.
+
+| Device | State | The arm's branch | Verdict |
+|---|---|---|---|
+| SM-G780G, API 33 | retail stock, the property is `30` | value present, silent | `0x0 []` |
+| moto g04, API 34 | retail stock, the property is `33` | value present, silent | `0x0 []` |
+| Pixel 7a, API 35 | rooted, property absent | absent, silent | `0x4104 [305, 901, 905, 1206]` |
+| API 30 emulator | userdebug, property absent | absent, silent | `0x14 [305, 506]` |
+| API 34 emulator | Magisk in the image, property absent | absent, silent | `0x100 [905]` |
+| the same, after `setprop ro.board.first_api_level ""` as root | property empty | empty and above every anchor | `0x180 [811, 905]` |
+
+The sorted allocation the rule leans on was read off the areas themselves. In
+`u:object_r:build_vendor_prop:s0` on the SM-G780G and on the moto g04,
+`ro.board.first_api_level` sits at offset 476 and `ro.product.first_api_level`
+at 808, with `ro.vendor.api_level` far behind them at 3900 and 5800. The
+Pixel 7a and an API 34 emulator lack the board property and hold the two
+anchors in the same order.
+
+Not measured. The positive was made by init, with `setprop` from a root
+shell, and not by Magisk's `resetprop`. Both end in `__system_property_add`,
+and `native/src/core/resetprop/cli.rs` takes that path for a missing `ro.`
+property with no check on the value, but PlayIntegrityFork itself has not
+been run on the bench. No stock device that ships the property empty has been
+seen either, so the branch that keeps such a device silent is covered by the
+self test only.
 
 ## Why the RKP provisioning era is not a detection
 
